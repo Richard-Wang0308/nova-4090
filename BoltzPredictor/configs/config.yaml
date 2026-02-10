@@ -1,0 +1,238 @@
+# ============================================================================
+# BOLTZPREDICTOR TRAINING CONFIGURATION - TWO-PHASE TRAINING
+# Phase 1: Model Selection (80/20 split with validation)
+# Phase 2: Final Training (100% data, no validation)
+# ============================================================================
+# SINGLE-TARGET VERSION (Fixed Target Protein)
+# ============================================================================
+# 
+# Use this config for competition scenarios with:
+# - Fixed target protein (learned as parameter)
+# - Single reaction type
+# - Optimized for speed and accuracy
+# - UPDATED: Optimized for score range (-0.2 to 0.2)
+# ============================================================================
+
+# ========== MODEL TYPE ==========
+model_type: single_target              # 'single_target' or 'multi_target'
+                                       # single_target: f(molecule) → affinity
+                                       # multi_target: f(molecule, protein) → affinity
+
+# ========== DATA ==========
+train_data: data/train.csv             # Training dataset for single target
+                                       # Expected columns: molecule_name, final_score, epoch
+                                       # NO protein information needed!
+
+# CSV column names (customize if your CSV has different column names)
+molecule_name_col: molecule_name       # Column with molecule identifiers (rxn format or SMILES)
+target_protein_col: target_protein     # NOT USED for single-target (kept for compatibility)
+target_seq_col: target_seq             # NOT USED for single-target (kept for compatibility)
+score_col: final_score                 # Column with binding affinity scores
+epoch_col: epoch                       # Column with epoch IDs (optional)
+
+# ========== MODEL ARCHITECTURE ==========
+# Single-target model is SIMPLER than multi-target:
+# - No protein encoder needed
+# - Learnable target embedding instead
+# - Faster inference (10x speedup!)
+
+mol_hidden_dim: 256                    # Molecule encoder hidden dimension
+                                       # Recommendation: 256-512
+                                       # Larger = more capacity, slower training
+
+target_embedding_dim: 512              # Learnable target protein embedding dimension
+                                       # Recommendation: 256-768
+                                       # This replaces protein encoder output
+                                       # Smaller = faster, less memory
+                                       # Larger = more expressive
+
+interaction_dim: 512                   # Interaction network hidden dimension
+                                       # Recommendation: 512-1024
+                                       # Larger = more expressive interaction modeling
+
+num_interaction_layers: 4              # Number of interaction layers
+                                       # Recommendation: 3-5 for single-target
+                                       # More layers = deeper interactions
+                                       # Note: single-target can use more layers (no protein encoder)
+
+dropout: 0.15                          # Dropout rate for regularization
+                                       # Recommendation: 0.1-0.2
+                                       # Higher = more regularization, slower convergence
+
+protein_model: facebook/esm2_t33_650M_UR50D  # NOT USED for single-target (kept for compatibility)
+protein_embedding_dim: 1280            # NOT USED for single-target (kept for compatibility)
+
+# ========== PHASE 1: MODEL SELECTION (80/20 SPLIT) ==========
+# Hyperparameters for Phase 1 (validation-based model selection)
+# UPDATED: Optimized for score range (-0.2 to 0.2)
+
+# Learning rate and optimization
+# UPDATED: Increased from 5e-5 to 1e-4 for better gradient signals
+learning_rate: 1.0e-4                  # Higher LR for single-target (no protein encoder)
+                                       # UPDATED: Increased for small value ranges
+                                       # Recommendation: 1e-4 to 5e-4
+                                       # Single-target can use higher LR (fewer parameters)
+
+# UPDATED: Changed from 0.01 to 0.0001 for small ranges
+weight_decay: 0.0001                   # L2 regularization
+                                       # UPDATED: Reduced for small ranges
+                                       # Recommendation: 0.00005-0.001
+                                       # Lower = less regularization (better for small ranges)
+
+optimizer: adamw                       # AdamW optimizer
+                                       # Recommendation: adamw (best for deep learning)
+
+# Batch size and data loading
+batch_size: 32                         # Batch size per GPU
+                                       # UPDATED: Increased from 16 to 32
+                                       # Recommendation: 32-64
+                                       # Larger = better gradient estimates for small ranges
+
+num_workers: 4                         # Number of data loading workers
+                                       # Recommendation: 4-8
+                                       # Higher = faster data loading (if CPU not bottleneck)
+
+pin_memory: true                       # Pin memory for faster data transfer
+                                       # Recommendation: true (if GPU memory available)
+
+# Training epochs
+num_epochs: 50                         # Maximum epochs for Phase 1
+                                       # Recommendation: 30-100
+                                       # Single-target often needs more epochs (smaller model)
+                                       # Early stopping will trigger before this limit
+
+# Early stopping (Phase 1 only)
+# UPDATED: Increased patience for stable training on small ranges
+early_stopping_patience: 10            # Stop if no improvement for N epochs
+                                       # UPDATED: Increased from 5 to 10
+                                       # Recommendation: 5-15
+                                       # Higher = more patient (wait longer for improvement)
+
+early_stopping_min_delta: 0.01         # Minimum relative improvement (1%)
+                                       # UPDATED: Increased from 0.005 to 0.01
+                                       # Recommendation: 0.005-0.02
+                                       # Higher = less strict (easier to trigger improvement)
+
+early_stopping_metric: rmse            # Metric to monitor
+                                       # Options: 'rmse' or 'mae'
+                                       # Recommendation: 'rmse' (more sensitive to large errors)
+
+# Learning rate scheduler
+scheduler: cosine_annealing            # Scheduler type
+                                       # Options: 'cosine_annealing', 'linear', 'exponential'
+                                       # Recommendation: cosine_annealing (best for deep learning)
+
+warmup_ratio: 0.08                     # Warmup ratio (not used in current implementation)
+                                       # Placeholder for future use
+
+# ========== PHASE 2: FINAL TRAINING (100% DATA) ==========
+# Phase 2 automatically uses:
+# - FIXED hyperparameters from Phase 1
+# - Epochs = best_epoch_from_phase1 + phase2_epoch_adjustment
+# - NO validation split
+# - NO early stopping
+# - Loads best Phase 1 model as initialization
+# - All data used for training
+
+# UPDATED: Number of additional epochs beyond best Phase 1 epoch
+phase2_epoch_adjustment: 5             # Additional epochs for Phase 2
+                                       # UPDATED: Set to 5 for better convergence
+                                       # Recommendation: 3-10
+                                       # Higher = more epochs on full data
+
+# ========== LOSS FUNCTION ==========
+# UPDATED: Changed from 'mse' to 'combined' for small ranges
+# Combined loss = α * MAPE + β * Ranking Loss
+# Perfect for score range (-0.2 to 0.2)
+
+loss_function: combined                # UPDATED: Changed from 'mse' to 'combined'
+                                       # Options: 'mse', 'mape', 'ranking', 'combined', 'huber', 'smooth_l1'
+                                       # 'combined': Best for small value ranges
+                                       # 'mape': Focuses on percentage error
+                                       # 'ranking': Focuses on ordering
+                                       # 'huber': Robust to outliers
+                                       # 'mse': Simple but less effective for small ranges
+
+# UPDATED: Combined Loss parameters
+loss_alpha: 0.5                        # Weight for MAPE loss (accuracy)
+                                       # UPDATED: Added for combined loss
+                                       # Recommendation: 0.3-0.7
+                                       # Higher = focus more on accuracy
+
+loss_beta: 0.5                         # Weight for Ranking loss (ordering)
+                                       # UPDATED: Added for combined loss
+                                       # Recommendation: 0.3-0.7
+                                       # Higher = focus more on ranking
+
+loss_margin: 0.01                      # Margin for ranking loss
+                                       # UPDATED: Added for combined loss
+                                       # Recommendation: 0.005-0.02
+                                       # Larger = more margin for ranking pairs
+
+# Optional: Huber loss parameters (if loss_function: huber)
+# UPDATED: Changed delta from 1.0 to 0.02 for small ranges
+huber_delta: 0.02                      # Threshold for Huber loss
+                                       # UPDATED: Changed from 1.0 to 0.02
+                                       # Recommendation: 0.01-0.05 for small ranges
+                                       # Lower = more robust to outliers
+
+# Optional: Smooth L1 loss parameters (if loss_function: smooth_l1)
+smooth_l1_beta: 1.0                    # Beta parameter for Smooth L1 loss
+                                       # Recommendation: 0.5-2.0
+                                       # Higher = smoother transitions
+
+# ========== TARGET NORMALIZATION ==========
+normalization_method: standardization  # Normalization method
+                                       # Options: 'standardization' or 'robust'
+                                       # standardization: (x - mean) / std
+                                       # robust: (x - median) / IQR
+                                       # Recommendation: 'standardization' (more stable)
+
+# ========== LABEL NOISE (OPTIONAL) ==========
+# Add Gaussian noise to targets for regularization
+# Helps prevent overfitting on small datasets
+
+add_label_noise: false                 # Enable/disable label noise
+                                       # Recommendation: false for competition
+                                       # true: useful for small datasets (< 1000 samples)
+
+label_noise_std: 0.01                  # Standard deviation of noise (in normalized space)
+                                       # Recommendation: 0.01-0.05
+                                       # Higher = more noise (more regularization)
+
+# ========== ENCODER FREEZING ==========
+# Which encoders to freeze during training
+# NOT APPLICABLE for single-target (no protein encoder)
+# Kept for compatibility with multi-target config
+
+freeze_protein_encoder: false          # NOT USED for single-target
+freeze_molecule_encoder: false         # Freeze molecule GNN encoder
+                                       # Recommendation: false (train all parameters)
+
+# ========== REPRODUCIBILITY ==========
+random_seed: 42                        # Random seed for reproducibility
+                                       # Controls: dataset split, weight initialization, dropout, etc.
+                                       # Recommendation: any fixed number for reproducibility
+
+# ========== DIRECTORIES ==========
+checkpoint_dir: checkpoints/single_target      # Directory to save model checkpoints
+                                               # Will contain:
+                                               # - best_phase1.pt (best model from phase 1)
+                                               # - final_model.pt (final model after phase 2)
+                                               # - normalizer.json (target normalization stats)
+                                               # - checkpoint_phase1_epoch_*.pt (phase 1 checkpoints)
+                                               # - checkpoint_phase2_epoch_*.pt (phase 2 checkpoints)
+
+cache_dir: cache/single_target                 # Directory for caching
+                                               # NOT USED for single-target (no protein embeddings)
+                                               # Kept for compatibility
+
+log_dir: logs/single_target                    # Directory for TensorBoard logs
+                                               # Contains:
+                                               # - phase1/ (phase 1 training logs)
+                                               # - phase2/ (phase 2 training logs)
+
+# ========== PRECOMPUTATION ==========
+precompute_proteins: false             # Precompute protein embeddings
+                                       # NOT APPLICABLE for single-target
+                                       # Recommendation: false (not needed)

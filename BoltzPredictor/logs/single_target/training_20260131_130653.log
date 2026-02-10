@@ -1,0 +1,645 @@
+2026-01-31 13:06:53 - boltzpredictor.utils.logging_config - INFO - [logging_config.py:61] - Logging configured. Log file: logs/single_target/training_20260131_130653.log
+2026-01-31 13:06:53 - boltzpredictor.utils.logging_config - INFO - [logging_config.py:62] - Log level: INFO
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:759] - ================================================================================
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:760] - Starting BoltzPredictor Training - Single-Target
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:761] - (Two-Phase: Selection + Full Retrain)
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:762] - Loss Function: COMBINED
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:763] - ================================================================================
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:764] - Config file: configs/config.yaml
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:765] - Log file: logs/single_target/training_20260131_130653.log
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:769] - Using device: cuda
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:771] - CUDA Device: NVIDIA GeForce RTX 4090
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:772] - CUDA Memory: 25.25 GB
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:779] - Loading datasets...
+2026-01-31 13:06:53 - __main__ - INFO - [train.py:780] - Train data: data/train.csv
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:359] - Loading single-target dataset from data/train.csv
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:361] - Loaded 4370 rows
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:368] - Available columns: ['molecule_name', 'target_protein', 'target_seq', 'final_score', 'epoch']
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:432] - Validating columns...
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:443] - ✅ Column validation passed
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:444] -   - Molecule names: molecule_name
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:445] -   - Scores: final_score
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:447] -   - Epoch IDs: epoch
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:448] -   - Target protein: FIXED (learned as parameter)
+2026-01-31 13:06:53 - boltzpredictor.data.dataset - INFO - [dataset.py:380] - Validating molecules...
+2026-01-31 13:07:01 - boltzpredictor.data.dataset - INFO - [dataset.py:425] - ✅ Single-target dataset validated: 4370 valid samples (filtered 0 invalid)
+2026-01-31 13:07:01 - __main__ - INFO - [train.py:790] - Full dataset loaded: 4370 samples
+2026-01-31 13:07:01 - __main__ - INFO - [train.py:802] - Fitting target normalizer on full dataset...
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:231] - Target normalizer fitted (standardization)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:232] -   Mean: 0.104337, Std: 0.039694
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:817] - Normalizer saved to checkpoints/single_target/normalizer.json
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:833] - Phase override: starting with phase 1
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:837] - ================================================================================
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:838] - PHASE 1: Model Selection (80/20 Train/Val Split)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:839] - ================================================================================
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:855] - Train split: 3496 samples (80%)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:856] - Val split: 874 samples (20%)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:862] - Creating data loaders - Batch size: 32, Workers: 4, Pin memory: True
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:872] - Train loader: 110 batches
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:882] - Val loader: 28 batches
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:885] - Creating model...
+2026-01-31 13:07:14 - boltzpredictor.models.boltz_predictor - INFO - [boltz_predictor.py:297] - Initialized SingleTargetAffinityPredictor - mol_hidden_dim=256, target_embedding_dim=512, interaction_dim=512, num_layers=4, dropout=0.15
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:897] - Model created - Total parameters: 1,921,541, Trainable: 1,921,541
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:904] - Optimizer: AdamW, LR: 0.0001, Weight decay: 0.0001
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:905] - Trainable parameters: 1,921,541
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:923] - Scheduler: Cosine annealing with warm restarts
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:702] - Using Combined Loss (MAPE + Ranking)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:703] -   α (MAPE weight): 0.5
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:704] -   β (Ranking weight): 0.5
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:705] -   Ranking margin: 0.01
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:58] - Initialized MAPELoss (epsilon=1e-06)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:91] - Initialized RankingLoss (margin=0.01)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:147] - Initialized CombinedLoss (alpha=0.5, beta=0.5, margin=0.01)
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:940] - TensorBoard logs: logs/single_target/phase1
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:953] - ================================================================================
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:954] - PHASE 1: Training for up to 50 epochs
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:955] - ================================================================================
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 1/50
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:07:14 - __main__ - INFO - [train.py:440] - Starting training epoch 1 [Phase1]
+2026-01-31 13:07:32 - __main__ - INFO - [train.py:507] - Epoch 1 training complete [Phase1] - Loss: 109.1082 | MAPE: 219.09%, MAE: 0.606007, RMSE: 0.857408, Ranking Acc: 65.86%
+2026-01-31 13:07:32 - __main__ - INFO - [train.py:972] - Train Loss: 109.1082
+2026-01-31 13:07:32 - __main__ - INFO - [train.py:973] - Train MAPE: 219.09%, MAE: 0.606007, RMSE: 0.857408, Ranking Acc: 65.86%
+2026-01-31 13:07:32 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 50.1480 | MAPE: 101.19%, MAE: 0.552062, RMSE: 0.679689, Ranking Acc: 71.53%
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:987] - Val Loss: 50.1480, MAPE: 101.19%, MAE: 0.552062, RMSE: 0.679689, Ranking Acc: 71.53%
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.679689
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:300] - Initial RMSE: 0.679689 at epoch 1
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 2/50
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:07:34 - __main__ - INFO - [train.py:440] - Starting training epoch 2 [Phase1]
+2026-01-31 13:07:50 - __main__ - INFO - [train.py:507] - Epoch 2 training complete [Phase1] - Loss: 102.2411 | MAPE: 205.56%, MAE: 0.447769, RMSE: 0.623342, Ranking Acc: 71.77%
+2026-01-31 13:07:50 - __main__ - INFO - [train.py:972] - Train Loss: 102.2411
+2026-01-31 13:07:50 - __main__ - INFO - [train.py:973] - Train MAPE: 205.56%, MAE: 0.447769, RMSE: 0.623342, Ranking Acc: 71.77%
+2026-01-31 13:07:50 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:07:52 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 67.0225 | MAPE: 136.04%, MAE: 0.398691, RMSE: 0.540023, Ranking Acc: 72.69%
+2026-01-31 13:07:52 - __main__ - INFO - [train.py:987] - Val Loss: 67.0225, MAPE: 136.04%, MAE: 0.398691, RMSE: 0.540023, Ranking Acc: 72.69%
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.540023
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.540023 at epoch 2 (improvement: 20.55%)
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 3/50
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:07:53 - __main__ - INFO - [train.py:440] - Starting training epoch 3 [Phase1]
+2026-01-31 13:08:09 - __main__ - INFO - [train.py:507] - Epoch 3 training complete [Phase1] - Loss: 57.9717 | MAPE: 116.34%, MAE: 0.404727, RMSE: 0.557339, Ranking Acc: 72.31%
+2026-01-31 13:08:09 - __main__ - INFO - [train.py:972] - Train Loss: 57.9717
+2026-01-31 13:08:09 - __main__ - INFO - [train.py:973] - Train MAPE: 116.34%, MAE: 0.404727, RMSE: 0.557339, Ranking Acc: 72.31%
+2026-01-31 13:08:09 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 53.1013 | MAPE: 107.12%, MAE: 0.503495, RMSE: 0.619006, Ranking Acc: 71.07%
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:987] - Val Loss: 53.1013, MAPE: 107.12%, MAE: 0.503495, RMSE: 0.619006, Ranking Acc: 71.07%
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 4/50
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:08:11 - __main__ - INFO - [train.py:440] - Starting training epoch 4 [Phase1]
+2026-01-31 13:08:24 - __main__ - INFO - [train.py:507] - Epoch 4 training complete [Phase1] - Loss: 91.5087 | MAPE: 183.70%, MAE: 0.401670, RMSE: 0.556251, Ranking Acc: 71.11%
+2026-01-31 13:08:24 - __main__ - INFO - [train.py:972] - Train Loss: 91.5087
+2026-01-31 13:08:24 - __main__ - INFO - [train.py:973] - Train MAPE: 183.70%, MAE: 0.401670, RMSE: 0.556251, Ranking Acc: 71.11%
+2026-01-31 13:08:24 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 59.8690 | MAPE: 121.36%, MAE: 0.395447, RMSE: 0.518459, Ranking Acc: 71.70%
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:987] - Val Loss: 59.8690, MAPE: 121.36%, MAE: 0.395447, RMSE: 0.518459, Ranking Acc: 71.70%
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.518459
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.518459 at epoch 4 (improvement: 3.99%)
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 5/50
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:08:26 - __main__ - INFO - [train.py:440] - Starting training epoch 5 [Phase1]
+2026-01-31 13:08:41 - __main__ - INFO - [train.py:507] - Epoch 5 training complete [Phase1] - Loss: 76.5054 | MAPE: 153.51%, MAE: 0.383501, RMSE: 0.529527, Ranking Acc: 72.37%
+2026-01-31 13:08:41 - __main__ - INFO - [train.py:972] - Train Loss: 76.5054
+2026-01-31 13:08:41 - __main__ - INFO - [train.py:973] - Train MAPE: 153.51%, MAE: 0.383501, RMSE: 0.529527, Ranking Acc: 72.37%
+2026-01-31 13:08:41 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 63.9215 | MAPE: 129.73%, MAE: 0.392312, RMSE: 0.520313, Ranking Acc: 72.80%
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:987] - Val Loss: 63.9215, MAPE: 129.73%, MAE: 0.392312, RMSE: 0.520313, Ranking Acc: 72.80%
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 6/50
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:08:43 - __main__ - INFO - [train.py:440] - Starting training epoch 6 [Phase1]
+2026-01-31 13:09:00 - __main__ - INFO - [train.py:507] - Epoch 6 training complete [Phase1] - Loss: 78.7907 | MAPE: 157.38%, MAE: 0.357169, RMSE: 0.486298, Ranking Acc: 73.31%
+2026-01-31 13:09:00 - __main__ - INFO - [train.py:972] - Train Loss: 78.7907
+2026-01-31 13:09:00 - __main__ - INFO - [train.py:973] - Train MAPE: 157.38%, MAE: 0.357169, RMSE: 0.486298, Ranking Acc: 73.31%
+2026-01-31 13:09:00 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:09:01 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 61.4583 | MAPE: 124.60%, MAE: 0.403989, RMSE: 0.547949, Ranking Acc: 71.44%
+2026-01-31 13:09:01 - __main__ - INFO - [train.py:987] - Val Loss: 61.4583, MAPE: 124.60%, MAE: 0.403989, RMSE: 0.547949, Ranking Acc: 71.44%
+2026-01-31 13:09:01 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:09:02 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:09:02 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 7/50
+2026-01-31 13:09:02 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:09:02 - __main__ - INFO - [train.py:440] - Starting training epoch 7 [Phase1]
+2026-01-31 13:09:16 - __main__ - INFO - [train.py:507] - Epoch 7 training complete [Phase1] - Loss: 61.0807 | MAPE: 122.78%, MAE: 0.364099, RMSE: 0.495331, Ranking Acc: 73.02%
+2026-01-31 13:09:16 - __main__ - INFO - [train.py:972] - Train Loss: 61.0807
+2026-01-31 13:09:16 - __main__ - INFO - [train.py:973] - Train MAPE: 122.78%, MAE: 0.364099, RMSE: 0.495331, Ranking Acc: 73.02%
+2026-01-31 13:09:16 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 76.7890 | MAPE: 156.31%, MAE: 0.329125, RMSE: 0.473120, Ranking Acc: 71.08%
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:987] - Val Loss: 76.7890, MAPE: 156.31%, MAE: 0.329125, RMSE: 0.473120, Ranking Acc: 71.08%
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.473120
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.473120 at epoch 7 (improvement: 8.74%)
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 8/50
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:09:17 - __main__ - INFO - [train.py:440] - Starting training epoch 8 [Phase1]
+2026-01-31 13:09:36 - __main__ - INFO - [train.py:507] - Epoch 8 training complete [Phase1] - Loss: 54.1261 | MAPE: 108.55%, MAE: 0.350665, RMSE: 0.487382, Ranking Acc: 72.63%
+2026-01-31 13:09:36 - __main__ - INFO - [train.py:972] - Train Loss: 54.1261
+2026-01-31 13:09:36 - __main__ - INFO - [train.py:973] - Train MAPE: 108.55%, MAE: 0.350665, RMSE: 0.487382, Ranking Acc: 72.63%
+2026-01-31 13:09:36 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 78.3436 | MAPE: 159.59%, MAE: 0.328190, RMSE: 0.476679, Ranking Acc: 72.06%
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:987] - Val Loss: 78.3436, MAPE: 159.59%, MAE: 0.328190, RMSE: 0.476679, Ranking Acc: 72.06%
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 9/50
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:09:38 - __main__ - INFO - [train.py:440] - Starting training epoch 9 [Phase1]
+2026-01-31 13:09:52 - __main__ - INFO - [train.py:507] - Epoch 9 training complete [Phase1] - Loss: 87.4310 | MAPE: 175.76%, MAE: 0.341452, RMSE: 0.480489, Ranking Acc: 73.50%
+2026-01-31 13:09:52 - __main__ - INFO - [train.py:972] - Train Loss: 87.4310
+2026-01-31 13:09:52 - __main__ - INFO - [train.py:973] - Train MAPE: 175.76%, MAE: 0.341452, RMSE: 0.480489, Ranking Acc: 73.50%
+2026-01-31 13:09:52 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 71.8609 | MAPE: 146.28%, MAE: 0.353167, RMSE: 0.507398, Ranking Acc: 71.26%
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:987] - Val Loss: 71.8609, MAPE: 146.28%, MAE: 0.353167, RMSE: 0.507398, Ranking Acc: 71.26%
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 10/50
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:09:54 - __main__ - INFO - [train.py:440] - Starting training epoch 10 [Phase1]
+2026-01-31 13:10:07 - __main__ - INFO - [train.py:507] - Epoch 10 training complete [Phase1] - Loss: 81.3165 | MAPE: 163.33%, MAE: 0.342815, RMSE: 0.474201, Ranking Acc: 73.19%
+2026-01-31 13:10:07 - __main__ - INFO - [train.py:972] - Train Loss: 81.3165
+2026-01-31 13:10:07 - __main__ - INFO - [train.py:973] - Train MAPE: 163.33%, MAE: 0.342815, RMSE: 0.474201, Ranking Acc: 73.19%
+2026-01-31 13:10:07 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:10:09 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 69.4396 | MAPE: 141.26%, MAE: 0.344639, RMSE: 0.475262, Ranking Acc: 71.98%
+2026-01-31 13:10:09 - __main__ - INFO - [train.py:987] - Val Loss: 69.4396, MAPE: 141.26%, MAE: 0.344639, RMSE: 0.475262, Ranking Acc: 71.98%
+2026-01-31 13:10:09 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:10:10 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:10:10 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 11/50
+2026-01-31 13:10:10 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:10:10 - __main__ - INFO - [train.py:440] - Starting training epoch 11 [Phase1]
+2026-01-31 13:10:29 - __main__ - INFO - [train.py:507] - Epoch 11 training complete [Phase1] - Loss: 63.4833 | MAPE: 127.50%, MAE: 0.331895, RMSE: 0.463036, Ranking Acc: 73.56%
+2026-01-31 13:10:29 - __main__ - INFO - [train.py:972] - Train Loss: 63.4833
+2026-01-31 13:10:29 - __main__ - INFO - [train.py:973] - Train MAPE: 127.50%, MAE: 0.331895, RMSE: 0.463036, Ranking Acc: 73.56%
+2026-01-31 13:10:29 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:10:31 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 76.8122 | MAPE: 156.10%, MAE: 0.323939, RMSE: 0.456811, Ranking Acc: 73.09%
+2026-01-31 13:10:31 - __main__ - INFO - [train.py:987] - Val Loss: 76.8122, MAPE: 156.10%, MAE: 0.323939, RMSE: 0.456811, Ranking Acc: 73.09%
+2026-01-31 13:10:31 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.456811
+2026-01-31 13:10:31 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:10:31 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.456811 at epoch 11 (improvement: 3.45%)
+2026-01-31 13:10:32 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:10:32 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 12/50
+2026-01-31 13:10:32 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:10:32 - __main__ - INFO - [train.py:440] - Starting training epoch 12 [Phase1]
+2026-01-31 13:10:43 - __main__ - INFO - [train.py:507] - Epoch 12 training complete [Phase1] - Loss: 63.0319 | MAPE: 126.58%, MAE: 0.329529, RMSE: 0.466428, Ranking Acc: 74.28%
+2026-01-31 13:10:43 - __main__ - INFO - [train.py:972] - Train Loss: 63.0319
+2026-01-31 13:10:43 - __main__ - INFO - [train.py:973] - Train MAPE: 126.58%, MAE: 0.329529, RMSE: 0.466428, Ranking Acc: 74.28%
+2026-01-31 13:10:43 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 71.6007 | MAPE: 145.41%, MAE: 0.335193, RMSE: 0.470215, Ranking Acc: 70.75%
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:987] - Val Loss: 71.6007, MAPE: 145.41%, MAE: 0.335193, RMSE: 0.470215, Ranking Acc: 70.75%
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 13/50
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:10:44 - __main__ - INFO - [train.py:440] - Starting training epoch 13 [Phase1]
+2026-01-31 13:10:57 - __main__ - INFO - [train.py:507] - Epoch 13 training complete [Phase1] - Loss: 72.6703 | MAPE: 146.04%, MAE: 0.329008, RMSE: 0.454823, Ranking Acc: 73.81%
+2026-01-31 13:10:57 - __main__ - INFO - [train.py:972] - Train Loss: 72.6703
+2026-01-31 13:10:57 - __main__ - INFO - [train.py:973] - Train MAPE: 146.04%, MAE: 0.329008, RMSE: 0.454823, Ranking Acc: 73.81%
+2026-01-31 13:10:57 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:10:58 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 77.0717 | MAPE: 156.92%, MAE: 0.337221, RMSE: 0.480349, Ranking Acc: 71.78%
+2026-01-31 13:10:58 - __main__ - INFO - [train.py:987] - Val Loss: 77.0717, MAPE: 156.92%, MAE: 0.337221, RMSE: 0.480349, Ranking Acc: 71.78%
+2026-01-31 13:10:58 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:10:59 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:10:59 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 14/50
+2026-01-31 13:10:59 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:10:59 - __main__ - INFO - [train.py:440] - Starting training epoch 14 [Phase1]
+2026-01-31 13:11:16 - __main__ - INFO - [train.py:507] - Epoch 14 training complete [Phase1] - Loss: 63.9655 | MAPE: 128.43%, MAE: 0.328405, RMSE: 0.456736, Ranking Acc: 73.88%
+2026-01-31 13:11:16 - __main__ - INFO - [train.py:972] - Train Loss: 63.9655
+2026-01-31 13:11:16 - __main__ - INFO - [train.py:973] - Train MAPE: 128.43%, MAE: 0.328405, RMSE: 0.456736, Ranking Acc: 73.88%
+2026-01-31 13:11:16 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 82.0032 | MAPE: 166.91%, MAE: 0.305560, RMSE: 0.459263, Ranking Acc: 70.97%
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:987] - Val Loss: 82.0032, MAPE: 166.91%, MAE: 0.305560, RMSE: 0.459263, Ranking Acc: 70.97%
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 15/50
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:11:18 - __main__ - INFO - [train.py:440] - Starting training epoch 15 [Phase1]
+2026-01-31 13:11:34 - __main__ - INFO - [train.py:507] - Epoch 15 training complete [Phase1] - Loss: 39.1021 | MAPE: 78.41%, MAE: 0.314885, RMSE: 0.440292, Ranking Acc: 74.56%
+2026-01-31 13:11:34 - __main__ - INFO - [train.py:972] - Train Loss: 39.1021
+2026-01-31 13:11:34 - __main__ - INFO - [train.py:973] - Train MAPE: 78.41%, MAE: 0.314885, RMSE: 0.440292, Ranking Acc: 74.56%
+2026-01-31 13:11:34 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 72.7087 | MAPE: 147.71%, MAE: 0.323159, RMSE: 0.453605, Ranking Acc: 70.88%
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:987] - Val Loss: 72.7087, MAPE: 147.71%, MAE: 0.323159, RMSE: 0.453605, Ranking Acc: 70.88%
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.453605
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 4/10
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 16/50
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:11:36 - __main__ - INFO - [train.py:440] - Starting training epoch 16 [Phase1]
+2026-01-31 13:11:52 - __main__ - INFO - [train.py:507] - Epoch 16 training complete [Phase1] - Loss: 72.0263 | MAPE: 144.76%, MAE: 0.314630, RMSE: 0.438561, Ranking Acc: 74.78%
+2026-01-31 13:11:52 - __main__ - INFO - [train.py:972] - Train Loss: 72.0263
+2026-01-31 13:11:52 - __main__ - INFO - [train.py:973] - Train MAPE: 144.76%, MAE: 0.314630, RMSE: 0.438561, Ranking Acc: 74.78%
+2026-01-31 13:11:52 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 78.7546 | MAPE: 160.62%, MAE: 0.312388, RMSE: 0.463989, Ranking Acc: 71.48%
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:987] - Val Loss: 78.7546, MAPE: 160.62%, MAE: 0.312388, RMSE: 0.463989, Ranking Acc: 71.48%
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 5/10
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 17/50
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:11:54 - __main__ - INFO - [train.py:440] - Starting training epoch 17 [Phase1]
+2026-01-31 13:12:06 - __main__ - INFO - [train.py:507] - Epoch 17 training complete [Phase1] - Loss: 74.3071 | MAPE: 149.35%, MAE: 0.313206, RMSE: 0.444169, Ranking Acc: 74.82%
+2026-01-31 13:12:06 - __main__ - INFO - [train.py:972] - Train Loss: 74.3071
+2026-01-31 13:12:06 - __main__ - INFO - [train.py:973] - Train MAPE: 149.35%, MAE: 0.313206, RMSE: 0.444169, Ranking Acc: 74.82%
+2026-01-31 13:12:06 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 66.5886 | MAPE: 135.21%, MAE: 0.319833, RMSE: 0.437264, Ranking Acc: 71.57%
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:987] - Val Loss: 66.5886, MAPE: 135.21%, MAE: 0.319833, RMSE: 0.437264, Ranking Acc: 71.57%
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.437264
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.437264 at epoch 17 (improvement: 4.28%)
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 18/50
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:12:07 - __main__ - INFO - [train.py:440] - Starting training epoch 18 [Phase1]
+2026-01-31 13:12:25 - __main__ - INFO - [train.py:507] - Epoch 18 training complete [Phase1] - Loss: 58.3779 | MAPE: 117.04%, MAE: 0.319328, RMSE: 0.450902, Ranking Acc: 74.59%
+2026-01-31 13:12:25 - __main__ - INFO - [train.py:972] - Train Loss: 58.3779
+2026-01-31 13:12:25 - __main__ - INFO - [train.py:973] - Train MAPE: 117.04%, MAE: 0.319328, RMSE: 0.450902, Ranking Acc: 74.59%
+2026-01-31 13:12:25 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 76.5267 | MAPE: 155.89%, MAE: 0.303148, RMSE: 0.445171, Ranking Acc: 71.26%
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:987] - Val Loss: 76.5267, MAPE: 155.89%, MAE: 0.303148, RMSE: 0.445171, Ranking Acc: 71.26%
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 19/50
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:12:27 - __main__ - INFO - [train.py:440] - Starting training epoch 19 [Phase1]
+2026-01-31 13:12:44 - __main__ - INFO - [train.py:507] - Epoch 19 training complete [Phase1] - Loss: 44.8407 | MAPE: 89.94%, MAE: 0.297673, RMSE: 0.425654, Ranking Acc: 75.30%
+2026-01-31 13:12:44 - __main__ - INFO - [train.py:972] - Train Loss: 44.8407
+2026-01-31 13:12:44 - __main__ - INFO - [train.py:973] - Train MAPE: 89.94%, MAE: 0.297673, RMSE: 0.425654, Ranking Acc: 75.30%
+2026-01-31 13:12:44 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 66.2077 | MAPE: 134.48%, MAE: 0.331676, RMSE: 0.466471, Ranking Acc: 71.42%
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:987] - Val Loss: 66.2077, MAPE: 134.48%, MAE: 0.331676, RMSE: 0.466471, Ranking Acc: 71.42%
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 20/50
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:12:45 - __main__ - INFO - [train.py:440] - Starting training epoch 20 [Phase1]
+2026-01-31 13:12:56 - __main__ - INFO - [train.py:507] - Epoch 20 training complete [Phase1] - Loss: 37.4752 | MAPE: 74.64%, MAE: 0.307962, RMSE: 0.428417, Ranking Acc: 75.12%
+2026-01-31 13:12:56 - __main__ - INFO - [train.py:972] - Train Loss: 37.4752
+2026-01-31 13:12:56 - __main__ - INFO - [train.py:973] - Train MAPE: 74.64%, MAE: 0.307962, RMSE: 0.428417, Ranking Acc: 75.12%
+2026-01-31 13:12:56 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 69.4600 | MAPE: 141.21%, MAE: 0.338095, RMSE: 0.482967, Ranking Acc: 71.85%
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:987] - Val Loss: 69.4600, MAPE: 141.21%, MAE: 0.338095, RMSE: 0.482967, Ranking Acc: 71.85%
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 21/50
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:12:58 - __main__ - INFO - [train.py:440] - Starting training epoch 21 [Phase1]
+2026-01-31 13:13:18 - __main__ - INFO - [train.py:507] - Epoch 21 training complete [Phase1] - Loss: 68.5927 | MAPE: 137.37%, MAE: 0.306777, RMSE: 0.431702, Ranking Acc: 75.02%
+2026-01-31 13:13:18 - __main__ - INFO - [train.py:972] - Train Loss: 68.5927
+2026-01-31 13:13:18 - __main__ - INFO - [train.py:973] - Train MAPE: 137.37%, MAE: 0.306777, RMSE: 0.431702, Ranking Acc: 75.02%
+2026-01-31 13:13:18 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 76.9719 | MAPE: 156.57%, MAE: 0.301394, RMSE: 0.433253, Ranking Acc: 71.65%
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:987] - Val Loss: 76.9719, MAPE: 156.57%, MAE: 0.301394, RMSE: 0.433253, Ranking Acc: 71.65%
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.433253
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 4/10
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 22/50
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:13:20 - __main__ - INFO - [train.py:440] - Starting training epoch 22 [Phase1]
+2026-01-31 13:13:35 - __main__ - INFO - [train.py:507] - Epoch 22 training complete [Phase1] - Loss: 38.7226 | MAPE: 77.26%, MAE: 0.294013, RMSE: 0.409334, Ranking Acc: 75.38%
+2026-01-31 13:13:35 - __main__ - INFO - [train.py:972] - Train Loss: 38.7226
+2026-01-31 13:13:35 - __main__ - INFO - [train.py:973] - Train MAPE: 77.26%, MAE: 0.294013, RMSE: 0.409334, Ranking Acc: 75.38%
+2026-01-31 13:13:35 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 70.9833 | MAPE: 144.01%, MAE: 0.337756, RMSE: 0.451828, Ranking Acc: 72.02%
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:987] - Val Loss: 70.9833, MAPE: 144.01%, MAE: 0.337756, RMSE: 0.451828, Ranking Acc: 72.02%
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 5/10
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 23/50
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:13:37 - __main__ - INFO - [train.py:440] - Starting training epoch 23 [Phase1]
+2026-01-31 13:13:50 - __main__ - INFO - [train.py:507] - Epoch 23 training complete [Phase1] - Loss: 39.4000 | MAPE: 79.09%, MAE: 0.301567, RMSE: 0.424134, Ranking Acc: 75.62%
+2026-01-31 13:13:50 - __main__ - INFO - [train.py:972] - Train Loss: 39.4000
+2026-01-31 13:13:50 - __main__ - INFO - [train.py:973] - Train MAPE: 79.09%, MAE: 0.301567, RMSE: 0.424134, Ranking Acc: 75.62%
+2026-01-31 13:13:50 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 58.9076 | MAPE: 119.65%, MAE: 0.334003, RMSE: 0.461170, Ranking Acc: 71.14%
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:987] - Val Loss: 58.9076, MAPE: 119.65%, MAE: 0.334003, RMSE: 0.461170, Ranking Acc: 71.14%
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 6/10
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 24/50
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:13:52 - __main__ - INFO - [train.py:440] - Starting training epoch 24 [Phase1]
+2026-01-31 13:14:11 - __main__ - INFO - [train.py:507] - Epoch 24 training complete [Phase1] - Loss: 44.0185 | MAPE: 88.29%, MAE: 0.282627, RMSE: 0.398682, Ranking Acc: 76.35%
+2026-01-31 13:14:11 - __main__ - INFO - [train.py:972] - Train Loss: 44.0185
+2026-01-31 13:14:11 - __main__ - INFO - [train.py:973] - Train MAPE: 88.29%, MAE: 0.282627, RMSE: 0.398682, Ranking Acc: 76.35%
+2026-01-31 13:14:11 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 73.0211 | MAPE: 148.22%, MAE: 0.344026, RMSE: 0.467330, Ranking Acc: 71.52%
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:987] - Val Loss: 73.0211, MAPE: 148.22%, MAE: 0.344026, RMSE: 0.467330, Ranking Acc: 71.52%
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 7/10
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 25/50
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:14:14 - __main__ - INFO - [train.py:440] - Starting training epoch 25 [Phase1]
+2026-01-31 13:14:26 - __main__ - INFO - [train.py:507] - Epoch 25 training complete [Phase1] - Loss: 30.5916 | MAPE: 61.35%, MAE: 0.289347, RMSE: 0.403797, Ranking Acc: 76.00%
+2026-01-31 13:14:26 - __main__ - INFO - [train.py:972] - Train Loss: 30.5916
+2026-01-31 13:14:26 - __main__ - INFO - [train.py:973] - Train MAPE: 61.35%, MAE: 0.289347, RMSE: 0.403797, Ranking Acc: 76.00%
+2026-01-31 13:14:26 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 82.5997 | MAPE: 168.44%, MAE: 0.300521, RMSE: 0.429753, Ranking Acc: 72.02%
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:987] - Val Loss: 82.5997, MAPE: 168.44%, MAE: 0.300521, RMSE: 0.429753, Ranking Acc: 72.02%
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.429753
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.429753 at epoch 25 (improvement: 1.72%)
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 26/50
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:14:28 - __main__ - INFO - [train.py:440] - Starting training epoch 26 [Phase1]
+2026-01-31 13:14:42 - __main__ - INFO - [train.py:507] - Epoch 26 training complete [Phase1] - Loss: 45.7455 | MAPE: 91.56%, MAE: 0.280542, RMSE: 0.395328, Ranking Acc: 76.39%
+2026-01-31 13:14:42 - __main__ - INFO - [train.py:972] - Train Loss: 45.7455
+2026-01-31 13:14:42 - __main__ - INFO - [train.py:973] - Train MAPE: 91.56%, MAE: 0.280542, RMSE: 0.395328, Ranking Acc: 76.39%
+2026-01-31 13:14:42 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 82.7895 | MAPE: 168.89%, MAE: 0.296482, RMSE: 0.436011, Ranking Acc: 71.50%
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:987] - Val Loss: 82.7895, MAPE: 168.89%, MAE: 0.296482, RMSE: 0.436011, Ranking Acc: 71.50%
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 27/50
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:14:43 - __main__ - INFO - [train.py:440] - Starting training epoch 27 [Phase1]
+2026-01-31 13:14:58 - __main__ - INFO - [train.py:507] - Epoch 27 training complete [Phase1] - Loss: 38.9869 | MAPE: 78.22%, MAE: 0.285655, RMSE: 0.405321, Ranking Acc: 76.16%
+2026-01-31 13:14:58 - __main__ - INFO - [train.py:972] - Train Loss: 38.9869
+2026-01-31 13:14:58 - __main__ - INFO - [train.py:973] - Train MAPE: 78.22%, MAE: 0.285655, RMSE: 0.405321, Ranking Acc: 76.16%
+2026-01-31 13:14:58 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 74.9425 | MAPE: 152.47%, MAE: 0.318089, RMSE: 0.433364, Ranking Acc: 71.84%
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:987] - Val Loss: 74.9425, MAPE: 152.47%, MAE: 0.318089, RMSE: 0.433364, Ranking Acc: 71.84%
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 28/50
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:15:00 - __main__ - INFO - [train.py:440] - Starting training epoch 28 [Phase1]
+2026-01-31 13:15:19 - __main__ - INFO - [train.py:507] - Epoch 28 training complete [Phase1] - Loss: 41.4013 | MAPE: 83.02%, MAE: 0.279357, RMSE: 0.396722, Ranking Acc: 76.49%
+2026-01-31 13:15:19 - __main__ - INFO - [train.py:972] - Train Loss: 41.4013
+2026-01-31 13:15:19 - __main__ - INFO - [train.py:973] - Train MAPE: 83.02%, MAE: 0.279357, RMSE: 0.396722, Ranking Acc: 76.49%
+2026-01-31 13:15:19 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 72.7268 | MAPE: 148.11%, MAE: 0.328958, RMSE: 0.459153, Ranking Acc: 71.27%
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:987] - Val Loss: 72.7268, MAPE: 148.11%, MAE: 0.328958, RMSE: 0.459153, Ranking Acc: 71.27%
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 29/50
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:15:21 - __main__ - INFO - [train.py:440] - Starting training epoch 29 [Phase1]
+2026-01-31 13:15:33 - __main__ - INFO - [train.py:507] - Epoch 29 training complete [Phase1] - Loss: 39.1687 | MAPE: 78.48%, MAE: 0.278286, RMSE: 0.392835, Ranking Acc: 76.25%
+2026-01-31 13:15:33 - __main__ - INFO - [train.py:972] - Train Loss: 39.1687
+2026-01-31 13:15:33 - __main__ - INFO - [train.py:973] - Train MAPE: 78.48%, MAE: 0.278286, RMSE: 0.392835, Ranking Acc: 76.25%
+2026-01-31 13:15:33 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 74.2064 | MAPE: 150.90%, MAE: 0.327122, RMSE: 0.450338, Ranking Acc: 70.24%
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:987] - Val Loss: 74.2064, MAPE: 150.90%, MAE: 0.327122, RMSE: 0.450338, Ranking Acc: 70.24%
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 4/10
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 30/50
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:15:34 - __main__ - INFO - [train.py:440] - Starting training epoch 30 [Phase1]
+2026-01-31 13:15:50 - __main__ - INFO - [train.py:507] - Epoch 30 training complete [Phase1] - Loss: 37.4276 | MAPE: 74.72%, MAE: 0.274474, RMSE: 0.387601, Ranking Acc: 76.58%
+2026-01-31 13:15:50 - __main__ - INFO - [train.py:972] - Train Loss: 37.4276
+2026-01-31 13:15:50 - __main__ - INFO - [train.py:973] - Train MAPE: 74.72%, MAE: 0.274474, RMSE: 0.387601, Ranking Acc: 76.58%
+2026-01-31 13:15:50 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 85.2187 | MAPE: 173.88%, MAE: 0.319697, RMSE: 0.446249, Ranking Acc: 71.35%
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:987] - Val Loss: 85.2187, MAPE: 173.88%, MAE: 0.319697, RMSE: 0.446249, Ranking Acc: 71.35%
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 5/10
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 31/50
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:15:52 - __main__ - INFO - [train.py:440] - Starting training epoch 31 [Phase1]
+2026-01-31 13:16:10 - __main__ - INFO - [train.py:507] - Epoch 31 training complete [Phase1] - Loss: 37.1196 | MAPE: 74.57%, MAE: 0.274810, RMSE: 0.394279, Ranking Acc: 77.34%
+2026-01-31 13:16:10 - __main__ - INFO - [train.py:972] - Train Loss: 37.1196
+2026-01-31 13:16:10 - __main__ - INFO - [train.py:973] - Train MAPE: 74.57%, MAE: 0.274810, RMSE: 0.394279, Ranking Acc: 77.34%
+2026-01-31 13:16:10 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 87.6957 | MAPE: 178.68%, MAE: 0.304375, RMSE: 0.439447, Ranking Acc: 71.29%
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:987] - Val Loss: 87.6957, MAPE: 178.68%, MAE: 0.304375, RMSE: 0.439447, Ranking Acc: 71.29%
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 6/10
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 32/50
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:16:11 - __main__ - INFO - [train.py:440] - Starting training epoch 32 [Phase1]
+2026-01-31 13:16:24 - __main__ - INFO - [train.py:507] - Epoch 32 training complete [Phase1] - Loss: 44.7428 | MAPE: 89.85%, MAE: 0.267765, RMSE: 0.380058, Ranking Acc: 77.22%
+2026-01-31 13:16:24 - __main__ - INFO - [train.py:972] - Train Loss: 44.7428
+2026-01-31 13:16:24 - __main__ - INFO - [train.py:973] - Train MAPE: 89.85%, MAE: 0.267765, RMSE: 0.380058, Ranking Acc: 77.22%
+2026-01-31 13:16:24 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 76.2887 | MAPE: 155.16%, MAE: 0.331660, RMSE: 0.447307, Ranking Acc: 71.32%
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:987] - Val Loss: 76.2887, MAPE: 155.16%, MAE: 0.331660, RMSE: 0.447307, Ranking Acc: 71.32%
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 7/10
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 33/50
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:16:26 - __main__ - INFO - [train.py:440] - Starting training epoch 33 [Phase1]
+2026-01-31 13:16:44 - __main__ - INFO - [train.py:507] - Epoch 33 training complete [Phase1] - Loss: 40.7979 | MAPE: 79.85%, MAE: 0.263231, RMSE: 0.373036, Ranking Acc: 77.65%
+2026-01-31 13:16:44 - __main__ - INFO - [train.py:972] - Train Loss: 40.7979
+2026-01-31 13:16:44 - __main__ - INFO - [train.py:973] - Train MAPE: 79.85%, MAE: 0.263231, RMSE: 0.373036, Ranking Acc: 77.65%
+2026-01-31 13:16:44 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:16:46 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 80.6036 | MAPE: 163.98%, MAE: 0.315075, RMSE: 0.429599, Ranking Acc: 72.05%
+2026-01-31 13:16:46 - __main__ - INFO - [train.py:987] - Val Loss: 80.6036, MAPE: 163.98%, MAE: 0.315075, RMSE: 0.429599, Ranking Acc: 72.05%
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.429599
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 8/10
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 34/50
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:16:47 - __main__ - INFO - [train.py:440] - Starting training epoch 34 [Phase1]
+2026-01-31 13:17:01 - __main__ - INFO - [train.py:507] - Epoch 34 training complete [Phase1] - Loss: 36.7684 | MAPE: 73.53%, MAE: 0.265274, RMSE: 0.376758, Ranking Acc: 77.58%
+2026-01-31 13:17:01 - __main__ - INFO - [train.py:972] - Train Loss: 36.7684
+2026-01-31 13:17:01 - __main__ - INFO - [train.py:973] - Train MAPE: 73.53%, MAE: 0.265274, RMSE: 0.376758, Ranking Acc: 77.58%
+2026-01-31 13:17:01 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 78.5099 | MAPE: 159.94%, MAE: 0.304760, RMSE: 0.422779, Ranking Acc: 71.66%
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:987] - Val Loss: 78.5099, MAPE: 159.94%, MAE: 0.304760, RMSE: 0.422779, Ranking Acc: 71.66%
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.422779
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.422779 at epoch 34 (improvement: 1.62%)
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 35/50
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:17:02 - __main__ - INFO - [train.py:440] - Starting training epoch 35 [Phase1]
+2026-01-31 13:17:18 - __main__ - INFO - [train.py:507] - Epoch 35 training complete [Phase1] - Loss: 33.2926 | MAPE: 66.66%, MAE: 0.261421, RMSE: 0.376049, Ranking Acc: 77.88%
+2026-01-31 13:17:18 - __main__ - INFO - [train.py:972] - Train Loss: 33.2926
+2026-01-31 13:17:18 - __main__ - INFO - [train.py:973] - Train MAPE: 66.66%, MAE: 0.261421, RMSE: 0.376049, Ranking Acc: 77.88%
+2026-01-31 13:17:18 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 85.7247 | MAPE: 174.75%, MAE: 0.294684, RMSE: 0.420054, Ranking Acc: 71.78%
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:987] - Val Loss: 85.7247, MAPE: 174.75%, MAE: 0.294684, RMSE: 0.420054, Ranking Acc: 71.78%
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.420054
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 36/50
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:17:20 - __main__ - INFO - [train.py:440] - Starting training epoch 36 [Phase1]
+2026-01-31 13:17:40 - __main__ - INFO - [train.py:507] - Epoch 36 training complete [Phase1] - Loss: 43.5778 | MAPE: 87.42%, MAE: 0.254099, RMSE: 0.368155, Ranking Acc: 77.85%
+2026-01-31 13:17:40 - __main__ - INFO - [train.py:972] - Train Loss: 43.5778
+2026-01-31 13:17:40 - __main__ - INFO - [train.py:973] - Train MAPE: 87.42%, MAE: 0.254099, RMSE: 0.368155, Ranking Acc: 77.85%
+2026-01-31 13:17:40 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 74.8595 | MAPE: 152.35%, MAE: 0.325753, RMSE: 0.462352, Ranking Acc: 70.54%
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:987] - Val Loss: 74.8595, MAPE: 152.35%, MAE: 0.325753, RMSE: 0.462352, Ranking Acc: 70.54%
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 37/50
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:17:42 - __main__ - INFO - [train.py:440] - Starting training epoch 37 [Phase1]
+2026-01-31 13:17:54 - __main__ - INFO - [train.py:507] - Epoch 37 training complete [Phase1] - Loss: 31.8503 | MAPE: 63.78%, MAE: 0.254374, RMSE: 0.368420, Ranking Acc: 78.26%
+2026-01-31 13:17:54 - __main__ - INFO - [train.py:972] - Train Loss: 31.8503
+2026-01-31 13:17:54 - __main__ - INFO - [train.py:973] - Train MAPE: 63.78%, MAE: 0.254374, RMSE: 0.368420, Ranking Acc: 78.26%
+2026-01-31 13:17:54 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 68.5726 | MAPE: 139.48%, MAE: 0.327022, RMSE: 0.453176, Ranking Acc: 71.82%
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:987] - Val Loss: 68.5726, MAPE: 139.48%, MAE: 0.327022, RMSE: 0.453176, Ranking Acc: 71.82%
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 38/50
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:17:56 - __main__ - INFO - [train.py:440] - Starting training epoch 38 [Phase1]
+2026-01-31 13:18:11 - __main__ - INFO - [train.py:507] - Epoch 38 training complete [Phase1] - Loss: 29.7582 | MAPE: 59.67%, MAE: 0.261741, RMSE: 0.377875, Ranking Acc: 78.30%
+2026-01-31 13:18:11 - __main__ - INFO - [train.py:972] - Train Loss: 29.7582
+2026-01-31 13:18:11 - __main__ - INFO - [train.py:973] - Train MAPE: 59.67%, MAE: 0.261741, RMSE: 0.377875, Ranking Acc: 78.30%
+2026-01-31 13:18:11 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 83.9829 | MAPE: 171.17%, MAE: 0.298058, RMSE: 0.420847, Ranking Acc: 71.41%
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:987] - Val Loss: 83.9829, MAPE: 171.17%, MAE: 0.298058, RMSE: 0.420847, Ranking Acc: 71.41%
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 4/10
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 39/50
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:18:13 - __main__ - INFO - [train.py:440] - Starting training epoch 39 [Phase1]
+2026-01-31 13:18:32 - __main__ - INFO - [train.py:507] - Epoch 39 training complete [Phase1] - Loss: 33.3920 | MAPE: 66.94%, MAE: 0.249713, RMSE: 0.361258, Ranking Acc: 78.18%
+2026-01-31 13:18:32 - __main__ - INFO - [train.py:972] - Train Loss: 33.3920
+2026-01-31 13:18:32 - __main__ - INFO - [train.py:973] - Train MAPE: 66.94%, MAE: 0.249713, RMSE: 0.361258, Ranking Acc: 78.18%
+2026-01-31 13:18:32 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:18:33 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 77.2753 | MAPE: 157.38%, MAE: 0.296129, RMSE: 0.414274, Ranking Acc: 71.79%
+2026-01-31 13:18:33 - __main__ - INFO - [train.py:987] - Val Loss: 77.2753, MAPE: 157.38%, MAE: 0.296129, RMSE: 0.414274, Ranking Acc: 71.79%
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.414274
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.414274 at epoch 39 (improvement: 2.01%)
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 40/50
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:18:34 - __main__ - INFO - [train.py:440] - Starting training epoch 40 [Phase1]
+2026-01-31 13:18:45 - __main__ - INFO - [train.py:507] - Epoch 40 training complete [Phase1] - Loss: 27.1031 | MAPE: 54.29%, MAE: 0.251820, RMSE: 0.361431, Ranking Acc: 78.26%
+2026-01-31 13:18:45 - __main__ - INFO - [train.py:972] - Train Loss: 27.1031
+2026-01-31 13:18:45 - __main__ - INFO - [train.py:973] - Train MAPE: 54.29%, MAE: 0.251820, RMSE: 0.361431, Ranking Acc: 78.26%
+2026-01-31 13:18:45 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 87.2071 | MAPE: 177.87%, MAE: 0.303289, RMSE: 0.437390, Ranking Acc: 71.47%
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:987] - Val Loss: 87.2071, MAPE: 177.87%, MAE: 0.303289, RMSE: 0.437390, Ranking Acc: 71.47%
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 41/50
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:18:46 - __main__ - INFO - [train.py:440] - Starting training epoch 41 [Phase1]
+2026-01-31 13:19:02 - __main__ - INFO - [train.py:507] - Epoch 41 training complete [Phase1] - Loss: 30.7638 | MAPE: 61.27%, MAE: 0.243987, RMSE: 0.356783, Ranking Acc: 79.01%
+2026-01-31 13:19:02 - __main__ - INFO - [train.py:972] - Train Loss: 30.7638
+2026-01-31 13:19:02 - __main__ - INFO - [train.py:973] - Train MAPE: 61.27%, MAE: 0.243987, RMSE: 0.356783, Ranking Acc: 79.01%
+2026-01-31 13:19:02 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 77.1177 | MAPE: 157.14%, MAE: 0.297820, RMSE: 0.414252, Ranking Acc: 72.12%
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:987] - Val Loss: 77.1177, MAPE: 157.14%, MAE: 0.297820, RMSE: 0.414252, Ranking Acc: 72.12%
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.414252
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 42/50
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:19:04 - __main__ - INFO - [train.py:440] - Starting training epoch 42 [Phase1]
+2026-01-31 13:19:20 - __main__ - INFO - [train.py:507] - Epoch 42 training complete [Phase1] - Loss: 46.1059 | MAPE: 92.63%, MAE: 0.245302, RMSE: 0.346594, Ranking Acc: 78.67%
+2026-01-31 13:19:20 - __main__ - INFO - [train.py:972] - Train Loss: 46.1059
+2026-01-31 13:19:20 - __main__ - INFO - [train.py:973] - Train MAPE: 92.63%, MAE: 0.245302, RMSE: 0.346594, Ranking Acc: 78.67%
+2026-01-31 13:19:20 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 85.2082 | MAPE: 173.70%, MAE: 0.279647, RMSE: 0.395862, Ranking Acc: 72.60%
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:987] - Val Loss: 85.2082, MAPE: 173.70%, MAE: 0.279647, RMSE: 0.395862, Ranking Acc: 72.60%
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.395862
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.395862 at epoch 42 (improvement: 4.44%)
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 43/50
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:19:21 - __main__ - INFO - [train.py:440] - Starting training epoch 43 [Phase1]
+2026-01-31 13:19:36 - __main__ - INFO - [train.py:507] - Epoch 43 training complete [Phase1] - Loss: 25.8941 | MAPE: 51.74%, MAE: 0.242388, RMSE: 0.352243, Ranking Acc: 79.22%
+2026-01-31 13:19:36 - __main__ - INFO - [train.py:972] - Train Loss: 25.8941
+2026-01-31 13:19:36 - __main__ - INFO - [train.py:973] - Train MAPE: 51.74%, MAE: 0.242388, RMSE: 0.352243, Ranking Acc: 79.22%
+2026-01-31 13:19:36 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 82.6991 | MAPE: 168.41%, MAE: 0.300964, RMSE: 0.415880, Ranking Acc: 71.64%
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:987] - Val Loss: 82.6991, MAPE: 168.41%, MAE: 0.300964, RMSE: 0.415880, Ranking Acc: 71.64%
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 44/50
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:19:38 - __main__ - INFO - [train.py:440] - Starting training epoch 44 [Phase1]
+2026-01-31 13:19:57 - __main__ - INFO - [train.py:507] - Epoch 44 training complete [Phase1] - Loss: 26.2036 | MAPE: 52.25%, MAE: 0.238080, RMSE: 0.340775, Ranking Acc: 79.01%
+2026-01-31 13:19:57 - __main__ - INFO - [train.py:972] - Train Loss: 26.2036
+2026-01-31 13:19:57 - __main__ - INFO - [train.py:973] - Train MAPE: 52.25%, MAE: 0.238080, RMSE: 0.340775, Ranking Acc: 79.01%
+2026-01-31 13:19:57 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 79.8168 | MAPE: 162.51%, MAE: 0.301639, RMSE: 0.418010, Ranking Acc: 72.35%
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:987] - Val Loss: 79.8168, MAPE: 162.51%, MAE: 0.301639, RMSE: 0.418010, Ranking Acc: 72.35%
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 45/50
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:19:58 - __main__ - INFO - [train.py:440] - Starting training epoch 45 [Phase1]
+2026-01-31 13:20:11 - __main__ - INFO - [train.py:507] - Epoch 45 training complete [Phase1] - Loss: 27.2696 | MAPE: 54.67%, MAE: 0.238186, RMSE: 0.339765, Ranking Acc: 79.11%
+2026-01-31 13:20:11 - __main__ - INFO - [train.py:972] - Train Loss: 27.2696
+2026-01-31 13:20:11 - __main__ - INFO - [train.py:973] - Train MAPE: 54.67%, MAE: 0.238186, RMSE: 0.339765, Ranking Acc: 79.11%
+2026-01-31 13:20:11 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 87.3425 | MAPE: 178.12%, MAE: 0.287208, RMSE: 0.410052, Ranking Acc: 72.05%
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:987] - Val Loss: 87.3425, MAPE: 178.12%, MAE: 0.287208, RMSE: 0.410052, Ranking Acc: 72.05%
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 3/10
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 46/50
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:20:12 - __main__ - INFO - [train.py:440] - Starting training epoch 46 [Phase1]
+2026-01-31 13:20:32 - __main__ - INFO - [train.py:507] - Epoch 46 training complete [Phase1] - Loss: 24.7508 | MAPE: 49.59%, MAE: 0.236979, RMSE: 0.343518, Ranking Acc: 79.36%
+2026-01-31 13:20:32 - __main__ - INFO - [train.py:972] - Train Loss: 24.7508
+2026-01-31 13:20:32 - __main__ - INFO - [train.py:973] - Train MAPE: 49.59%, MAE: 0.236979, RMSE: 0.343518, Ranking Acc: 79.36%
+2026-01-31 13:20:32 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 90.4508 | MAPE: 184.44%, MAE: 0.305120, RMSE: 0.423746, Ranking Acc: 71.28%
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:987] - Val Loss: 90.4508, MAPE: 184.44%, MAE: 0.305120, RMSE: 0.423746, Ranking Acc: 71.28%
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 4/10
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 47/50
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:20:34 - __main__ - INFO - [train.py:440] - Starting training epoch 47 [Phase1]
+2026-01-31 13:20:48 - __main__ - INFO - [train.py:507] - Epoch 47 training complete [Phase1] - Loss: 23.8581 | MAPE: 47.76%, MAE: 0.236396, RMSE: 0.339656, Ranking Acc: 79.28%
+2026-01-31 13:20:48 - __main__ - INFO - [train.py:972] - Train Loss: 23.8581
+2026-01-31 13:20:48 - __main__ - INFO - [train.py:973] - Train MAPE: 47.76%, MAE: 0.236396, RMSE: 0.339656, Ranking Acc: 79.28%
+2026-01-31 13:20:48 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:20:49 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 91.5037 | MAPE: 186.67%, MAE: 0.287321, RMSE: 0.400280, Ranking Acc: 73.01%
+2026-01-31 13:20:49 - __main__ - INFO - [train.py:987] - Val Loss: 91.5037, MAPE: 186.67%, MAE: 0.287321, RMSE: 0.400280, Ranking Acc: 73.01%
+2026-01-31 13:20:49 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 5/10
+2026-01-31 13:20:50 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:20:50 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 48/50
+2026-01-31 13:20:50 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:20:50 - __main__ - INFO - [train.py:440] - Starting training epoch 48 [Phase1]
+2026-01-31 13:21:09 - __main__ - INFO - [train.py:507] - Epoch 48 training complete [Phase1] - Loss: 31.7526 | MAPE: 63.73%, MAE: 0.230010, RMSE: 0.330364, Ranking Acc: 79.59%
+2026-01-31 13:21:09 - __main__ - INFO - [train.py:972] - Train Loss: 31.7526
+2026-01-31 13:21:09 - __main__ - INFO - [train.py:973] - Train MAPE: 63.73%, MAE: 0.230010, RMSE: 0.330364, Ranking Acc: 79.59%
+2026-01-31 13:21:09 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 89.2632 | MAPE: 182.12%, MAE: 0.279211, RMSE: 0.390536, Ranking Acc: 73.22%
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:987] - Val Loss: 89.2632, MAPE: 182.12%, MAE: 0.279211, RMSE: 0.390536, Ranking Acc: 73.22%
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:1008] - ✓ New best model (Phase 1)! Val RMSE: 0.390536
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:1009] -   Saved to: checkpoints/single_target/best_phase1.pt
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:314] - ✓ RMSE improved: 0.390536 at epoch 48 (improvement: 1.35%)
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 49/50
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:21:12 - __main__ - INFO - [train.py:440] - Starting training epoch 49 [Phase1]
+2026-01-31 13:21:26 - __main__ - INFO - [train.py:507] - Epoch 49 training complete [Phase1] - Loss: 25.8232 | MAPE: 51.25%, MAE: 0.230908, RMSE: 0.334791, Ranking Acc: 79.68%
+2026-01-31 13:21:26 - __main__ - INFO - [train.py:972] - Train Loss: 25.8232
+2026-01-31 13:21:26 - __main__ - INFO - [train.py:973] - Train MAPE: 51.25%, MAE: 0.230908, RMSE: 0.334791, Ranking Acc: 79.68%
+2026-01-31 13:21:26 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 89.8697 | MAPE: 183.29%, MAE: 0.281620, RMSE: 0.396405, Ranking Acc: 72.91%
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:987] - Val Loss: 89.8697, MAPE: 183.29%, MAE: 0.281620, RMSE: 0.396405, Ranking Acc: 72.91%
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 1/10
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:961] - --------------------------------------------------------------------------------
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:962] - PHASE 1 - Epoch 50/50
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:963] - --------------------------------------------------------------------------------
+2026-01-31 13:21:27 - __main__ - INFO - [train.py:440] - Starting training epoch 50 [Phase1]
+2026-01-31 13:21:40 - __main__ - INFO - [train.py:507] - Epoch 50 training complete [Phase1] - Loss: 34.8164 | MAPE: 69.81%, MAE: 0.229079, RMSE: 0.329912, Ranking Acc: 79.54%
+2026-01-31 13:21:40 - __main__ - INFO - [train.py:972] - Train Loss: 34.8164
+2026-01-31 13:21:40 - __main__ - INFO - [train.py:973] - Train MAPE: 69.81%, MAE: 0.229079, RMSE: 0.329912, Ranking Acc: 79.54%
+2026-01-31 13:21:40 - __main__ - INFO - [train.py:522] - Starting validation [Phase1] - 28 batches
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:562] - Validation complete [Phase1] - Loss: 83.9097 | MAPE: 171.18%, MAE: 0.293767, RMSE: 0.404585, Ranking Acc: 72.70%
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:987] - Val Loss: 83.9097, MAPE: 171.18%, MAE: 0.293767, RMSE: 0.404585, Ranking Acc: 72.70%
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:322] - No improvement in RMSE. Patience: 2/10
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1031] - ================================================================================
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1032] - PHASE 1 COMPLETE
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1033] - Best Val RMSE: 0.390536
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1034] - Best Epoch: 48
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1035] - ================================================================================
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1043] - Phase 1 complete. Run Phase 2 to retrain on 100% data.
+2026-01-31 13:21:42 - __main__ - INFO - [train.py:1044] - Command: python train.py --config configs/config.yaml --phase 2

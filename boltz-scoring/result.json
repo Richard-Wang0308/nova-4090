@@ -1,0 +1,45 @@
+{
+  "target": "P31652",
+  "antitarget": "H6AQJ3",
+  "molecule": {
+    "name": "molecule_1",
+    "smiles": "Cc1cccc2cc(NC(C)c3cnc4[nH]ncc4c3)cnc12",
+    "boltz_score": 0.12664271955904755,
+    "components": {
+      "affinity_probability_binary": 0.7006653547286987,
+      "affinity_pred_value": -2.2121171951293945,
+      "affinity_probability_binary1": 0.8239732384681702,
+      "affinity_pred_value1": -1.7548710107803345,
+      "affinity_probability_binary2": 0.5773574113845825,
+      "affinity_pred_value2": -1.6593053340911865,
+      "confidence_score": 0.8677612543106079,
+      "ptm": 0.8752499222755432,
+      "iptm": 0.944068193435669,
+      "ligand_iptm": 0.944068193435669,
+      "protein_iptm": 0.0,
+      "complex_plddt": 0.8486844897270203,
+      "complex_iplddt": 0.8924822807312012,
+      "complex_pde": 0.8203725218772888,
+      "complex_ipde": 1.4964152574539185,
+      "chains_ptm": {
+        "0": 0.8729391694068909,
+        "1": 0.9431796073913574
+      },
+      "pair_chains_iptm": {
+        "0": {
+          "0": 0.8729391694068909,
+          "1": 0.6416448950767517
+        },
+        "1": {
+          "0": 0.944068193435669,
+          "1": 0.9431796073913574
+        }
+      },
+      "heavy_atom_count": 23
+    }
+  },
+  "scores": {
+    "boltz_score": 0.12664271955904755,
+    "entropy_boltz": null
+  }
+}
