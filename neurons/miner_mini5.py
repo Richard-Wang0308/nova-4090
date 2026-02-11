@@ -44,7 +44,7 @@ STARTING_EPOCH = 20795
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
 
 # ✅ Database for storing scored molecules (using nova2 directory)
-SCORE_RESULTS_DB = os.path.abspath(os.path.join(BASE_DIR, "..", "nova2", "score_results.sqlite"))
+SCORE_RESULTS_DB = os.path.abspath(os.path.join(BASE_DIR, "..", "nova2", "score_results5.sqlite"))
 
 from config.config_loader import load_config
 from utils import (

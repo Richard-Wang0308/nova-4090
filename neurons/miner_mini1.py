@@ -37,14 +37,14 @@ sys.path.append(BASE_DIR)
 
 # Database path for combinatorial DB
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 3
+HARDCODED_RXN_ID = 5
 STARTING_EPOCH = 20795
 
-# ✅ CSV for loading initial molecules
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
+# ✅ CSV for loading initial molecules (now directly under nova-4090/data/)
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 
 # ✅ Database for storing scored molecules
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results5.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -133,8 +133,8 @@ class GeneticAlgorithmOperator:
         Crossover two molecules by swapping random components.
         
         Supports two formats:
-        - 2 components: rxn:3:comp1:comp2 (4 parts)
-        - 3 components: rxn:3:comp1:comp2:comp3 (5 parts)
+        - 2 components: rxn:5:comp1:comp2 (4 parts)
+        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts)
         
         Both parents must have the same number of components.
         We randomly swap one component between the two molecules.
@@ -1011,52 +1011,143 @@ async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: in
     """
     Collect submissions using prepare_training_data.py and process CSV.
     
-    Since prepare_training_data.py appends the whole result, we need to:
-    1. Run prepare_training_data.py
-    2. Load CSV and deduplicate (remove duplicates)
-    3. Filter for rxn:3 molecules
-    4. Sort by score and return top 30
+    Optimized to only collect new epochs:
+    1. Check latest epoch in CSV
+    2. Only collect from (latest_epoch + 1) to latest (or from start_epoch if CSV is empty)
+    3. Load CSV and deduplicate (remove duplicates)
+    4. Filter for rxn:5 molecules
+    5. Sort by score and return top 200
     """
     import subprocess
     
-    bt.logging.info(f"📥 Collecting submissions from epoch {start_epoch}...")
+    # Check current state of CSV to determine where to start collecting
+    latest_epoch_in_csv = None
+    num_rows_before = 0
+    actual_start_epoch = start_epoch  # Default to provided start_epoch
     
-    # Run prepare_training_data.py
-    script_path = os.path.join(BASE_DIR, 'BoltzPredictor', 'scripts', 'prepare_training_data.py')
+    if os.path.exists(csv_path):
+        try:
+            df_before = pd.read_csv(csv_path)
+            num_rows_before = len(df_before)
+            if 'epoch' in df_before.columns and not df_before['epoch'].isna().all():
+                latest_epoch_in_csv = int(df_before['epoch'].max())
+                # Start collecting from the next epoch after the latest in CSV
+                actual_start_epoch = max(start_epoch, latest_epoch_in_csv + 1)
+                bt.logging.info(f"   CSV before: {num_rows_before} rows, latest epoch: {latest_epoch_in_csv}")
+                bt.logging.info(f"   Will collect from epoch {actual_start_epoch} (CSV has up to {latest_epoch_in_csv})")
+            else:
+                bt.logging.info(f"   CSV exists but has no epoch data, starting from {start_epoch}")
+        except Exception as e:
+            bt.logging.debug(f"Could not read CSV before collection: {e}, starting from {start_epoch}")
+    else:
+        bt.logging.info(f"   CSV does not exist, will create new one starting from epoch {start_epoch}")
+    
+    # If CSV already has the latest data, skip collection
+    if latest_epoch_in_csv is not None:
+        # We'll still run the script to check for newer epochs, but it will be fast if nothing new
+        bt.logging.info(f"📥 Collecting submissions from epoch {actual_start_epoch} (CSV has up to {latest_epoch_in_csv})...")
+    else:
+        bt.logging.info(f"📥 Collecting submissions from epoch {actual_start_epoch}...")
+    
+    # Run prepare_training_data.py (now in neurons/ folder)
+    script_path = os.path.join(BASE_DIR, 'neurons', 'prepare_training_data.py')
     if not os.path.exists(script_path):
         bt.logging.error(f"prepare_training_data.py not found at {script_path}")
         return pd.DataFrame()
     
+    # Script needs to be run from BASE_DIR (nova-4090) so it can find:
+    # 1. The script itself (neurons/prepare_training_data.py)
+    # 2. The data directory (data/)
+    if not os.path.exists(BASE_DIR):
+        bt.logging.error(f"BASE_DIR not found at {BASE_DIR}")
+        return pd.DataFrame()
+    
+    # Use absolute path for output to avoid path issues
+    csv_path_abs = os.path.abspath(csv_path)
+    
+    # Get current epoch and calculate end_epoch (current_epoch - 2)
     try:
-        # Run the script
+        current_block = await state['subtensor'].get_current_block()
+        current_epoch = current_block // state['epoch_length']
+        end_epoch = current_epoch - 2  # Latest is current_epoch - 2
+        # Ensure end_epoch is at least as large as actual_start_epoch
+        if end_epoch < actual_start_epoch:
+            bt.logging.warning(f"   Calculated end_epoch ({end_epoch}) < start_epoch ({actual_start_epoch}), using start_epoch as end")
+            end_epoch = actual_start_epoch
+        bt.logging.info(f"   Current epoch: {current_epoch}, will collect up to epoch {end_epoch} (current - 2)")
+    except Exception as e:
+        bt.logging.warning(f"Could not get current epoch: {e}, will let script find latest epoch")
+        end_epoch = None
+    
+    try:
+        # Run the script starting from actual_start_epoch (will only collect new epochs)
+        # Run from BASE_DIR so it can find the data directory
+        bt.logging.info(f"   Running prepare_training_data.py from {BASE_DIR}")
+        if end_epoch is not None:
+            bt.logging.info(f"   Collecting from epoch {actual_start_epoch} to {end_epoch} (current_epoch - 2), output: {csv_path_abs}")
+            script_args = ['python3', script_path, '--start_epoch', str(actual_start_epoch), '--end_epoch', str(end_epoch), '--output', csv_path_abs]
+        else:
+            bt.logging.info(f"   Collecting from epoch {actual_start_epoch} to latest, output: {csv_path_abs}")
+            script_args = ['python3', script_path, '--start_epoch', str(actual_start_epoch), '--output', csv_path_abs]
+        
         result = subprocess.run(
-            ['python3', script_path, '--start_epoch', str(start_epoch), '--output', csv_path],
+            script_args,
+            cwd=BASE_DIR,  # Run from BASE_DIR (nova-4090) so paths work correctly
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=1800  # 30 minute timeout (collecting many epochs can take time)
         )
         
+        # Always log output for debugging (not just on error)
+        if result.stdout:
+            bt.logging.info(f"prepare_training_data.py stdout:\n{result.stdout}")
+        if result.stderr:
+            bt.logging.warning(f"prepare_training_data.py stderr:\n{result.stderr}")
+        
         if result.returncode != 0:
-            bt.logging.error(f"prepare_training_data.py failed: {result.stderr}")
+            bt.logging.error(f"prepare_training_data.py failed with return code {result.returncode}")
+            bt.logging.error(f"stderr: {result.stderr}")
+            if result.stdout:
+                bt.logging.error(f"stdout: {result.stdout}")
             return pd.DataFrame()
         
         bt.logging.info(f"✅ prepare_training_data.py completed successfully")
         
-    except subprocess.TimeoutExpired:
-        bt.logging.error("prepare_training_data.py timed out")
+    except subprocess.TimeoutExpired as e:
+        bt.logging.error(f"prepare_training_data.py timed out after 1800 seconds (30 minutes)")
+        bt.logging.error(f"This might indicate the collection is taking longer than expected, or there's an issue with the API")
         return pd.DataFrame()
     except Exception as e:
         bt.logging.error(f"Error running prepare_training_data.py: {e}")
+        import traceback
+        bt.logging.error(traceback.format_exc())
         return pd.DataFrame()
     
-    # Load and process CSV
-    if not os.path.exists(csv_path):
-        bt.logging.warning(f"CSV file not created at {csv_path}")
+    # Load and process CSV (use absolute path)
+    if not os.path.exists(csv_path_abs):
+        bt.logging.warning(f"CSV file not created at {csv_path_abs}")
+        bt.logging.warning(f"   Script may have failed or output path was incorrect")
         return pd.DataFrame()
     
     try:
-        df = pd.read_csv(csv_path)
-        bt.logging.info(f"📊 Loaded {len(df)} rows from CSV")
+        df = pd.read_csv(csv_path_abs)
+        num_rows_after = len(df)
+        latest_epoch_after = None
+        if 'epoch' in df.columns:
+            latest_epoch_after = int(df['epoch'].max()) if not df['epoch'].isna().all() else None
+        
+        # Verify CSV was updated
+        rows_added = num_rows_after - num_rows_before
+        if rows_added > 0:
+            bt.logging.info(f"✅ CSV updated: +{rows_added} rows (before: {num_rows_before}, after: {num_rows_after})")
+        if latest_epoch_after and latest_epoch_in_csv and latest_epoch_after > latest_epoch_in_csv:
+            bt.logging.info(f"✅ CSV updated: latest epoch {latest_epoch_in_csv} → {latest_epoch_after} (collected epochs {actual_start_epoch} to {latest_epoch_after})")
+        elif latest_epoch_after == latest_epoch_in_csv and latest_epoch_after is not None:
+            bt.logging.info(f"ℹ️  CSV already up to date (latest epoch: {latest_epoch_after}, no new epochs to collect)")
+        elif latest_epoch_after is None:
+            bt.logging.info(f"📊 Loaded {num_rows_after} rows from CSV (no epoch column found)")
+        else:
+            bt.logging.info(f"📊 Loaded {num_rows_after} rows from CSV")
         
         # Since prepare_training_data appends the whole result, remove duplicates and rewrite
         original_len = len(df)
@@ -1070,12 +1161,12 @@ async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: in
             else:
                 bt.logging.info(f"   No duplicates found ({len(df)} rows)")
         
-        # Filter for rxn:3 molecules only
-        df = df[df['molecule_name'].str.startswith('rxn:3:', na=False)]
-        bt.logging.info(f"   After filtering rxn:3: {len(df)} rows")
+        # Filter for rxn:5 molecules only
+        df = df[df['molecule_name'].str.startswith('rxn:5:', na=False)]
+        bt.logging.info(f"   After filtering rxn:5: {len(df)} rows")
         
         if df.empty:
-            bt.logging.warning("No rxn:3 molecules found in CSV")
+            bt.logging.warning("No rxn:5 molecules found in CSV")
             return pd.DataFrame()
         
         # Sort by final_score descending
@@ -1219,7 +1310,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
     """
     Updated genetic algorithm loop:
     1. When epoch changes, collect submissions using prepare_training_data.py
-    2. Load CSV, filter rxn:3, sort, take top 30
+    2. Load CSV, filter rxn:5, sort, take top 30
     3. Generate unique molecules (NOT in HuggingFace) - keep generating until desired count
     4. Score in batches of 10, checking blocks remaining after each batch
     5. Only submit when < 50 blocks remain until next epoch
@@ -1228,7 +1319,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
     """
     bt.logging.info("🚀 Starting ADAPTIVE genetic algorithm loop with CSV-based generation...")
     
-    csv_path = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
+    csv_path = os.path.join(BASE_DIR, 'data', 'mols.csv')
     last_processed_epoch = state.get('last_processed_epoch', -1)
     desired_unique_count = 100  # Desired number of unique molecules to generate
     
@@ -1245,8 +1336,13 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
                 bt.logging.info(f"{'='*70}")
                 
-                # Collect submissions from STARTING_EPOCH
-                top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, csv_path)
+                # Use existing top_200_df from startup if available (to avoid duplicate collection)
+                if last_processed_epoch == -1 and 'top_200_df' in state and not state['top_200_df'].empty:
+                    bt.logging.info("✅ Using top_200_df from startup phase (already collected)")
+                    top_200_df = state['top_200_df']
+                else:
+                    # Collect submissions from STARTING_EPOCH (only if not already collected in startup)
+                    top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, csv_path)
                 
                 if top_200_df.empty:
                     bt.logging.warning("No top 200 molecules found, skipping this epoch")
@@ -1293,7 +1389,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                     blocks_remaining = next_epoch_block - current_block_before_round
                     
                     # If we're already within 50 blocks, submit and exit
-                    if blocks_remaining < 50:
+                    if blocks_remaining < 70:
                         if best_molecule_so_far:
                             # Check if we already submitted in this epoch
                             if last_submission_epoch == current_epoch:
@@ -1444,7 +1540,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                         blocks_remaining = next_epoch_block - current_block_before_batch
                         
                         # Only submit when < 50 blocks remain
-                        if blocks_remaining < 50:
+                        if blocks_remaining < 70:
                             if best_molecule_so_far:
                                 # Check if we already submitted in this epoch
                                 if last_submission_epoch == current_epoch:
@@ -1626,7 +1722,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                         bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}, batch {batch_idx + 1}: {blocks_remaining_after}")
                         
                         # If we hit the 50 block threshold during batch scoring, exit batch loop
-                        if blocks_remaining_after < 50:
+                        if blocks_remaining_after < 70:
                             break
                     
                     # After completing all batches for this round, check if we should continue
@@ -1640,7 +1736,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                     bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}: {blocks_remaining_after_round}")
                     
                     # If blocks remaining < 50, submit and exit
-                    if blocks_remaining_after_round < 50:
+                    if blocks_remaining_after_round < 70:
                         if best_molecule_so_far and last_submission_epoch != current_epoch:
                             # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
                             molecule_name = best_molecule_so_far['name']
@@ -1877,6 +1973,9 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         # Collect submissions FIRST (this creates/updates the CSV)
         bt.logging.info("📥 Collecting submissions from epoch...")
         top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, REACTION_TRAIN_CSV)
+        
+        # Store top_200_df in state for use in adaptive GA loop
+        state['top_200_df'] = top_200_df
         
         if top_200_df.empty:
             bt.logging.warning("⚠️  No submissions collected, CSV may be empty or outdated")

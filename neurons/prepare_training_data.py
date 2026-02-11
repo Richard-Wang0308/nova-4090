@@ -11,49 +11,13 @@ import sys
 import logging
 from collections import defaultdict
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Add BASE_DIR (nova-4090) to path
+base_dir = os.path.join(os.path.dirname(__file__), '..')
+sys.path.insert(0, base_dir)
 
-from boltzpredictor.utils.proteins import get_sequence_from_protein_code
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
-class ProteinSequenceCache:
-    """Cache for protein sequences to avoid repeated API calls."""
-    
-    def __init__(self, cache_file='cache/protein_sequences.json'):
-        self.cache_file = cache_file
-        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-        self.cache = self._load_cache()
-    
-    def _load_cache(self):
-        """Load cache from file."""
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-    
-    def _save_cache(self):
-        """Save cache to file."""
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.cache, f)
-    
-    def get_sequence(self, protein_code):
-        """Get sequence, using cache if available."""
-        if protein_code in self.cache:
-            return self.cache[protein_code]
-        
-        sequence = get_sequence_from_protein_code(protein_code)
-        if sequence:
-            self.cache[protein_code] = sequence
-            self._save_cache()
-        return sequence
-
-
 
 
 def fetch_leaderboard_data(epoch: int, metric: str = 'boltz') -> dict:
@@ -78,7 +42,7 @@ def fetch_leaderboard_data(epoch: int, metric: str = 'boltz') -> dict:
         return None
 
 
-def extract_training_samples(data: dict, protein_cache: ProteinSequenceCache) -> list:
+def extract_training_samples(data: dict) -> list:
     """
     Extract training samples from API response.
     
@@ -112,11 +76,6 @@ def extract_training_samples(data: dict, protein_cache: ProteinSequenceCache) ->
     # Get target code (should be same for all samples in an epoch)
     target_code = target_proteins[0] if isinstance(target_proteins, list) else target_proteins
     
-    # Fetch target sequence once per epoch
-    target_seq = protein_cache.get_sequence(target_code)
-    if not target_seq:
-        logger.error(f"Could not get sequence for target {target_code}")
-        return samples
     
     # Process leaderboard entries
     leaderboard = data.get('leaderboard', [])
@@ -158,8 +117,6 @@ def extract_training_samples(data: dict, protein_cache: ProteinSequenceCache) ->
             # Create training sample (save both codes and sequences)
             sample = {
                 'molecule_name': mol_name,
-                'target_protein': target_code,
-                'target_seq': target_seq,
                 # 'antitarget_protein': antitarget_code,
                 # 'antitarget_seq': antitarget_seq,
                 'final_score': final_score,
@@ -243,8 +200,6 @@ def collect_training_data(start_epoch: int, end_epoch: int = None, metric: str =
     
     logger.info(f"Collecting data from epoch {start_epoch} to {end_epoch}")
     
-    # Initialize protein cache
-    protein_cache = ProteinSequenceCache()
     
     # Collect data
     all_samples = []
@@ -265,7 +220,7 @@ def collect_training_data(start_epoch: int, end_epoch: int = None, metric: str =
             continue
         
         # Extract samples
-        samples = extract_training_samples(data, protein_cache)
+        samples = extract_training_samples(data)
         
         if not samples:
             logger.warning(f"No samples extracted from epoch {epoch}")
@@ -303,19 +258,15 @@ def save_samples(samples: list, output_file: str, append: bool = True):
     
     df = pd.DataFrame(samples)
     
-    # Reorder columns - save: molecule_name, target_protein, target_seq, antitarget_protein, antitarget_seq, final_score, epoch
-    # columns_order = ['molecule_name', 'target_protein', 'target_seq', 'antitarget_protein', 'antitarget_seq', 'final_score', 'epoch']
-    # Reorder columns - save: molecule_name, target_protein, target_seq, final_score, epoch
-    columns_order = ['molecule_name', 'target_protein', 'target_seq', 'final_score', 'epoch']
+    # Reorder columns - save: molecule_name, final_score, epoch
+    columns_order = ['molecule_name', 'final_score', 'epoch']
     df = df[[col for col in columns_order if col in df.columns]]
     
     if append and os.path.exists(output_file):
         df_existing = pd.read_csv(output_file)
         df = pd.concat([df_existing, df], ignore_index=True)
-        # Remove duplicates based on molecule_name, target_protein, antitarget_protein, epoch
-        # df = df.drop_duplicates(subset=['molecule_name', 'target_protein', 'antitarget_protein', 'epoch'], keep='last')
-        # Remove duplicates based on molecule_name, target_protein, epoch
-        df = df.drop_duplicates(subset=['molecule_name', 'target_protein', 'epoch'], keep='last')
+        # Remove duplicates based on molecule_name and epoch
+        df = df.drop_duplicates(subset=['molecule_name', 'epoch'], keep='last')
     
     df.to_csv(output_file, index=False)
     logger.info(f"Saved {len(df)} samples to {output_file}")
