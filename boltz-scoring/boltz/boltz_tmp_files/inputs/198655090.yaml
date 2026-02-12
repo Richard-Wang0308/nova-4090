@@ -6,7 +6,7 @@ sequences:
         msa: empty
     - ligand:
         id: B
-        smiles: 'c1c[se]c(-c2ncc(-c3cc[nH]c3)cc2C2CC2)c1'
+        smiles: 'COc1cncc(-c2ccc(-c3ccc[se]3)nc2C)c1C'
         
 properties:
     - affinity:
