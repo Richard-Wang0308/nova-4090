@@ -17,6 +17,8 @@ import datetime
 import tempfile
 import traceback
 import base64
+import rdkit
+from rdkit import Chem
 import hashlib
 from typing import Any, Dict, Tuple
 from pathlib import Path
@@ -32,6 +34,7 @@ from config.config_loader import load_config
 from utils import (
     upload_file_to_github,
     get_challenge_params_from_blockhash,
+    contains_atom_type,
 )
 from utils.molecules import molecule_unique_for_protein_hf
 from combinatorial_db.reactions import get_smiles_from_reaction
@@ -318,6 +321,14 @@ async def run_simple_submit(config: argparse.Namespace) -> None:
     # Check if molecule is unique (not in HuggingFace)
     bt.logging.info(f"🔍 Checking if molecule {molecule_name} is unique...")
     is_unique = await check_molecule_unique(state, molecule_name, molecule_smiles)
+
+    mol = Chem.MolFromSmiles(molecule_smiles)
+    if mol is None:
+        bt.logging.warning(f"❌ Molecule {molecule_name} is not a valid SMILES. Not submitting.")
+        return
+    if contains_atom_type(mol, config.banned_atom_types):
+        bt.logging.warning(f"❌ Molecule {molecule_name} contains banned atom types. Not submitting.")
+        return
     
     if not is_unique:
         bt.logging.warning(f"❌ Molecule {molecule_name} is already in HuggingFace. Not submitting.")

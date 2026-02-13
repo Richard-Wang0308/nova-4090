@@ -587,11 +587,11 @@ def load_molecules_from_csv_with_validation(
         )
         df = pd.read_csv(csv_path)
         
-        if 'target_protein' in df.columns:
-            df = df[df['target_protein'].isin(target_proteins)]
-        else:
-            bt.logging.warning("CSV file does not have 'target_protein' column")
-            return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+        # if 'target_protein' in df.columns:
+        #     df = df[df['target_protein'].isin(target_proteins)]
+        # else:
+        #     bt.logging.warning("CSV file does not have 'target_protein' column")
+        #     return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
         
         if 'epoch' in df.columns:
             df = df[df['epoch'] >= starting_epoch]
@@ -927,7 +927,7 @@ async def generate_unique_molecules_from_top200(
         return []
     
     ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    all_names = top_200_df['molecule_name'].tolist()
+    all_names = top_200_df['name'].tolist()
     
     pool_sizes = [30, 50, 100, 150, 200]
     current_pool_size_idx = 0
