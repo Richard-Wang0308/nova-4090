@@ -694,7 +694,7 @@ def load_molecules_from_csv_with_validation(
         bt.logging.error(f"Error loading molecules from CSV: {e}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
-async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: int, csv_path: str) -> pd.DataFrame:
+async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: int, csv_path: str, config: Dict[str, Any]) -> pd.DataFrame:
     """
     Collect submissions using prepare_training_data.py and process CSV.
     
@@ -855,6 +855,16 @@ async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: in
         if df.empty:
             bt.logging.warning("No rxn:5 molecules found in CSV")
             return pd.DataFrame()
+
+        for name in df['molecule_name']:
+            smiles = get_smiles_from_reaction(name)
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                bt.logging.warning(f"❌ Molecule {mol} is not a valid SMILES. Not submitting.")
+                df = df[df['molecule_name'] != mol]
+            if contains_atom_type(mol, config.banned_atom_types):
+                bt.logging.warning(f"❌ Molecule {mol} contains banned atom types. Not submitting.")
+                df = df[df['molecule_name'] != mol]
         
         # Sort by final_score descending
         if 'final_score' in df.columns:
@@ -1283,7 +1293,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         
         # Collect submissions FIRST (this creates/updates the CSV)
         bt.logging.info("📥 Collecting submissions from epoch...")
-        top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, REACTION_TRAIN_CSV)
+        top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, REACTION_TRAIN_CSV, config)
         
         # Store top_200_df in state for use in adaptive GA loop
         state['top_200_df'] = top_200_df
