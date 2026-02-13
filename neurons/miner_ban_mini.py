@@ -861,10 +861,10 @@ async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: in
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 bt.logging.warning(f"❌ Molecule {mol} is not a valid SMILES. Not submitting.")
-                df = df[df['molecule_name'] != mol]
+                df = df[df['molecule_name'] != name]
             if contains_atom_type(mol, config.banned_atom_types):
                 bt.logging.warning(f"❌ Molecule {mol} contains banned atom types. Not submitting.")
-                df = df[df['molecule_name'] != mol]
+                df = df[df['molecule_name'] != name]
         
         # Sort by final_score descending
         if 'final_score' in df.columns:
