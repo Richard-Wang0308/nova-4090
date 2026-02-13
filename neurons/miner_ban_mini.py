@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SIMPLIFIED BITTENSOR MINER - Genetic Algorithm Based Molecule Generation
-WITH COMPREHENSIVE VALIDATION
+WITH COMPREHENSIVE VALIDATION FROM CONFIG.YAML
 """
 import os
 import sys
@@ -25,6 +25,9 @@ from bittensor.core.errors import MetadataError
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
@@ -54,19 +57,11 @@ from btdr import QuicknetBittensorDrandTimelock
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
 
-# ============================================================================
-# VALIDATION CONFIGURATION
-# ============================================================================
-VALIDATION_CONFIG = {
-    'min_heavy_atoms': 10,
-    'banned_atom_types': ['F', 'Cl', 'Br', 'I'],
-    'min_rotatable_bonds': 2,
-    'max_rotatable_bonds': 15,
-}
 
 # ============================================================================
 # VALIDATION FUNCTIONS
 # ============================================================================
+
 def validate_molecule_smiles(molecule_name: str, smiles: str) -> Tuple[bool, str]:
     """Validate SMILES string with RDKit."""
     if not smiles:
@@ -81,7 +76,11 @@ def validate_molecule_smiles(molecule_name: str, smiles: str) -> Tuple[bool, str
         return False, f"RDKit parsing error: {str(e)}"
 
 
-def validate_molecule_heavy_atoms(molecule_name: str, smiles: str, config: Dict[str, Any]) -> Tuple[bool, str]:
+def validate_molecule_heavy_atoms(
+    molecule_name: str,
+    smiles: str,
+    config: Dict[str, Any]
+) -> Tuple[bool, str]:
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
@@ -94,21 +93,33 @@ def validate_molecule_heavy_atoms(molecule_name: str, smiles: str, config: Dict[
         return False, f"Heavy atom count error: {str(e)}"
 
 
-def validate_molecule_banned_atoms(molecule_name: str, smiles: str, config: Dict[str, Any]) -> Tuple[bool, str]:
+def validate_molecule_banned_atoms(
+    molecule_name: str,
+    smiles: str,
+    config: Dict[str, Any]
+) -> Tuple[bool, str]:
     """Validate molecule doesn't contain banned atom types."""
     try:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return False, "Cannot parse SMILES for banned atom check"
         
-        if contains_atom_type(mol, config.get('banned_atom_types', [])):
-            return False, f"Contains banned atom types: {config.get('banned_atom_types', [])}"
+        banned_atoms = config.get('banned_atom_types', [])
+        if not banned_atoms:
+            return True, ""
+        
+        if contains_atom_type(mol, banned_atoms):
+            return False, f"Contains banned atom types: {banned_atoms}"
         return True, ""
     except Exception as e:
         return False, f"Banned atom check error: {str(e)}"
 
 
-def validate_molecule_rotatable_bonds(molecule_name: str, smiles: str, config: Dict[str, Any]) -> Tuple[bool, str]:
+def validate_molecule_rotatable_bonds(
+    molecule_name: str,
+    smiles: str,
+    config: Dict[str, Any]
+) -> Tuple[bool, str]:
     """Validate rotatable bonds are within acceptable range."""
     try:
         mol = Chem.MolFromSmiles(smiles)
@@ -116,8 +127,8 @@ def validate_molecule_rotatable_bonds(molecule_name: str, smiles: str, config: D
             return False, "Cannot parse SMILES for rotatable bonds check"
         
         num_rotatable_bonds = Descriptors.NumRotatableBonds(mol)
-        min_bonds = config.get('min_rotatable_bonds', 2)
-        max_bonds = config.get('max_rotatable_bonds', 15)
+        min_bonds = config.get('min_rotatable_bonds', 1)
+        max_bonds = config.get('max_rotatable_bonds', 10)
         
         if num_rotatable_bonds < min_bonds or num_rotatable_bonds > max_bonds:
             return False, f"Rotatable bonds out of range: {num_rotatable_bonds} (expected {min_bonds}-{max_bonds})"
@@ -155,7 +166,7 @@ async def validate_molecule_complete(
 ) -> Tuple[bool, List[str]]:
     """Perform complete validation on a molecule."""
     if config is None:
-        config = VALIDATION_CONFIG
+        config = state.get('config', {})
     
     errors = []
     
@@ -187,14 +198,16 @@ async def validate_molecule_complete(
     
     return len(errors) == 0, errors
 
+
 # ============================================================================
-# PYTORCH 2.6+ COMPATIBILITY
+# PYTORCH COMPATIBILITY
 # ============================================================================
+
 def safe_torch_load(path, map_location='cpu'):
     """Safely load PyTorch checkpoint with numpy scalar support."""
     import torch
     import numpy as np
-
+    
     path = Path(path)
     
     if not path.exists():
@@ -211,17 +224,18 @@ def safe_torch_load(path, map_location='cpu'):
         )
         bt.logging.info(f"✅ Checkpoint loaded successfully")
         return checkpoint
-        
     except Exception as e:
         bt.logging.error(f"❌ Failed to load checkpoint: {e}")
         raise RuntimeError(f"Checkpoint loading failed: {e}") from e
 
+
 # ============================================================================
-# GENETIC ALGORITHM OPERATIONS (CROSSOVER ONLY)
+# GENETIC ALGORITHM OPERATIONS
 # ============================================================================
+
 class GeneticAlgorithmOperator:
     """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
-
+    
     def __init__(self, rxn_id: int, db_path: str):
         """Initialize GA operator."""
         self.rxn_id = rxn_id
@@ -334,9 +348,11 @@ class GeneticAlgorithmOperator:
         bt.logging.info(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
         return new_molecules
 
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
@@ -345,10 +361,10 @@ def parse_arguments() -> argparse.Namespace:
     bt.subtensor.add_args(parser)
     bt.logging.add_args(parser)
     bt.wallet.add_args(parser)
-
+    
     config = bt.config(parser)
     config.update(load_config())
-
+    
     config.full_path = os.path.expanduser(
         "{}/{}/{}/netuid{}/{}".format(
             config.logging.logging_dir,
@@ -358,7 +374,7 @@ def parse_arguments() -> argparse.Namespace:
             'miner',
         )
     )
-
+    
     os.makedirs(config.full_path, exist_ok=True)
     return config
 
@@ -369,18 +385,18 @@ def load_github_path() -> str:
     github_repo_branch = os.environ.get('GITHUB_REPO_BRANCH')
     github_repo_owner = os.environ.get('GITHUB_REPO_OWNER')
     github_repo_path = os.environ.get('GITHUB_REPO_PATH')
-
+    
     if github_repo_name is None or github_repo_branch is None or github_repo_owner is None:
         raise ValueError("Missing GitHub environment variables")
-
+    
     if github_repo_path == "":
         github_path = f"{github_repo_owner}/{github_repo_name}/{github_repo_branch}"
     else:
         github_path = f"{github_repo_owner}/{github_repo_name}/{github_repo_branch}/{github_repo_path}"
-
+    
     if len(github_path) > 100:
         raise ValueError("GitHub path too long (max 100 chars)")
-
+    
     return github_path
 
 
@@ -393,10 +409,10 @@ def setup_logging(config: argparse.Namespace) -> None:
 async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any, Any, int, int]:
     """Initializes wallet, subtensor, and metagraph with retry logic."""
     bt.logging.info("Setting up Bittensor objects.")
-
+    
     wallet = bt.wallet(config=config)
     bt.logging.info(f"Wallet: {wallet}")
-
+    
     max_retries = 10
     retry_delay = 5
     
@@ -410,10 +426,10 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
                 metagraph = await subtensor.metagraph(config.netuid)
                 await metagraph.sync()
                 bt.logging.info(f"Metagraph synced successfully.")
-
+                
                 miner_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
                 bt.logging.info(f"Miner UID: {miner_uid}")
-
+                
                 epoch_length = 361
                 bt.logging.info(f"Epoch length: {epoch_length} blocks")
             
@@ -421,7 +437,7 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
             await subtensor.initialize()
             
             return wallet, subtensor, metagraph, miner_uid, epoch_length
-                    
+            
         except (ConnectionError, TimeoutError) as e:
             if attempt < max_retries - 1:
                 wait_time = retry_delay * (2 ** attempt)
@@ -446,7 +462,7 @@ def init_score_results_db(db_path: str = None) -> None:
     """Initialize/create the score_results.sqlite database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -474,7 +490,7 @@ def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float
     """Get score for a molecule from the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -494,7 +510,7 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
     """Write scored molecules to the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     if not molecules:
         return
     
@@ -527,7 +543,7 @@ def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> 
     """Get scores for multiple molecules from the database in batch."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     if not molecule_names:
         return {}
     
@@ -556,9 +572,9 @@ def load_molecules_from_csv_with_validation(
     rxn_id: int,
     config: Dict[str, Any] = None
 ) -> pd.DataFrame:
-    """Load molecules from CSV file with validation."""
+    """Load molecules from CSV file with validation from config.yaml."""
     if config is None:
-        config = VALIDATION_CONFIG
+        config = {}
     
     if not os.path.exists(csv_path):
         bt.logging.warning(f"CSV file not found at {csv_path}")
@@ -597,6 +613,7 @@ def load_molecules_from_csv_with_validation(
         successful_count = 0
         failed_count = 0
         banned_atom_count = 0
+        heavy_atom_count = 0
         
         for _, row in df.iterrows():
             molecule_name = row['molecule_name']
@@ -615,9 +632,19 @@ def load_molecules_from_csv_with_validation(
                     failed_count += 1
                     continue
                 
-                if contains_atom_type(mol, config.get('banned_atom_types', [])):
-                    bt.logging.debug(f"Molecule {molecule_name} contains banned atoms, skipping")
+                # Check banned atoms
+                banned_atoms = config.get('banned_atom_types', [])
+                if banned_atoms and contains_atom_type(mol, banned_atoms):
+                    bt.logging.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
+                    continue
+                
+                # Check heavy atom count
+                min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                heavy_atom_count_val = get_heavy_atom_count(smiles)
+                if heavy_atom_count_val < min_heavy_atoms:
+                    bt.logging.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
+                    heavy_atom_count += 1
                     continue
                 
                 inchikey = generate_inchikey(smiles)
@@ -653,7 +680,8 @@ def load_molecules_from_csv_with_validation(
                 result_df = result_df.sort_values(by='score', ascending=False, na_position='last')
                 bt.logging.info(
                     f"✅ Loaded {len(result_df)} molecules from CSV "
-                    f"(successful: {successful_count}, failed: {failed_count}, banned atoms: {banned_atom_count})"
+                    f"(successful: {successful_count}, failed: {failed_count}, "
+                    f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
                 )
                 if len(result_df) > 0:
                     scores = result_df['score'].dropna()
@@ -665,7 +693,8 @@ def load_molecules_from_csv_with_validation(
         else:
             bt.logging.warning(
                 f"No valid molecules loaded from CSV "
-                f"(successful: {successful_count}, failed: {failed_count}, banned atoms: {banned_atom_count})"
+                f"(successful: {successful_count}, failed: {failed_count}, "
+                f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
             )
         
         return result_df
@@ -683,7 +712,7 @@ async def score_molecules_with_boltz(
     if state.get('boltz_wrapper') is None:
         bt.logging.warning("BoltzWrapper not available, skipping scoring")
         return molecules
-
+    
     if not molecules:
         return molecules
     
@@ -770,7 +799,7 @@ async def score_molecules_with_boltz(
             os.makedirs(records_dir, exist_ok=True)
             os.makedirs(msa_dir, exist_ok=True)
             os.makedirs(predictions_dir, exist_ok=True)
-        
+            
             valid_molecules_by_uid = {
                 0: {
                     'smiles': [mol['smiles'] for mol in molecules_to_score],
@@ -793,13 +822,13 @@ async def score_molecules_with_boltz(
             subnet_config = {
                 'weekly_target': primary_target,
                 'num_antitargets': len(antitarget_proteins),
-                'binding_pocket': getattr(config, 'binding_pocket', None),
-                'max_distance': getattr(config, 'max_distance', None),
-                'force': getattr(config, 'force', False),
+                'binding_pocket': config.get('binding_pocket', None),
+                'max_distance': config.get('max_distance', None),
+                'force': config.get('force', False),
                 'num_molecules_boltz': num_molecules_to_score,
-                'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
-                'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
-                'sample_selection': getattr(config, 'sample_selection', 'first'),
+                'boltz_metric': config.get('boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                'combination_strategy': config.get('combination_strategy', 'heavy_atom_normalization'),
+                'sample_selection': config.get('sample_selection', 'first'),
             }
             
             final_block_hash = "0x" + "0" * 64
@@ -964,7 +993,8 @@ async def generate_unique_molecules_from_top200(
             except Exception as e:
                 bt.logging.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
             
-            is_valid, errors = await validate_molecule_complete(state, molecule_name, smiles, VALIDATION_CONFIG)
+            # Validate with config.yaml settings
+            is_valid, errors = await validate_molecule_complete(state, molecule_name, smiles, state['config'])
             
             if not is_valid:
                 for error in errors:
@@ -1022,7 +1052,7 @@ async def generate_unique_molecules_from_top200(
 def _import_boltz_wrapper():
     """Import BoltzWrapper following DataGenerator pattern."""
     global BOLTZ_AVAILABLE, BoltzWrapper
-
+    
     try:
         BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
         BOLTZ_SRC_DIR = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
@@ -1058,10 +1088,20 @@ def _import_boltz_wrapper():
 async def startup_phase(state: Dict[str, Any]) -> None:
     """Startup phase with CSV loading and validation."""
     bt.logging.info("🚀 Starting STARTUP phase...")
-
+    
     try:
         init_score_results_db()
         bt.logging.info(f"✅ Score results database initialized")
+        
+        # Log validation config from config.yaml
+        config = state['config']
+        bt.logging.info(
+            f"✅ Loaded validation config from config.yaml:"
+            f"\n   - min_heavy_atoms: {config.get('min_heavy_atoms', 10)}"
+            f"\n   - min_rotatable_bonds: {config.get('min_rotatable_bonds', 1)}"
+            f"\n   - max_rotatable_bonds: {config.get('max_rotatable_bonds', 10)}"
+            f"\n   - banned_atom_types: {config.get('banned_atom_types', [])}"
+        )
         
         bt.logging.info("🔬 Importing BoltzWrapper...")
         boltz_imported = _import_boltz_wrapper()
@@ -1084,7 +1124,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             state['current_challenge_targets'],
             STARTING_EPOCH,
             HARDCODED_RXN_ID,
-            VALIDATION_CONFIG
+            config
         )
         
         if molecules_df.empty:
@@ -1123,22 +1163,22 @@ async def submit_response(state: Dict[str, Any]) -> None:
         current_block = await state['subtensor'].get_current_block()
         encrypted_response = state['bdt'].encrypt(state['miner_uid'], candidate_product, current_block)
         bt.logging.info(f"🔐 Encrypted response generated successfully")
-
+        
         tmp_file = tempfile.NamedTemporaryFile(delete=True)
         with open(tmp_file.name, 'w+') as f:
             f.write(str(encrypted_response))
             f.flush()
-
+            
             f.seek(0)
             content_str = f.read()
             encoded_content = base64.b64encode(content_str.encode()).decode()
-
+            
             filename = hashlib.sha256(content_str.encode()).hexdigest()[:20]
             commit_content = f"{state['github_path']}/{filename}.txt"
             bt.logging.info(f"📝 Prepared commit content: {commit_content}")
-
+            
             bt.logging.info(f"⛓️  Attempting chain commitment...")
-            try: 
+            try:
                 commitment_status = await state['subtensor'].set_commitment(
                     wallet=state['wallet'],
                     netuid=state['config'].netuid,
@@ -1148,7 +1188,7 @@ async def submit_response(state: Dict[str, Any]) -> None:
             except MetadataError:
                 bt.logging.info("⏳ Too soon to commit again. Will try next epoch.")
                 return
-
+            
             if commitment_status:
                 try:
                     bt.logging.info(f"✅ Commitment set successfully for {commit_content}")
@@ -1172,10 +1212,79 @@ async def submit_response(state: Dict[str, Any]) -> None:
         bt.logging.error(traceback.format_exc())
 
 
+async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
+    """Adaptive genetic algorithm loop with validation."""
+    bt.logging.info("🚀 Starting ADAPTIVE genetic algorithm loop with validation...")
+    
+    csv_path = os.path.join(BASE_DIR, 'data', 'mols.csv')
+    last_processed_epoch = state.get('last_processed_epoch', -1)
+    desired_unique_count = 100
+    
+    while not state['shutdown_event'].is_set():
+        try:
+            current_block = await state['subtensor'].get_current_block()
+            current_epoch = current_block // state['epoch_length']
+            last_submission_epoch = state.get('last_submission_epoch', -1)
+            
+            if current_epoch != last_processed_epoch:
+                bt.logging.info(f"\n{'='*70}")
+                bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
+                bt.logging.info(f"{'='*70}")
+                
+                if last_processed_epoch == -1 and 'top_200_df' in state and not state['top_200_df'].empty:
+                    bt.logging.info("✅ Using top_200_df from startup phase")
+                    top_200_df = state['top_200_df']
+                else:
+                    bt.logging.info("📥 Collecting new submissions for this epoch...")
+                    top_200_df = state.get('top_200_df', pd.DataFrame())
+                
+                if top_200_df.empty:
+                    bt.logging.warning("No top 200 molecules found, skipping this epoch")
+                    last_processed_epoch = current_epoch
+                    state['last_processed_epoch'] = current_epoch
+                    await asyncio.sleep(10)
+                    continue
+                
+                bt.logging.info(f"🧬 Generating {desired_unique_count} unique molecules with validation...")
+                unique_molecules = await generate_unique_molecules_from_top200(
+                    state, top_200_df, desired_unique_count
+                )
+                
+                if not unique_molecules:
+                    bt.logging.warning("Failed to generate unique molecules, skipping this epoch")
+                    last_processed_epoch = current_epoch
+                    state['last_processed_epoch'] = current_epoch
+                    await asyncio.sleep(10)
+                    continue
+                
+                bt.logging.info(f"✅ Generated {len(unique_molecules)} valid unique molecules")
+                
+                # Score and submit
+                scored_molecules = await score_molecules_with_boltz(state, unique_molecules)
+                
+                if scored_molecules:
+                    best_mol = scored_molecules[0]
+                    if best_mol.get('boltz_score') is not None:
+                        state['candidate_product'] = best_mol['name']
+                        await submit_response(state)
+                        state['last_submission_epoch'] = current_epoch
+                
+                last_processed_epoch = current_epoch
+                state['last_processed_epoch'] = current_epoch
+            
+            await asyncio.sleep(10)
+        
+        except Exception as e:
+            bt.logging.error(f"Error in adaptive GA loop: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            await asyncio.sleep(10)
+
+
 async def run_miner(config: argparse.Namespace) -> None:
     """Main mining loop."""
     wallet, subtensor, metagraph, miner_uid, epoch_length = await setup_bittensor_objects(config)
-
+    
     state: Dict[str, Any] = {
         'config': config,
         'github_path': load_github_path(),
@@ -1204,9 +1313,9 @@ async def run_miner(config: argparse.Namespace) -> None:
         'boltz_wrapper': None,
         'top_200_df': pd.DataFrame(),
     }
-
+    
     bt.logging.info("🚀 Entering main miner loop...")
-
+    
     state['rxn_id'] = HARDCODED_RXN_ID
     
     current_block = await subtensor.get_current_block()
@@ -1217,7 +1326,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         weekly_target=config.weekly_target,
         num_antitargets=config.num_antitargets
     )
-
+    
     if startup_proteins:
         state['current_challenge_targets'] = startup_proteins["targets"]
         state['last_challenge_targets'] = startup_proteins["targets"]
@@ -1229,7 +1338,7 @@ async def run_miner(config: argparse.Namespace) -> None:
             f"Startup targets: {startup_proteins['targets']}, "
             f"antitargets: {startup_proteins['antitargets']}"
         )
-
+        
         # Run startup phase
         try:
             await startup_phase(state)
@@ -1238,7 +1347,7 @@ async def run_miner(config: argparse.Namespace) -> None:
             bt.logging.error(f"Error in startup: {e}")
             import traceback
             bt.logging.error(traceback.format_exc())
-
+        
         # Launch adaptive GA loop
         try:
             state['ga_task'] = asyncio.create_task(run_adaptive_genetic_loop(state))
@@ -1247,18 +1356,18 @@ async def run_miner(config: argparse.Namespace) -> None:
             bt.logging.error(f"Error starting GA loop: {e}")
             import traceback
             bt.logging.error(traceback.format_exc())
-
+    
     # Main monitoring loop
     while True:
         try:
             current_block = await subtensor.get_current_block()
-
+            
             if current_block % epoch_length == 0:
                 current_epoch = current_block // epoch_length
                 bt.logging.info(
                     f"⏰ Epoch boundary at block {current_block} (epoch {current_epoch})"
                 )
-
+            
             if current_block % 60 == 0:
                 await metagraph.sync()
                 log = (
@@ -1267,14 +1376,14 @@ async def run_miner(config: argparse.Namespace) -> None:
                     f"Current epoch: {metagraph.block.item() // epoch_length}"
                 )
                 bt.logging.info(log)
-
+            
             await asyncio.sleep(1)
-
+        
         except RuntimeError as e:
             bt.logging.error(e)
             import traceback
             traceback.print_exc()
-
+        
         except KeyboardInterrupt:
             bt.logging.success("⛔ Keyboard interrupt detected. Exiting miner.")
             state['shutdown_event'].set()
