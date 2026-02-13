@@ -54,8 +54,9 @@ from utils import (
 from utils.molecules import molecule_unique_for_protein_hf
 from molecules_base import (
     generate_inchikey,
+    get_molecules_by_role,
 )
-from combinatorial_db.reactions import get_smiles_from_reaction
+from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from btdr import QuicknetBittensorDrandTimelock
 
 # BoltzWrapper import - following the same pattern as DataGenerator/main.py
@@ -116,17 +117,43 @@ def safe_torch_load(path, map_location='cpu'):
 
 
 # ============================================================================
-# ✅ GENETIC ALGORITHM OPERATIONS (CROSSOVER ONLY)
+# ✅ GENETIC ALGORITHM OPERATIONS (CROSSOVER + MUTATION)
 # ============================================================================
 
 class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
+    """Performs genetic algorithm operations on molecules (CROSSOVER + MUTATION)."""
     
     def __init__(self, rxn_id: int, db_path: str):
         """Initialize GA operator."""
         self.rxn_id = rxn_id
         self.db_path = db_path
         self.generated_molecule_names: Set[str] = set()  # Track generated molecule names
+        
+        # Load reaction info and component pools for mutation
+        self.reaction_info = get_reaction_info(rxn_id, db_path)
+        if self.reaction_info:
+            self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+            self.is_three_component = self.roleC is not None and self.roleC != 0
+            
+            # Load component pools for mutation
+            self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+            self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+            self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+            
+            # Extract component IDs for each role
+            self.component_ids_A = [mol[0] for mol in self.molecules_A] if self.molecules_A else []
+            self.component_ids_B = [mol[0] for mol in self.molecules_B] if self.molecules_B else []
+            self.component_ids_C = [mol[0] for mol in self.molecules_C] if self.molecules_C else []
+            
+            bt.logging.debug(f"GA Operator initialized: {len(self.component_ids_A)} A, {len(self.component_ids_B)} B"
+                           f"{f', {len(self.component_ids_C)} C' if self.is_three_component else ''} components")
+        else:
+            bt.logging.warning(f"Could not load reaction info for rxn_id {rxn_id}, mutation will be disabled")
+            self.reaction_info = None
+            self.component_ids_A = []
+            self.component_ids_B = []
+            self.component_ids_C = []
+            self.is_three_component = False
     
     def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
         """
@@ -228,17 +255,141 @@ class GeneticAlgorithmOperator:
             bt.logging.debug(traceback.format_exc())
             return None
     
+    def mutate_molecule(self, mol_name: str) -> Optional[str]:
+        """
+        Mutate a molecule by replacing a random component with a random component from the same role.
+        
+        Supports two formats:
+        - 2 components: rxn:5:comp1:comp2 (4 parts) - components at indices 2, 3
+        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts) - components at indices 2, 3, 4
+        
+        Args:
+            mol_name: Parent molecule name to mutate
+            
+        Returns:
+            New molecule name from mutation, or None if mutation failed
+        """
+        try:
+            from rdkit import Chem
+            
+            # Check if mutation is available
+            if not self.reaction_info or not self.component_ids_A or not self.component_ids_B:
+                bt.logging.debug("Mutation not available: reaction info or component pools not loaded")
+                return None
+            
+            # Parse molecule name
+            parts = mol_name.split(':')
+            
+            bt.logging.debug(f"Mutation: {mol_name}")
+            bt.logging.debug(f"  Parts: {parts}")
+            
+            # Validate format: must start with 'rxn'
+            if parts[0] != 'rxn':
+                bt.logging.debug(f"Invalid format: must start with 'rxn'")
+                return None
+            
+            # Accept 4 parts (2 components) or 5 parts (3 components)
+            if len(parts) not in [4, 5]:
+                bt.logging.debug(f"Invalid format: expected 4 or 5 parts, got {len(parts)}")
+                return None
+            
+            try:
+                rxn_id = int(parts[1])
+                if rxn_id != self.rxn_id:
+                    bt.logging.debug(f"Wrong rxn_id: {rxn_id}")
+                    return None
+            except (ValueError, IndexError) as e:
+                bt.logging.debug(f"Error parsing rxn_id: {e}")
+                return None
+            
+            # Determine which component indices can be mutated
+            # For 2 components (4 parts): indices 2, 3 (A, B)
+            # For 3 components (5 parts): indices 2, 3, 4 (A, B, C)
+            num_components = len(parts) - 2  # Subtract 'rxn' and rxn_id
+            component_indices = list(range(2, 2 + num_components))
+            
+            # Randomly select which component to mutate
+            mutate_idx = random.choice(component_indices)
+            component_position = mutate_idx - 2  # 0 for A, 1 for B, 2 for C
+            
+            bt.logging.debug(f"Mutating component at index {mutate_idx} (position {component_position})")
+            
+            # Get the appropriate component pool based on position
+            if component_position == 0:  # Component A
+                component_pool = self.component_ids_A
+                current_component_id = int(parts[mutate_idx])
+            elif component_position == 1:  # Component B
+                component_pool = self.component_ids_B
+                current_component_id = int(parts[mutate_idx])
+            elif component_position == 2 and self.is_three_component:  # Component C
+                component_pool = self.component_ids_C
+                current_component_id = int(parts[mutate_idx])
+            else:
+                bt.logging.debug(f"Invalid component position: {component_position}")
+                return None
+            
+            if not component_pool:
+                bt.logging.debug(f"No components available for position {component_position}")
+                return None
+            
+            # Select a random component from the pool (excluding current one to ensure mutation)
+            available_components = [cid for cid in component_pool if cid != current_component_id]
+            if not available_components:
+                bt.logging.debug(f"No alternative components available for position {component_position}")
+                return None
+            
+            new_component_id = random.choice(available_components)
+            
+            # Create mutated molecule by replacing the component
+            mutated_parts = parts.copy()
+            mutated_parts[mutate_idx] = str(new_component_id)
+            mutated_name = ':'.join(mutated_parts)
+            
+            bt.logging.debug(f"Mutated: {mutated_name}")
+            
+            # ✅ CHECK IF WE ALREADY GENERATED THIS MOLECULE
+            if mutated_name in self.generated_molecule_names:
+                bt.logging.debug(f"⚠️  Mutated molecule {mutated_name} already generated in this batch")
+                return None
+            
+            # Validate mutated molecule
+            try:
+                mutated_smiles = get_smiles_from_reaction(mutated_name)
+                if mutated_smiles:
+                    mol = Chem.MolFromSmiles(mutated_smiles)
+                    if mol is not None:
+                        # ✅ TRACK THIS MOLECULE NAME
+                        self.generated_molecule_names.add(mutated_name)
+                        bt.logging.info(f"✅ Mutation successful: {mol_name} → {mutated_name} (replaced component {component_position})")
+                        return mutated_name
+                    else:
+                        bt.logging.debug(f"Invalid SMILES from RDKit: {mutated_smiles}")
+                else:
+                    bt.logging.debug(f"No SMILES generated for mutated molecule")
+            except Exception as e:
+                bt.logging.debug(f"Error validating mutation: {e}")
+            
+            return None
+        
+        except Exception as e:
+            bt.logging.debug(f"Error in mutate_molecule: {e}")
+            import traceback
+            bt.logging.debug(traceback.format_exc())
+            return None
+    
     def apply_genetic_operations(
         self,
         top_molecules: List[str],
-        num_crossovers: int = 5
+        num_crossovers: int = 5,
+        num_mutations: int = 5
     ) -> List[Dict[str, Any]]:
         """
-        Apply genetic operations (CROSSOVER ONLY) to top molecules.
+        Apply genetic operations (CROSSOVER + MUTATION) to top molecules.
         
         Args:
             top_molecules: List of top molecule names
             num_crossovers: Number of crossovers to attempt
+            num_mutations: Number of mutations to attempt
             
         Returns:
             List of new molecules with their SMILES and names (in order generated)
@@ -248,10 +399,11 @@ class GeneticAlgorithmOperator:
         # ✅ RESET TRACKING FOR THIS BATCH
         self.generated_molecule_names.clear()
         
-        bt.logging.info(f"🧬 Applying CROSSOVER-ONLY genetic operations to top {len(top_molecules)} molecules...")
+        bt.logging.info(f"🧬 Applying genetic operations (CROSSOVER + MUTATION) to top {len(top_molecules)} molecules...")
         bt.logging.info(f"   Sample molecules: {top_molecules[:3]}")
+        bt.logging.info(f"   Operations: {num_crossovers} crossovers, {num_mutations} mutations")
         
-        # Apply crossovers only
+        # Apply crossovers
         crossover_attempts = 0
         crossovers_created = 0
         
@@ -288,7 +440,41 @@ class GeneticAlgorithmOperator:
                 bt.logging.debug(f"   ⏭️  Crossover {i+1}: parents are identical, skipping")
         
         bt.logging.info(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
-        bt.logging.info(f"🧬 Generated {len(new_molecules)} new molecules from crossover operations")
+        
+        # Apply mutations
+        mutation_attempts = 0
+        mutations_created = 0
+        
+        for i in range(num_mutations):
+            parent = random.choice(top_molecules)
+            mutation_attempts += 1
+            
+            bt.logging.info(f"   Attempting mutation {i+1}/{num_mutations}: {parent}")
+            
+            mutated = self.mutate_molecule(parent)
+            
+            if mutated:
+                try:
+                    smiles = get_smiles_from_reaction(mutated)
+                    inchikey = generate_inchikey(smiles)
+                    
+                    if smiles and inchikey:
+                        new_molecules.append({
+                            'name': mutated,
+                            'smiles': smiles,
+                            'InChIKey': inchikey,
+                            'type': 'mutation'
+                        })
+                        mutations_created += 1
+                        bt.logging.info(f"   ✅ Mutation #{mutations_created}: {parent} → {mutated}")
+                
+                except Exception as e:
+                    bt.logging.debug(f"Error processing mutated molecule: {e}")
+            else:
+                bt.logging.debug(f"   ❌ Mutation {i+1} failed (duplicate or invalid)")
+        
+        bt.logging.info(f"   Mutations: {mutations_created}/{num_mutations} successful")
+        bt.logging.info(f"🧬 Generated {len(new_molecules)} new molecules ({crossovers_created} crossovers, {mutations_created} mutations)")
         
         # ✅ VERIFY ORDER IS PRESERVED
         bt.logging.info(f"   Generated molecules in order: {[m['name'] for m in new_molecules]}")
@@ -1237,10 +1423,11 @@ async def generate_unique_molecules_from_top200(
         # Use current pool size
         current_pool_names = all_names[:current_pool_size]
         
-        # Apply genetic operations (crossover)
+        # Apply genetic operations (crossover + mutation)
         new_molecules = ga_operator.apply_genetic_operations(
             current_pool_names,
-            num_crossovers=10  # 10 crossovers per batch
+            num_crossovers=10,  # 10 crossovers per batch
+            num_mutations=10   # 10 mutations per batch
         )
         
         # Check each new molecule for uniqueness
@@ -1389,7 +1576,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                     blocks_remaining = next_epoch_block - current_block_before_round
                     
                     # If we're already within 50 blocks, submit and exit
-                    if blocks_remaining < 50:
+                    if blocks_remaining < 70:
                         if best_molecule_so_far:
                             # Check if we already submitted in this epoch
                             if last_submission_epoch == current_epoch:
@@ -1540,7 +1727,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                         blocks_remaining = next_epoch_block - current_block_before_batch
                         
                         # Only submit when < 50 blocks remain
-                        if blocks_remaining < 50:
+                        if blocks_remaining < 70:
                             if best_molecule_so_far:
                                 # Check if we already submitted in this epoch
                                 if last_submission_epoch == current_epoch:
@@ -1722,7 +1909,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                         bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}, batch {batch_idx + 1}: {blocks_remaining_after}")
                         
                         # If we hit the 50 block threshold during batch scoring, exit batch loop
-                        if blocks_remaining_after < 50:
+                        if blocks_remaining_after < 70:
                             break
                     
                     # After completing all batches for this round, check if we should continue
@@ -1736,7 +1923,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                     bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}: {blocks_remaining_after_round}")
                     
                     # If blocks remaining < 50, submit and exit
-                    if blocks_remaining_after_round < 50:
+                    if blocks_remaining_after_round < 70:
                         if best_molecule_so_far and last_submission_epoch != current_epoch:
                             # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
                             molecule_name = best_molecule_so_far['name']

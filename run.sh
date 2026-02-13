@@ -16,9 +16,10 @@ CUDA_VISIBLE_DEVICES=0 python3 neurons/miner_mini1.py --wallet.name multisig-jjp
 
 CUDA_VISIBLE_DEVICES=0 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotc --logging.debug
 
+CUDA_VISIBLE_DEVICES=1 pm2 start "python3 neurons/miner_mutate.py --wallet.name multisig-jjpes-shib --wallet.hotkey hote --logging.debug" --name "mutate_miner"
 
-CUDA_VISIBLE_DEVICES=0 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hote --logging.debug
-CUDA_VISIBLE_DEVICES=0 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
-CUDA_VISIBLE_DEVICES=0 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotb --logging.debug
-CUDA_VISIBLE_DEVICES=0 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hota --logging.debug
+pm2 start "python3 neurons/miner_mini1.py --wallet.name multisig-jjpes-shib --wallet.hotkey hote --logging.debug" --name "compound"
 
+python3 neurons/miner_mutate.py --wallet.name multisig-jjpes-shib --wallet.hotkey hote --logging.debug
+
+python3 neurons/miner_synthon.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug

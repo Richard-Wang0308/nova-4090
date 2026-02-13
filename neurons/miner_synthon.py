@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-SIMPLIFIED BITTENSOR MINER - Genetic Algorithm Based Molecule Generation
+UPDATED BITTENSOR MINER - Genetic Algorithm + Synthon Search
 
-Simple workflow:
+Updated workflow:
 1. Load molecules from CSV at startup
 2. Initialize BoltzWrapper for scoring
-3. Apply genetic operations (CROSSOVER ONLY)
+3. Generate molecules:
+   - 70% using SYNTHON SEARCH (intelligent fragment recombination)
+   - 30% using CROSSOVER-ONLY genetic algorithm
 4. Collect 10 unique molecules (NOT on HuggingFace)
 5. Score all 10 molecules using BoltzWrapper
 6. Submit the top-scoring molecule
@@ -40,11 +42,11 @@ DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 HARDCODED_RXN_ID = 5
 STARTING_EPOCH = 20795
 
-# ✅ CSV for loading initial molecules
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
+# ✅ CSV for loading initial molecules (now directly under nova-4090/data/)
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 
-# ✅ Database for storing scored molecules (using nova2 directory)
-SCORE_RESULTS_DB = os.path.abspath(os.path.join(BASE_DIR, "..", "nova2", "score_results5.sqlite"))
+# ✅ Database for storing scored molecules
+SCORE_RESULTS_DB = os.path.join(BASE_DIR,"..","nova-4090", "score_results5.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -54,12 +56,14 @@ from utils import (
 from utils.molecules import molecule_unique_for_protein_hf
 from molecules_base import (
     generate_inchikey,
+    SynthonLibrary,
+    generate_molecules_from_synthon_library,
+    validate_molecules,
 )
 from combinatorial_db.reactions import get_smiles_from_reaction
 from btdr import QuicknetBittensorDrandTimelock
 
 # BoltzWrapper import - following the same pattern as DataGenerator/main.py
-# We'll import it lazily in startup_phase after logging is initialized
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
 
@@ -69,24 +73,7 @@ BoltzWrapper = None
 # ============================================================================
 
 def safe_torch_load(path, map_location='cpu'):
-    """
-    Safely load PyTorch checkpoint with numpy scalar support (PyTorch 2.6+).
-    
-    This function handles PyTorch 2.6+ compatibility by:
-    - Adding numpy.core.multiarray.scalar to safe globals
-    - Using weights_only=False for backward compatibility
-    
-    Args:
-        path: Path to checkpoint file (str or Path)
-        map_location: Device to load to (default: 'cpu')
-        
-    Returns:
-        Loaded checkpoint dictionary
-        
-    Raises:
-        FileNotFoundError: If checkpoint file doesn't exist
-        RuntimeError: If checkpoint loading fails
-    """
+    """Safely load PyTorch checkpoint with numpy scalar support (PyTorch 2.6+)."""
     import torch
     import numpy as np
     
@@ -98,10 +85,7 @@ def safe_torch_load(path, map_location='cpu'):
     bt.logging.info(f"Loading checkpoint from {path}...")
     
     try:
-        # Add safe globals for numpy scalars (PyTorch 2.6+)
         torch.serialization.add_safe_globals([np.core.multiarray.scalar])
-        
-        # Load checkpoint with weights_only=False for compatibility
         checkpoint = torch.load(
             path,
             map_location=map_location,
@@ -116,28 +100,236 @@ def safe_torch_load(path, map_location='cpu'):
 
 
 # ============================================================================
-# ✅ GENETIC ALGORITHM OPERATIONS (CROSSOVER ONLY)
+# ✅ HYBRID MOLECULE GENERATION (70% SYNTHON + 30% CROSSOVER)
 # ============================================================================
 
-class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
+class HybridMoleculeGenerator:
+    """Generates molecules using 70% synthon search + 30% crossover."""
     
     def __init__(self, rxn_id: int, db_path: str):
-        """Initialize GA operator."""
+        """Initialize hybrid generator."""
         self.rxn_id = rxn_id
         self.db_path = db_path
-        self.generated_molecule_names: Set[str] = set()  # Track generated molecule names
+        self.generated_molecule_names: Set[str] = set()
+        self.synthon_lib: Optional[SynthonLibrary] = None
+        self.synthon_lib_ready = False
     
+    def initialize_synthon_library(self) -> bool:
+        """
+        Initialize SynthonLibrary for synthon search.
+        Should be called after we have good molecules (iteration 2+).
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            bt.logging.info(f"🔬 Initializing SynthonLibrary for rxn_id={self.rxn_id}...")
+            start_time = time.time()
+            
+            self.synthon_lib = SynthonLibrary(self.db_path, self.rxn_id)
+            self.synthon_lib_ready = True
+            
+            elapsed = time.time() - start_time
+            bt.logging.info(f"✅ SynthonLibrary initialized successfully in {elapsed:.2f}s")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to initialize SynthonLibrary: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            self.synthon_lib_ready = False
+            return False
+    
+    def generate_synthon_molecules(
+        self,
+        top_molecules: List[str],
+        top_pool_df: pd.DataFrame,
+        num_synthon: int = 70
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate molecules using synthon search (70% of generation).
+        
+        Uses multi-range strategy:
+        - Tight on top 5 molecules
+        - Medium on molecules 10-40
+        - Broad on top 50 molecules
+        
+        Args:
+            top_molecules: List of top molecule names
+            top_pool_df: DataFrame with top molecules (name, smiles, InChIKey, score)
+            num_synthon: Number of synthon molecules to generate
+            
+        Returns:
+            List of new molecules with SMILES and names
+        """
+        if not self.synthon_lib_ready or self.synthon_lib is None:
+            bt.logging.warning("⚠️  SynthonLibrary not ready, skipping synthon generation")
+            return []
+        
+        if top_pool_df.empty:
+            bt.logging.warning("⚠️  No top molecules available for synthon search")
+            return []
+        
+        new_molecules = []
+        
+        try:
+            bt.logging.info(f"🧬 Generating {num_synthon} molecules using SYNTHON SEARCH...")
+            
+            # Get current max score for adaptive strategy
+            current_max_score = top_pool_df['score'].max() if 'score' in top_pool_df.columns else None
+            
+            # Determine strategy based on score
+            has_high_score = current_max_score is not None and current_max_score > 0.01
+            has_very_high_score = current_max_score is not None and current_max_score > 0.015
+            
+            if has_very_high_score:
+                bt.logging.info(f"🎯 Very high score detected ({current_max_score:.6f}), using TIGHT synthon strategy")
+                
+                # Part 1: Ultra-tight on TOP 1 (40% of budget)
+                n_part1 = int(num_synthon * 0.40)
+                synthon_part1 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(1),
+                    n_part1,
+                    min_similarity=0.90,
+                    n_per_base=50
+                )
+                bt.logging.info(f"   Part 1: Generated {len(synthon_part1)} ultra-tight synthon (top 1, sim=0.90)")
+                
+                # Part 2: Tight on TOP 5 (30% of budget)
+                n_part2 = int(num_synthon * 0.30)
+                synthon_part2 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(5),
+                    n_part2,
+                    min_similarity=0.80,
+                    n_per_base=30
+                )
+                bt.logging.info(f"   Part 2: Generated {len(synthon_part2)} tight synthon (top 5, sim=0.80)")
+                
+                # Part 3: Medium on TOP 20 (30% of budget)
+                n_part3 = int(num_synthon * 0.30)
+                synthon_part3 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(20),
+                    n_part3,
+                    min_similarity=0.55,
+                    n_per_base=15
+                )
+                bt.logging.info(f"   Part 3: Generated {len(synthon_part3)} medium synthon (top 20, sim=0.55)")
+                
+                # Combine all parts
+                synthon_df = pd.concat([synthon_part1, synthon_part2, synthon_part3], ignore_index=True)
+            
+            elif has_high_score:
+                bt.logging.info(f"🎯 High score detected ({current_max_score:.6f}), using BALANCED synthon strategy")
+                
+                # Part 1: Tight on TOP 5 (40% of budget)
+                n_part1 = int(num_synthon * 0.40)
+                synthon_part1 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(5),
+                    n_part1,
+                    min_similarity=0.80,
+                    n_per_base=30
+                )
+                bt.logging.info(f"   Part 1: Generated {len(synthon_part1)} tight synthon (top 5, sim=0.80)")
+                
+                # Part 2: Medium on molecules 10-40 (30% of budget)
+                n_part2 = int(num_synthon * 0.30)
+                seed_medium = top_pool_df.iloc[10:40] if len(top_pool_df) > 40 else top_pool_df.iloc[5:]
+                synthon_part2 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    seed_medium,
+                    n_part2,
+                    min_similarity=0.55,
+                    n_per_base=15
+                )
+                bt.logging.info(f"   Part 2: Generated {len(synthon_part2)} medium synthon (molecules 10-40, sim=0.55)")
+                
+                # Part 3: Broad on TOP 50 (30% of budget)
+                n_part3 = int(num_synthon * 0.30)
+                synthon_part3 = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(50),
+                    n_part3,
+                    min_similarity=0.40,
+                    n_per_base=20
+                )
+                bt.logging.info(f"   Part 3: Generated {len(synthon_part3)} broad synthon (top 50, sim=0.40)")
+                
+                # Combine all parts
+                synthon_df = pd.concat([synthon_part1, synthon_part2, synthon_part3], ignore_index=True)
+            
+            else:
+                bt.logging.info(f"🎯 Standard score, using BROAD synthon strategy")
+                
+                # Simple approach: Medium on top 30
+                synthon_df = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    top_pool_df.head(30),
+                    num_synthon,
+                    min_similarity=0.65,
+                    n_per_base=20
+                )
+                bt.logging.info(f"   Generated {len(synthon_df)} broad synthon (top 30, sim=0.65)")
+            
+            # ✅ FIX: VALIDATE FIRST to add smiles and InChIKey columns
+            if not synthon_df.empty:
+                bt.logging.info(f"   Processing {len(synthon_df)} synthon molecules...")
+                
+                # ✅ VALIDATE MOLECULES FIRST - this adds 'smiles' and 'InChIKey' columns
+                # Create a minimal config for validation
+                validation_config = {
+                    'min_heavy_atoms': 5,
+                    'min_rotatable_bonds': 0,
+                    'max_rotatable_bonds': 20
+                }
+                
+                synthon_df = validate_molecules(synthon_df, validation_config)
+                bt.logging.info(f"   After validation: {len(synthon_df)} valid synthon molecules")
+                
+                if synthon_df.empty:
+                    bt.logging.warning("   ⚠️  No molecules passed validation")
+                    return []
+                
+                # Deduplicate by InChIKey (now that we have it)
+                synthon_df = synthon_df.drop_duplicates(subset=['InChIKey'], keep='first')
+                bt.logging.info(f"   After deduplication: {len(synthon_df)} unique synthon molecules")
+                
+                # ✅ NOW we can safely access smiles and InChIKey columns
+                for _, row in synthon_df.iterrows():
+                    mol_name = row.get('name')
+                    smiles = row.get('smiles')
+                    inchikey = row.get('InChIKey')
+                    
+                    # ✅ All columns now exist after validate_molecules
+                    if mol_name and smiles and inchikey:
+                        if mol_name not in self.generated_molecule_names:
+                            new_molecules.append({
+                                'name': mol_name,
+                                'smiles': smiles,
+                                'InChIKey': inchikey,
+                                'type': 'synthon'
+                            })
+                            self.generated_molecule_names.add(mol_name)
+            
+            bt.logging.info(f"✅ Generated {len(new_molecules)} valid synthon molecules")
+            return new_molecules
+        
+        except Exception as e:
+            bt.logging.error(f"❌ Error in synthon generation: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            return []
+
     def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
         """
-        Crossover two molecules by swapping random components.
+        Crossover two molecules by swapping random components (30% of generation).
         
         Supports two formats:
         - 2 components: rxn:5:comp1:comp2 (4 parts)
         - 3 components: rxn:5:comp1:comp2:comp3 (5 parts)
-        
-        Both parents must have the same number of components.
-        We randomly swap one component between the two molecules.
         
         Args:
             mol_name_1: First parent molecule name
@@ -153,54 +345,36 @@ class GeneticAlgorithmOperator:
             parts1 = mol_name_1.split(':')
             parts2 = mol_name_2.split(':')
             
-            bt.logging.debug(f"Crossover: {mol_name_1} x {mol_name_2}")
-            bt.logging.debug(f"  Parts1: {parts1}, Parts2: {parts2}")
-            
-            # Validate format: must start with 'rxn' and have same length
+            # Validate format
             if (parts1[0] != 'rxn' or parts2[0] != 'rxn'):
-                bt.logging.debug(f"Invalid format: must start with 'rxn'")
                 return None
             
-            # Both molecules must have the same number of parts (same number of components)
             if len(parts1) != len(parts2):
-                bt.logging.debug(f"Invalid format: different number of components ({len(parts1)} vs {len(parts2)})")
                 return None
             
-            # Accept 4 parts (2 components) or 5 parts (3 components)
             if len(parts1) not in [4, 5]:
-                bt.logging.debug(f"Invalid format: expected 4 or 5 parts, got {len(parts1)}")
                 return None
             
             try:
                 rxn_id_1 = int(parts1[1])
                 rxn_id_2 = int(parts2[1])
                 if rxn_id_1 != self.rxn_id or rxn_id_2 != self.rxn_id:
-                    bt.logging.debug(f"Wrong rxn_ids: {rxn_id_1}, {rxn_id_2}")
                     return None
-            except (ValueError, IndexError) as e:
-                bt.logging.debug(f"Error parsing rxn_ids: {e}")
+            except (ValueError, IndexError):
                 return None
             
-            # Determine which component indices can be swapped
-            # For 2 components (4 parts): indices 2, 3
-            # For 3 components (5 parts): indices 2, 3, 4
-            num_components = len(parts1) - 2  # Subtract 'rxn' and rxn_id
-            component_indices = list(range(2, 2 + num_components))
-            
             # Randomly select which component to swap
+            num_components = len(parts1) - 2
+            component_indices = list(range(2, 2 + num_components))
             swap_idx = random.choice(component_indices)
-            bt.logging.debug(f"Swapping component at index {swap_idx} (molecule has {num_components} components)")
             
-            # Create offspring by swapping one component
+            # Create offspring
             offspring_parts = parts1.copy()
             offspring_parts[swap_idx] = parts2[swap_idx]
             offspring_name = ':'.join(offspring_parts)
             
-            bt.logging.debug(f"Offspring: {offspring_name}")
-            
-            # ✅ CHECK IF WE ALREADY GENERATED THIS MOLECULE
+            # Check if already generated
             if offspring_name in self.generated_molecule_names:
-                bt.logging.debug(f"⚠️  Offspring {offspring_name} already generated in this batch")
                 return None
             
             # Validate offspring
@@ -209,14 +383,9 @@ class GeneticAlgorithmOperator:
                 if offspring_smiles:
                     mol = Chem.MolFromSmiles(offspring_smiles)
                     if mol is not None:
-                        # ✅ TRACK THIS MOLECULE NAME
                         self.generated_molecule_names.add(offspring_name)
-                        bt.logging.info(f"✅ Crossover successful: {mol_name_1} × {mol_name_2} → {offspring_name}")
+                        bt.logging.debug(f"✅ Crossover: {mol_name_1} × {mol_name_2} → {offspring_name}")
                         return offspring_name
-                    else:
-                        bt.logging.debug(f"Invalid SMILES from RDKit: {offspring_smiles}")
-                else:
-                    bt.logging.debug(f"No SMILES generated for offspring")
             except Exception as e:
                 bt.logging.debug(f"Error validating crossover: {e}")
             
@@ -224,43 +393,56 @@ class GeneticAlgorithmOperator:
         
         except Exception as e:
             bt.logging.debug(f"Error in crossover_molecules: {e}")
-            import traceback
-            bt.logging.debug(traceback.format_exc())
             return None
     
-    def apply_genetic_operations(
+    def apply_hybrid_generation(
         self,
         top_molecules: List[str],
-        num_crossovers: int = 5
+        top_pool_df: pd.DataFrame,
+        num_synthon: int = 70,
+        num_crossover: int = 30
     ) -> List[Dict[str, Any]]:
         """
-        Apply genetic operations (CROSSOVER ONLY) to top molecules.
+        Apply hybrid generation: 70% synthon search + 30% crossover.
         
         Args:
             top_molecules: List of top molecule names
-            num_crossovers: Number of crossovers to attempt
+            top_pool_df: DataFrame with top molecules
+            num_synthon: Number of synthon molecules (70%)
+            num_crossover: Number of crossover molecules (30%)
             
         Returns:
-            List of new molecules with their SMILES and names (in order generated)
+            List of new molecules (synthon + crossover combined)
         """
         new_molecules = []
         
-        # ✅ RESET TRACKING FOR THIS BATCH
+        # Reset tracking for this batch
         self.generated_molecule_names.clear()
         
-        bt.logging.info(f"🧬 Applying CROSSOVER-ONLY genetic operations to top {len(top_molecules)} molecules...")
-        bt.logging.info(f"   Sample molecules: {top_molecules[:3]}")
+        bt.logging.info(f"🧬 Applying HYBRID generation (70% synthon + 30% crossover)...")
+        bt.logging.info(f"   Target: {num_synthon} synthon + {num_crossover} crossover = {num_synthon + num_crossover} total")
         
-        # Apply crossovers only
+        # ✅ PART 1: SYNTHON SEARCH (70%)
+        if self.synthon_lib_ready:
+            synthon_molecules = self.generate_synthon_molecules(
+                top_molecules,
+                top_pool_df,
+                num_synthon
+            )
+            new_molecules.extend(synthon_molecules)
+            bt.logging.info(f"   ✅ Synthon: {len(synthon_molecules)}/{num_synthon} molecules generated")
+        else:
+            bt.logging.warning(f"   ⚠️  SynthonLibrary not ready, using crossover for all molecules")
+            num_crossover = num_synthon + num_crossover  # Use all budget for crossover
+        
+        # ✅ PART 2: CROSSOVER (30%)
         crossover_attempts = 0
         crossovers_created = 0
         
-        for i in range(num_crossovers):
+        for i in range(num_crossover):
             parent1 = random.choice(top_molecules)
             parent2 = random.choice(top_molecules)
             crossover_attempts += 1
-            
-            bt.logging.info(f"   Attempting crossover {i+1}/{num_crossovers}: {parent1} x {parent2}")
             
             if parent1 != parent2:
                 offspring = self.crossover_molecules(parent1, parent2)
@@ -278,26 +460,18 @@ class GeneticAlgorithmOperator:
                                 'type': 'crossover'
                             })
                             crossovers_created += 1
-                            bt.logging.info(f"   ✅ Crossover #{crossovers_created}: {parent1} × {parent2} → {offspring}")
                     
                     except Exception as e:
-                        bt.logging.debug(f"Error processing offspring: {e}")
-                else:
-                    bt.logging.debug(f"   ❌ Crossover {i+1} failed (duplicate or invalid)")
-            else:
-                bt.logging.debug(f"   ⏭️  Crossover {i+1}: parents are identical, skipping")
+                        bt.logging.debug(f"Error processing crossover offspring: {e}")
         
-        bt.logging.info(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
-        bt.logging.info(f"🧬 Generated {len(new_molecules)} new molecules from crossover operations")
-        
-        # ✅ VERIFY ORDER IS PRESERVED
-        bt.logging.info(f"   Generated molecules in order: {[m['name'] for m in new_molecules]}")
+        bt.logging.info(f"   ✅ Crossover: {crossovers_created}/{num_crossover} molecules generated")
+        bt.logging.info(f"🧬 HYBRID generation complete: {len(new_molecules)} total molecules")
         
         return new_molecules
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (from original code)
 # ============================================================================
 
 def parse_arguments() -> argparse.Namespace:
@@ -354,36 +528,61 @@ def setup_logging(config: argparse.Namespace) -> None:
 
 
 async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any, Any, int, int]:
-    """Initializes wallet, subtensor, and metagraph."""
+    """Initializes wallet, subtensor, and metagraph with retry logic."""
     bt.logging.info("Setting up Bittensor objects.")
 
     wallet = bt.wallet(config=config)
     bt.logging.info(f"Wallet: {wallet}")
 
-    try:
-        async with bt.async_subtensor(network=config.network) as subtensor:
-            metagraph = await subtensor.metagraph(config.netuid)
-            await metagraph.sync()
-            bt.logging.info(f"Metagraph synced successfully.")
+    max_retries = 10
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            bt.logging.info(f"Attempting to connect to Bittensor network (attempt {attempt + 1}/{max_retries})...")
+            
+            subtensor = bt.async_subtensor(network=config.network)
+            
+            async with subtensor:
+                metagraph = await subtensor.metagraph(config.netuid)
+                await metagraph.sync()
+                bt.logging.info(f"Metagraph synced successfully.")
 
-            miner_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
-            bt.logging.info(f"Miner UID: {miner_uid}")
+                miner_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+                bt.logging.info(f"Miner UID: {miner_uid}")
 
-            epoch_length = 361
-            bt.logging.info(f"Epoch length: {epoch_length} blocks")
-
-        return wallet, subtensor, metagraph, miner_uid, epoch_length
-    except Exception as e:
-        bt.logging.error(f"Failed to setup Bittensor objects: {e}")
-        raise
+                epoch_length = 361
+                bt.logging.info(f"Epoch length: {epoch_length} blocks")
+            
+            subtensor = bt.async_subtensor(network=config.network)
+            await subtensor.initialize()
+            
+            return wallet, subtensor, metagraph, miner_uid, epoch_length
+                    
+        except (ConnectionError, TimeoutError) as e:
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                bt.logging.warning(
+                    f"Connection attempt {attempt + 1} failed: {e}. "
+                    f"Retrying in {wait_time} seconds..."
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                bt.logging.error(f"Failed to connect after {max_retries} attempts: {e}")
+                raise
+        except Exception as e:
+            bt.logging.error(f"Unexpected error during connection: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                await asyncio.sleep(wait_time)
+            else:
+                raise
 
 
 def init_score_results_db(db_path: str = None) -> None:
-    """
-    Initialize/create the score_results.sqlite database.
-    
-    Creates a table with molecule_name and score fields.
-    """
+    """Initialize/create the score_results.sqlite database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -399,7 +598,6 @@ def init_score_results_db(db_path: str = None) -> None:
             )
         """)
         
-        # Create index on score for faster queries
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
         """)
@@ -412,12 +610,7 @@ def init_score_results_db(db_path: str = None) -> None:
 
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
-    """
-    Get score for a molecule from the database.
-    
-    Returns:
-        Score if found, None otherwise
-    """
+    """Get score for a molecule from the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -437,13 +630,7 @@ def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float
 
 
 def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
-    """
-    Write scored molecules to the database.
-    
-    Args:
-        molecules: List of molecule dicts with 'name' and 'boltz_score'
-        db_path: Path to database (default: SCORE_RESULTS_DB)
-    """
+    """Write scored molecules to the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -454,7 +641,6 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Prepare data for insertion (only molecules with valid scores)
         to_insert = []
         for mol in molecules:
             molecule_name = mol.get('name')
@@ -479,12 +665,7 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
-    """
-    Get scores for multiple molecules from the database in batch.
-    
-    Returns:
-        Dictionary mapping molecule_name -> score
-    """
+    """Get scores for multiple molecules from the database in batch."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -495,7 +676,6 @@ def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> 
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Use IN clause for batch query
         placeholders = ','.join('?' * len(molecule_names))
         cursor.execute(
             f"SELECT molecule_name, score FROM scored_molecules WHERE molecule_name IN ({placeholders})",
@@ -511,13 +691,7 @@ def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> 
 
 
 async def check_molecule_unique(state: Dict[str, Any], molecule_name: str, smiles: str) -> bool:
-    """
-    Check if molecule is unique for target protein (NOT in HuggingFace dataset).
-    
-    Returns:
-        True if molecule is NOT in HuggingFace (i.e., it's unique/new)
-        False if molecule IS in HuggingFace (i.e., it's already known)
-    """
+    """Check if molecule is unique for target protein (NOT in HuggingFace dataset)."""
     if not state.get('current_challenge_targets'):
         bt.logging.warning("No target proteins available")
         return False
@@ -544,12 +718,7 @@ def load_molecules_from_csv(
     starting_epoch: int,
     rxn_id: int
 ) -> pd.DataFrame:
-    """
-    Load molecules from CSV file, sorted by final_score descending.
-    
-    Returns DataFrame with columns: name, smiles, InChIKey, score
-    Sorted by score (final_score from CSV) descending.
-    """
+    """Load molecules from CSV file, sorted by final_score descending."""
     if not os.path.exists(csv_path):
         bt.logging.warning(f"CSV file not found at {csv_path}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
@@ -561,13 +730,6 @@ def load_molecules_from_csv(
         )
         df = pd.read_csv(csv_path)
         
-        # Filter by target protein
-        if 'target_protein' in df.columns:
-            df = df[df['target_protein'].isin(target_proteins)]
-        else:
-            bt.logging.warning("CSV file does not have 'target_protein' column")
-            return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
-        
         # Filter by epoch
         if 'epoch' in df.columns:
             df = df[df['epoch'] >= starting_epoch]
@@ -575,12 +737,12 @@ def load_molecules_from_csv(
             bt.logging.warning("CSV file does not have 'epoch' column")
             return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
         
-        # Filter by reaction ID
-        if 'molecule_name' in df.columns:
-            df = df[df['molecule_name'].str.startswith(f"rxn:{rxn_id}:", na=False)]
-        else:
+        # Filter by rxn_id using molecule_name column
+        if 'molecule_name' not in df.columns:
             bt.logging.warning("CSV file does not have 'molecule_name' column")
             return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+        
+        df = df[df['molecule_name'].str.startswith(f"rxn:{rxn_id}:", na=False)]
         
         if df.empty:
             bt.logging.info("No matching molecules found in CSV")
@@ -594,6 +756,7 @@ def load_molecules_from_csv(
             molecule_name = row['molecule_name']
             
             try:
+                # Generate SMILES from reaction ID
                 smiles = get_smiles_from_reaction(molecule_name)
                 
                 if not smiles:
@@ -601,13 +764,14 @@ def load_molecules_from_csv(
                     failed_count += 1
                     continue
                 
+                # Generate InChIKey from SMILES
                 inchikey = generate_inchikey(smiles)
                 if not inchikey:
                     bt.logging.debug(f"Could not generate InChIKey for {molecule_name}")
                     failed_count += 1
                     continue
                 
-                # Get final_score from CSV if available
+                # Get score from CSV
                 final_score = row.get('final_score', None)
                 if pd.isna(final_score):
                     final_score = None
@@ -629,24 +793,24 @@ def load_molecules_from_csv(
         
         result_df = pd.DataFrame(result_rows)
         if not result_df.empty:
+            # Remove duplicates by InChIKey
             result_df = result_df.drop_duplicates(subset=['InChIKey'], keep='first')
             
-            # ✅ SORT BY final_score DESCENDING (highest scores first)
-            if 'score' in result_df.columns:
-                result_df = result_df.sort_values(by='score', ascending=False, na_position='last')
-                bt.logging.info(
-                    f"✅ Loaded {len(result_df)} molecules from CSV "
-                    f"(successful: {successful_count}, failed: {failed_count})"
-                )
-                if len(result_df) > 0:
-                    scores = result_df['score'].dropna()
-                    if len(scores) > 0:
-                        bt.logging.info(
-                            f"   Score range: {scores.min():.6f} to {scores.max():.6f} "
-                            f"(top 3: {scores.head(3).tolist()})"
-                        )
-            else:
-                bt.logging.warning("No 'score' column found, molecules not sorted by score")
+            # Sort by score descending
+            result_df = result_df.sort_values(by='score', ascending=False, na_position='last')
+            
+            bt.logging.info(
+                f"✅ Loaded {len(result_df)} molecules from CSV "
+                f"(successful: {successful_count}, failed: {failed_count})"
+            )
+            
+            if len(result_df) > 0:
+                scores = result_df['score'].dropna()
+                if len(scores) > 0:
+                    bt.logging.info(
+                        f"   Score range: {scores.min():.6f} to {scores.max():.6f} "
+                        f"(top 3: {scores.head(3).tolist()})"
+                    )
         else:
             bt.logging.warning(
                 f"No valid molecules loaded from CSV "
@@ -657,28 +821,20 @@ def load_molecules_from_csv(
         
     except Exception as e:
         bt.logging.error(f"Error loading molecules from CSV: {e}")
+        import traceback
+        bt.logging.error(traceback.format_exc())
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
 
 # ============================================================================
-# ✅ ADAPTIVE GENETIC OPERATIONS WITH SUBMISSION LOGIC (CROSSOVER ONLY)
+# SCORING AND SUBMISSION (same as original)
 # ============================================================================
 
 async def score_molecules_with_boltz(
     state: Dict[str, Any],
     molecules: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """
-    Score molecules using BoltzWrapper.
-    Checks database and HuggingFace Hub first to avoid redundant scoring.
-    
-    Args:
-        state: Miner state dictionary
-        molecules: List of molecule dicts with 'name', 'smiles', 'InChIKey'
-        
-    Returns:
-        List of molecules with added 'boltz_score' field, sorted by score descending
-    """
+    """Score molecules using BoltzWrapper (same as original code)."""
     if state.get('boltz_wrapper') is None:
         bt.logging.warning("BoltzWrapper not available, skipping scoring")
         return molecules
@@ -688,30 +844,24 @@ async def score_molecules_with_boltz(
     
     bt.logging.info(f"🔬 Processing {len(molecules)} molecules for scoring...")
     
-    # Initialize score database
     init_score_results_db()
     
-    # Separate molecules into: already scored, in HuggingFace, need scoring
     molecules_to_score = []
     molecules_with_db_scores = []
     molecules_in_hf = []
     
-    # Get target protein for HuggingFace check
     target_proteins = state.get('current_challenge_targets', [])
     primary_target = target_proteins[0] if target_proteins else None
     
-    # Batch check database for all molecules
     molecule_names = [mol['name'] for mol in molecules]
     db_scores = batch_get_scores_from_db(molecule_names)
     
     bt.logging.info(f"   Found {len(db_scores)} molecules already scored in database")
     
-    # Categorize molecules
     for mol in molecules:
         molecule_name = mol['name']
         smiles = mol.get('smiles')
         
-        # Check database first
         if molecule_name in db_scores:
             mol['boltz_score'] = db_scores[molecule_name]
             mol['boltz_score_source'] = 'database'
@@ -719,7 +869,6 @@ async def score_molecules_with_boltz(
             bt.logging.debug(f"   ✓ {molecule_name}: score from DB = {db_scores[molecule_name]:.6f}")
             continue
         
-        # Check HuggingFace Hub (skip if already submitted)
         if primary_target and smiles:
             try:
                 is_unique_hf = molecule_unique_for_protein_hf(primary_target, smiles)
@@ -729,9 +878,7 @@ async def score_molecules_with_boltz(
                     continue
             except Exception as e:
                 bt.logging.debug(f"   Error checking HuggingFace for {molecule_name}: {e}")
-                # Continue to scoring if check fails
         
-        # Need to score this molecule
         molecules_to_score.append(mol)
     
     bt.logging.info(
@@ -740,7 +887,6 @@ async def score_molecules_with_boltz(
         f"{len(molecules_to_score)} need scoring"
     )
     
-    # Score molecules that need scoring
     newly_scored_molecules = []
     if molecules_to_score:
         bt.logging.info(f"🔬 Scoring {len(molecules_to_score)} new molecules with Boltz...")
@@ -752,14 +898,12 @@ async def score_molecules_with_boltz(
         
         if not target_proteins:
             bt.logging.warning("No target proteins available for scoring")
-            # Return what we have from DB
             all_results = molecules_with_db_scores + [mol for mol in molecules if mol.get('boltz_score') is None]
             return all_results
         
         primary_target = target_proteins[0]
         
         try:
-            # Clean up any previous failed runs to avoid conflicts (same as DataGenerator)
             output_dir = os.path.join(boltz.output_dir, 'boltz_results_inputs')
             if os.path.exists(output_dir):
                 try:
@@ -771,20 +915,17 @@ async def score_molecules_with_boltz(
                 except Exception as cleanup_err:
                     bt.logging.debug(f"Could not clean up old logs: {cleanup_err}")
             
-            # Ensure output directories exist before scoring (same as DataGenerator)
             processed_dir = os.path.join(output_dir, 'processed')
             structures_dir = os.path.join(processed_dir, 'structures')
             records_dir = os.path.join(processed_dir, 'records')
             msa_dir = os.path.join(processed_dir, 'msa')
             predictions_dir = os.path.join(output_dir, 'predictions')
             
-            # Create all necessary directories
             os.makedirs(structures_dir, exist_ok=True)
             os.makedirs(records_dir, exist_ok=True)
             os.makedirs(msa_dir, exist_ok=True)
             os.makedirs(predictions_dir, exist_ok=True)
         
-            # Prepare data structures for BoltzWrapper (same as DataGenerator)
             valid_molecules_by_uid = {
                 0: {
                     'smiles': [mol['smiles'] for mol in molecules_to_score],
@@ -803,8 +944,6 @@ async def score_molecules_with_boltz(
                 }
             }
             
-            # Build subnet_config from config (same pattern as DataGenerator)
-            # ✅ IMPORTANT: Set num_molecules_boltz to score ALL molecules, not just 1
             num_molecules_to_score = len(molecules_to_score)
             subnet_config = {
                 'weekly_target': primary_target,
@@ -812,19 +951,17 @@ async def score_molecules_with_boltz(
                 'binding_pocket': getattr(config, 'binding_pocket', None),
                 'max_distance': getattr(config, 'max_distance', None),
                 'force': getattr(config, 'force', False),
-                'num_molecules_boltz': num_molecules_to_score,  # ✅ Score ALL molecules, not just 1
+                'num_molecules_boltz': num_molecules_to_score,
                 'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
                 'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
                 'sample_selection': getattr(config, 'sample_selection', 'first'),
             }
             
-            # Use dummy block hash for scoring
             final_block_hash = "0x" + "0" * 64
             
             bt.logging.info(f"   Running Boltz scoring for {len(molecules_to_score)} molecules...")
             start_time = time.time()
             
-            # Run scoring (this is synchronous, so we run it in executor to avoid blocking)
             def run_scoring():
                 boltz.score_molecules_target(
                     valid_molecules_by_uid,
@@ -839,33 +976,24 @@ async def score_molecules_with_boltz(
             elapsed = time.time() - start_time
             bt.logging.info(f"   ✅ Boltz scoring completed in {elapsed:.2f} seconds")
             
-            # Extract scores following DataGenerator pattern
-            # Important: When multiple molecules have the same SMILES, Boltz only processes unique SMILES
-            # We need to map the score back to all molecules with that SMILES
             uid = 0
-            
-            # First, build a SMILES -> score mapping from per_molecule_metric (most reliable)
             smiles_to_score = {}
             if uid in boltz.per_molecule_metric:
                 smiles_to_score = boltz.per_molecule_metric[uid].copy()
                 bt.logging.info(f"   ✅ Loaded {len(smiles_to_score)} unique SMILES scores from per_molecule_metric")
-                bt.logging.debug(f"   Unique SMILES scored: {list(smiles_to_score.keys())[:5]}...")
             
-            # Also check target_scores as a fallback (by index in valid_molecules_by_uid)
             target_scores_list = None
             target_scores = score_dict[uid].get('target_scores', [[]])
             if target_scores and len(target_scores[0]) > 0:
                 target_scores_list = target_scores[0] if isinstance(target_scores[0], list) else [target_scores[0]]
                 bt.logging.debug(f"   Found {len(target_scores_list)} scores in target_scores")
             
-            # Fallback: try to get from score_dict's boltz_score (average of all) - only if no individual scores
             avg_score = None
             if not smiles_to_score and not target_scores_list:
                 avg_score = score_dict[uid].get('boltz_score')
                 if avg_score is not None and isinstance(avg_score, (int, float)):
                     bt.logging.warning(f"   ⚠️  Only average boltz_score available: {avg_score} (using as fallback)")
             
-            # Assign scores to molecules_to_score
             molecules_with_individual_scores = 0
             molecules_with_avg_scores = 0
             molecules_without_scores = 0
@@ -875,17 +1003,14 @@ async def score_molecules_with_boltz(
                 score = None
                 score_source = None
                 
-                # Priority 1: Get score from per_molecule_metric by SMILES (works for duplicate SMILES)
                 if smiles in smiles_to_score:
                     score = smiles_to_score[smiles]
                     score_source = "boltz_scoring"
                     molecules_with_individual_scores += 1
-                # Priority 2: Try target_scores by index (if available and index is valid)
                 elif target_scores_list and mol_idx < len(target_scores_list):
                     score = target_scores_list[mol_idx]
                     score_source = "boltz_scoring"
                     molecules_with_individual_scores += 1
-                # Priority 3: Try to find SMILES in valid_molecules_by_uid and get score by index
                 elif target_scores_list:
                     try:
                         valid_idx = valid_molecules_by_uid[uid]['smiles'].index(smiles)
@@ -895,7 +1020,7 @@ async def score_molecules_with_boltz(
                             molecules_with_individual_scores += 1
                     except (ValueError, IndexError):
                         pass
-                # Priority 4: Use average as last resort (but log warning)
+                
                 if score is None and avg_score is not None:
                     score = avg_score
                     score_source = "boltz_scoring_avg"
@@ -917,7 +1042,6 @@ async def score_molecules_with_boltz(
                 f"{molecules_without_scores} without scores"
             )
             
-            # Write newly scored molecules to database
             if newly_scored_molecules:
                 write_scores_to_db(newly_scored_molecules)
         
@@ -944,16 +1068,13 @@ async def score_molecules_with_boltz(
             import traceback
             bt.logging.error(traceback.format_exc())
     
-    # Combine all results: DB scores, newly scored, HuggingFace skipped (with None score)
     all_results = molecules_with_db_scores + newly_scored_molecules
     
-    # Add HuggingFace molecules with None score (for tracking)
     for mol in molecules_in_hf:
         mol['boltz_score'] = None
         mol['boltz_score_source'] = 'huggingface_skipped'
         all_results.append(mol)
     
-    # Sort by boltz_score descending (None scores go to end)
     scored_molecules = sorted(
         all_results,
         key=lambda m: m.get('boltz_score') if m.get('boltz_score') is not None else float('-inf'),
@@ -967,980 +1088,6 @@ async def score_molecules_with_boltz(
     
     return scored_molecules
 
-
-async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: int, csv_path: str) -> pd.DataFrame:
-    """
-    Collect submissions using prepare_training_data.py and process CSV.
-    
-    Since prepare_training_data.py appends the whole result, we need to:
-    1. Run prepare_training_data.py
-    2. Load CSV and deduplicate (remove duplicates)
-    3. Filter for rxn:5 molecules
-    4. Sort by score and return top 30
-    """
-    import subprocess
-    
-    bt.logging.info(f"📥 Collecting submissions from epoch {start_epoch}...")
-    
-    # Run prepare_training_data.py
-    script_path = os.path.join(BASE_DIR, 'BoltzPredictor', 'scripts', 'prepare_training_data.py')
-    if not os.path.exists(script_path):
-        bt.logging.error(f"prepare_training_data.py not found at {script_path}")
-        return pd.DataFrame()
-    
-    try:
-        # Run the script
-        result = subprocess.run(
-            ['python3', script_path, '--start_epoch', str(start_epoch), '--output', csv_path],
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        if result.returncode != 0:
-            bt.logging.error(f"prepare_training_data.py failed: {result.stderr}")
-            return pd.DataFrame()
-        
-        bt.logging.info(f"✅ prepare_training_data.py completed successfully")
-        
-    except subprocess.TimeoutExpired:
-        bt.logging.error("prepare_training_data.py timed out")
-        return pd.DataFrame()
-    except Exception as e:
-        bt.logging.error(f"Error running prepare_training_data.py: {e}")
-        return pd.DataFrame()
-    
-    # Load and process CSV
-    if not os.path.exists(csv_path):
-        bt.logging.warning(f"CSV file not created at {csv_path}")
-        return pd.DataFrame()
-    
-    try:
-        df = pd.read_csv(csv_path)
-        bt.logging.info(f"📊 Loaded {len(df)} rows from CSV")
-        
-        # Since prepare_training_data appends the whole result, remove duplicates and rewrite
-        original_len = len(df)
-        if 'molecule_name' in df.columns:
-            df = df.drop_duplicates(subset=['molecule_name'], keep='last')
-            if len(df) < original_len:
-                bt.logging.info(f"   Removed {original_len - len(df)} duplicates, rewriting CSV...")
-                # Rewrite CSV without duplicates
-                df.to_csv(csv_path, index=False)
-                bt.logging.info(f"   ✅ Rewrote CSV with {len(df)} unique rows")
-            else:
-                bt.logging.info(f"   No duplicates found ({len(df)} rows)")
-        
-        # Filter for rxn:5 molecules only
-        df = df[df['molecule_name'].str.startswith('rxn:5:', na=False)]
-        bt.logging.info(f"   After filtering rxn:5: {len(df)} rows")
-        
-        if df.empty:
-            bt.logging.warning("No rxn:5 molecules found in CSV")
-            return pd.DataFrame()
-        
-        # Sort by final_score descending
-        if 'final_score' in df.columns:
-            df = df.sort_values(by='final_score', ascending=False, na_position='last')
-            bt.logging.info(f"   Sorted by final_score")
-        
-        # Take top 200
-        top_200 = df.head(200)
-        bt.logging.info(f"✅ Selected top 200 molecules (scores: {top_200['final_score'].head(5).tolist() if 'final_score' in top_200.columns else 'N/A'})")
-        
-        return top_200
-        
-    except Exception as e:
-        bt.logging.error(f"Error processing CSV: {e}")
-        import traceback
-        bt.logging.error(traceback.format_exc())
-        return pd.DataFrame()
-
-
-async def generate_unique_molecules_from_top200(
-    state: Dict[str, Any], 
-    top_200_df: pd.DataFrame,
-    desired_count: int = 100
-) -> List[Dict[str, Any]]:
-    """
-    Generate unique molecules (NOT in HuggingFace) using genetic algorithm from top 200 molecules.
-    Uses adaptive pool sizing: starts with top 30, increases to 50, 100, 150, 200 if generation fails.
-    Keeps generating until desired_count unique molecules are found.
-    """
-    if top_200_df.empty:
-        bt.logging.warning("Top 200 DataFrame is empty")
-        return []
-    
-    ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    
-    # Get all molecule names from top 200
-    all_names = top_200_df['molecule_name'].tolist()
-    
-    # Adaptive pool sizes: start with 30, increase if generation fails
-    pool_sizes = [30, 50, 100, 150, 200]
-    current_pool_size_idx = 0
-    current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-    
-    bt.logging.info(f"🧬 Generating {desired_count} unique molecules using adaptive pool sizing (starting with top {current_pool_size})...")
-    
-    unique_molecules = []
-    attempts = 0
-    max_attempts = 500  # Maximum generation attempts
-    last_successful_attempt = 0  # Track when we last found a unique molecule
-    
-    # Get or initialize generated molecules tracking set
-    generated_molecules = state.get('generated_molecules', set())
-    generated_inchikeys = state.get('generated_inchikeys', set())
-    
-    while len(unique_molecules) < desired_count and attempts < max_attempts:
-        attempts += 1
-        
-        # Check if we should increase pool size (if first 100 attempts failed to find new unique molecules)
-        if attempts - last_successful_attempt >= 100 and current_pool_size_idx < len(pool_sizes) - 1:
-            current_pool_size_idx += 1
-            new_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-            if new_pool_size > current_pool_size:
-                current_pool_size = new_pool_size
-                bt.logging.info(f"📈 Increasing pool size to top {current_pool_size} (after {attempts - last_successful_attempt} failed attempts)")
-                last_successful_attempt = attempts  # Reset counter
-        
-        # Use current pool size
-        current_pool_names = all_names[:current_pool_size]
-        
-        # Apply genetic operations (crossover)
-        new_molecules = ga_operator.apply_genetic_operations(
-            current_pool_names,
-            num_crossovers=10  # 10 crossovers per batch
-        )
-        
-        # Check each new molecule for uniqueness
-        for mol in new_molecules:
-            if len(unique_molecules) >= desired_count:
-                break
-            
-            molecule_name = mol['name']
-            smiles = mol.get('smiles')
-            
-            # Skip if already in our unique list for this generation
-            if molecule_name in [m['name'] for m in unique_molecules]:
-                continue
-            
-            # Skip if already generated in previous generations
-            if molecule_name in generated_molecules:
-                bt.logging.debug(f"   ⏭️  Molecule {molecule_name} already generated, skipping")
-                continue
-            
-            # Generate InChIKey to check for duplicates
-            inchikey = None
-            try:
-                inchikey = generate_inchikey(smiles) if smiles else None
-                if inchikey and inchikey in generated_inchikeys:
-                    bt.logging.debug(f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated, skipping")
-                    continue
-            except Exception as e:
-                bt.logging.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
-            
-            # Check if unique (NOT on HuggingFace)
-            is_unique = await check_molecule_unique(state, molecule_name, smiles)
-            
-            if is_unique:
-                unique_molecules.append(mol)
-                # Track this molecule as generated
-                generated_molecules.add(molecule_name)
-                if inchikey:
-                    generated_inchikeys.add(inchikey)
-                last_successful_attempt = attempts  # Update last successful attempt
-                bt.logging.info(
-                    f"   ✅ Added unique molecule {molecule_name} "
-                    f"(pool size: {current_pool_size}, {len(unique_molecules)}/{desired_count})"
-                )
-            else:
-                bt.logging.debug(
-                    f"   ❌ Molecule {molecule_name} is already on HuggingFace"
-                )
-        
-        if len(unique_molecules) >= desired_count:
-            break
-        
-        # Small delay to avoid overwhelming
-        await asyncio.sleep(0.1)
-    
-    # Update state with generated molecules tracking
-    state['generated_molecules'] = generated_molecules
-    state['generated_inchikeys'] = generated_inchikeys
-    
-    bt.logging.info(f"✅ Generated {len(unique_molecules)} unique molecules using pool size {current_pool_size} (attempts: {attempts}, total tracked: {len(generated_molecules)})")
-    
-    return unique_molecules
-
-
-
-
-async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
-    """
-    Updated genetic algorithm loop:
-    1. When epoch changes, collect submissions using prepare_training_data.py
-    2. Load CSV, filter rxn:5, sort, take top 30
-    3. Generate unique molecules (NOT in HuggingFace) - keep generating until desired count
-    4. Score in batches of 10, checking blocks remaining after each batch
-    5. Only submit when < 80 blocks remain until next epoch
-    6. Skip molecules already in DB UNLESS they're the top-scoring molecule
-    7. When epoch changes, restart process
-    """
-    bt.logging.info("🚀 Starting ADAPTIVE genetic algorithm loop with CSV-based generation...")
-    
-    csv_path = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
-    last_processed_epoch = state.get('last_processed_epoch', -1)
-    desired_unique_count = 100  # Desired number of unique molecules to generate
-    
-    while not state['shutdown_event'].is_set():
-        try:
-            # Get current epoch
-            current_block = await state['subtensor'].get_current_block()
-            current_epoch = current_block // state['epoch_length']
-            last_submission_epoch = state.get('last_submission_epoch', -1)
-            
-            # Check if epoch changed - if so, collect new submissions and start generation
-            if current_epoch != last_processed_epoch:
-                bt.logging.info(f"\n{'='*70}")
-                bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
-                bt.logging.info(f"{'='*70}")
-                
-                # Collect submissions from STARTING_EPOCH
-                top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, csv_path)
-                
-                if top_200_df.empty:
-                    bt.logging.warning("No top 200 molecules found, skipping this epoch")
-                    last_processed_epoch = current_epoch
-                    state['last_processed_epoch'] = current_epoch
-                    await asyncio.sleep(10)
-                    continue
-                
-                # Store top_200_df in state for use in generation loop
-                state['top_200_df'] = top_200_df
-                
-                # Generate unique molecules - keep generating until we have desired count
-                bt.logging.info(f"🧬 Generating {desired_unique_count} unique molecules from top 200 (adaptive pool sizing)...")
-                unique_molecules = await generate_unique_molecules_from_top200(
-                    state, top_200_df, desired_unique_count
-                )
-                
-                if not unique_molecules:
-                    bt.logging.warning("Failed to generate unique molecules, skipping this epoch")
-                    last_processed_epoch = current_epoch
-                    state['last_processed_epoch'] = current_epoch
-                    await asyncio.sleep(10)
-                    continue
-                
-                bt.logging.info(f"✅ Generated {len(unique_molecules)} unique molecules")
-                
-                # Calculate blocks until next epoch
-                next_epoch_block = (current_epoch + 1) * state['epoch_length']
-                
-                # ✅ CONTINUOUS GENERATION AND SCORING LOOP
-                # Keep generating and scoring batches of 100 until we're within 80 blocks of next epoch
-                batch_size = 10
-                all_scored_molecules = []
-                best_molecule_so_far = None
-                best_score_so_far = float('-inf')
-                generation_round = 0
-                submitted = False
-                
-                while not submitted:
-                    generation_round += 1
-                    
-                    # Check blocks remaining before starting this generation round
-                    current_block_before_round = await state['subtensor'].get_current_block()
-                    blocks_remaining = next_epoch_block - current_block_before_round
-                    
-                    # If we're already within 80 blocks, submit and exit
-                    if blocks_remaining < 50:
-                        if best_molecule_so_far:
-                            # Check if we already submitted in this epoch
-                            if last_submission_epoch == current_epoch:
-                                bt.logging.info(f"⏭️  Already submitted in epoch {current_epoch}")
-                            else:
-                                # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
-                                molecule_name = best_molecule_so_far['name']
-                                smiles = best_molecule_so_far.get('smiles')
-                                
-                                if not smiles:
-                                    bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, skipping submission")
-                                    # Try to find next best unique molecule
-                                    best_molecule_so_far = None
-                                    best_score_so_far = float('-inf')
-                                    for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                        if mol.get('smiles'):
-                                            is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
-                                            if is_unique:
-                                                best_molecule_so_far = mol
-                                                best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                                bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
-                                                break
-                                    
-                                    if not best_molecule_so_far:
-                                        bt.logging.warning("⚠️  No unique molecules found to submit")
-                                        last_processed_epoch = current_epoch
-                                        state['last_processed_epoch'] = current_epoch
-                                        submitted = True
-                                        break
-                                    molecule_name = best_molecule_so_far['name']
-                                    smiles = best_molecule_so_far.get('smiles')
-                                
-                                # Check uniqueness
-                                is_unique = await check_molecule_unique(state, molecule_name, smiles)
-                                
-                                if not is_unique:
-                                    bt.logging.warning(
-                                        f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
-                                        f"finding next best unique molecule..."
-                                    )
-                                    # Find next best unique molecule
-                                    best_molecule_so_far = None
-                                    best_score_so_far = float('-inf')
-                                    for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                        mol_name = mol['name']
-                                        mol_smiles = mol.get('smiles')
-                                        if not mol_smiles:
-                                            continue
-                                        
-                                        is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
-                                        if is_unique_check:
-                                            best_molecule_so_far = mol
-                                            best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                            bt.logging.info(
-                                                f"✅ Found next best unique molecule: {mol_name} "
-                                                f"(score: {best_score_so_far:.6f})"
-                                            )
-                                            break
-                                    
-                                    if not best_molecule_so_far:
-                                        bt.logging.warning(
-                                            "⚠️  No unique molecules found in scored molecules. "
-                                            "Cannot submit non-unique molecule."
-                                        )
-                                        last_processed_epoch = current_epoch
-                                        state['last_processed_epoch'] = current_epoch
-                                        submitted = True
-                                        break
-                                
-                                # Check if molecule is already in DB
-                                db_score = get_score_from_db(best_molecule_so_far['name'])
-                                if db_score is not None:
-                                    bt.logging.info(
-                                        f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
-                                        f"(score: {db_score:.6f}), but submitting as top molecule"
-                                    )
-                                
-                                bt.logging.info(
-                                    f"✅ Best molecule {best_molecule_so_far['name']} is unique, proceeding with submission"
-                                )
-                                state['candidate_product'] = best_molecule_so_far['name']
-                                
-                                try:
-                                    await submit_response(state)
-                                    bt.logging.info(
-                                        f"✅ Submission successful for {best_molecule_so_far['name']} "
-                                        f"(score: {best_score_so_far:.6f})!"
-                                    )
-                                    state['last_submission_epoch'] = current_epoch
-                                    submitted = True
-                                    
-                                    # After successful submission, mark epoch as processed and wait for next epoch
-                                    last_processed_epoch = current_epoch
-                                    state['last_processed_epoch'] = current_epoch
-                                    bt.logging.info(f"⏳ Waiting for next epoch to start...")
-                                    break  # Exit generation loop
-                                except Exception as e:
-                                    bt.logging.error(f"❌ Error submitting response: {e}")
-                                    import traceback
-                                    bt.logging.error(traceback.format_exc())
-                                    # Mark as submitted to exit loop even if submission failed
-                                    submitted = True
-                                    last_processed_epoch = current_epoch
-                                    state['last_processed_epoch'] = current_epoch
-                                    break
-                        else:
-                            bt.logging.warning(
-                                f"⚠️  Only {blocks_remaining} blocks until next epoch, "
-                                f"but no valid molecules scored yet"
-                            )
-                            # Mark epoch as processed and exit
-                            last_processed_epoch = current_epoch
-                            state['last_processed_epoch'] = current_epoch
-                            submitted = True
-                            break
-                    
-                    # If this is not the first round, generate another batch of 100 unique molecules
-                    if generation_round > 1:
-                        bt.logging.info(
-                            f"\n{'='*70}"
-                            f"\n🔄 Generation Round {generation_round}: "
-                            f"Blocks remaining ({blocks_remaining}) >= 80, generating another {desired_unique_count} molecules..."
-                            f"\n{'='*70}"
-                        )
-                        # Get top_200_df from state (stored when epoch changed)
-                        top_200_df = state.get('top_200_df')
-                        if top_200_df is None or top_200_df.empty:
-                            bt.logging.warning("No top_200_df in state, skipping generation")
-                            break
-                        
-                        unique_molecules = await generate_unique_molecules_from_top200(
-                            state, top_200_df, desired_unique_count
-                        )
-                        
-                        if not unique_molecules:
-                            bt.logging.warning("Failed to generate unique molecules, stopping generation loop")
-                            break
-                        
-                        bt.logging.info(f"✅ Generated {len(unique_molecules)} unique molecules for round {generation_round}")
-                    
-                    # Score this batch of molecules in batches of 10
-                    total_batches = (len(unique_molecules) + batch_size - 1) // batch_size
-                    bt.logging.info(f"🔬 Round {generation_round}: Scoring {len(unique_molecules)} molecules in {total_batches} batches of {batch_size}...")
-                    
-                    for batch_idx in range(total_batches):
-                        # Check blocks remaining before starting batch
-                        current_block_before_batch = await state['subtensor'].get_current_block()
-                        blocks_remaining = next_epoch_block - current_block_before_batch
-                        
-                        # Only submit when < 80 blocks remain
-                        if blocks_remaining < 80:
-                            if best_molecule_so_far:
-                                # Check if we already submitted in this epoch
-                                if last_submission_epoch == current_epoch:
-                                    bt.logging.info(f"⏭️  Already submitted in epoch {current_epoch}")
-                                else:
-                                    # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
-                                    molecule_name = best_molecule_so_far['name']
-                                    smiles = best_molecule_so_far.get('smiles')
-                                    
-                                    if not smiles:
-                                        bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, skipping submission")
-                                        # Try to find next best unique molecule
-                                        best_molecule_so_far = None
-                                        best_score_so_far = float('-inf')
-                                        for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                            if mol.get('smiles'):
-                                                is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
-                                                if is_unique:
-                                                    best_molecule_so_far = mol
-                                                    best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                                    bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
-                                                    break
-                                        
-                                        if not best_molecule_so_far:
-                                            bt.logging.warning("⚠️  No unique molecules found to submit")
-                                            last_processed_epoch = current_epoch
-                                            state['last_processed_epoch'] = current_epoch
-                                            submitted = True
-                                            break
-                                        molecule_name = best_molecule_so_far['name']
-                                        smiles = best_molecule_so_far.get('smiles')
-                                    
-                                    # Check uniqueness
-                                    is_unique = await check_molecule_unique(state, molecule_name, smiles)
-                                    
-                                    if not is_unique:
-                                        bt.logging.warning(
-                                            f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
-                                            f"finding next best unique molecule..."
-                                        )
-                                        # Find next best unique molecule
-                                        best_molecule_so_far = None
-                                        best_score_so_far = float('-inf')
-                                        for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                            mol_name = mol['name']
-                                            mol_smiles = mol.get('smiles')
-                                            if not mol_smiles:
-                                                continue
-                                            
-                                            is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
-                                            if is_unique_check:
-                                                best_molecule_so_far = mol
-                                                best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                                bt.logging.info(
-                                                    f"✅ Found next best unique molecule: {mol_name} "
-                                                    f"(score: {best_score_so_far:.6f})"
-                                                )
-                                                break
-                                        
-                                        if not best_molecule_so_far:
-                                            bt.logging.warning(
-                                                "⚠️  No unique molecules found in scored molecules. "
-                                                "Cannot submit non-unique molecule."
-                                            )
-                                            last_processed_epoch = current_epoch
-                                            state['last_processed_epoch'] = current_epoch
-                                            submitted = True
-                                            break
-                                    
-                                    # Check if molecule is already in DB
-                                    db_score = get_score_from_db(best_molecule_so_far['name'])
-                                    if db_score is not None:
-                                        bt.logging.info(
-                                            f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
-                                            f"(score: {db_score:.6f}), but submitting as top molecule"
-                                        )
-                                    
-                                    bt.logging.info(
-                                        f"✅ Best molecule {best_molecule_so_far['name']} is unique, proceeding with submission"
-                                    )
-                                    state['candidate_product'] = best_molecule_so_far['name']
-                                    
-                                    try:
-                                        await submit_response(state)
-                                        bt.logging.info(
-                                            f"✅ Submission successful for {best_molecule_so_far['name']} "
-                                            f"(score: {best_score_so_far:.6f})!"
-                                        )
-                                        state['last_submission_epoch'] = current_epoch
-                                        submitted = True
-                                        
-                                        # After successful submission, mark epoch as processed and wait for next epoch
-                                        last_processed_epoch = current_epoch
-                                        state['last_processed_epoch'] = current_epoch
-                                        bt.logging.info(f"⏳ Waiting for next epoch to start...")
-                                        break  # Exit batch loop
-                                    except Exception as e:
-                                        bt.logging.error(f"❌ Error submitting response: {e}")
-                                        import traceback
-                                        bt.logging.error(traceback.format_exc())
-                                        # Mark as submitted to exit loop even if submission failed
-                                        submitted = True
-                                        last_processed_epoch = current_epoch
-                                        state['last_processed_epoch'] = current_epoch
-                                        break
-                            else:
-                                bt.logging.warning(
-                                    f"⚠️  Only {blocks_remaining} blocks until next epoch, "
-                                    f"but no valid molecules scored yet"
-                                )
-                                # Mark epoch as processed and exit
-                                last_processed_epoch = current_epoch
-                                state['last_processed_epoch'] = current_epoch
-                                submitted = True
-                                break  # Exit batch loop
-                        
-                        start_idx = batch_idx * batch_size
-                        end_idx = min(start_idx + batch_size, len(unique_molecules))
-                        batch = unique_molecules[start_idx:end_idx]
-                        
-                        # Check which molecules in this batch are already in DB
-                        batch_molecule_names = [m['name'] for m in batch]
-                        db_scores = batch_get_scores_from_db(batch_molecule_names)
-                        
-                        # Separate molecules: those in DB (skip scoring) vs those needing scoring
-                        batch_to_score = []
-                        batch_from_db = []
-                        
-                        for mol in batch:
-                            mol_name = mol['name']
-                            if mol_name in db_scores:
-                                # Already in DB - skip scoring but track for potential submission
-                                mol['boltz_score'] = db_scores[mol_name]
-                                mol['boltz_score_source'] = 'database'
-                                batch_from_db.append(mol)
-                                bt.logging.debug(
-                                    f"   ⏭️  Molecule {mol_name} already in DB "
-                                    f"(score: {db_scores[mol_name]:.6f}), skipping scoring"
-                                )
-                            else:
-                                batch_to_score.append(mol)
-                        
-                        bt.logging.info(
-                            f"   📦 Round {generation_round}, Batch {batch_idx + 1}/{total_batches}: "
-                            f"Scoring {len(batch_to_score)} new molecules, "
-                            f"{len(batch_from_db)} already in DB "
-                            f"(blocks remaining: {blocks_remaining})"
-                        )
-                        
-                        # Score only molecules not in DB
-                        scored_batch = []
-                        if batch_to_score:
-                            scored_batch = await score_molecules_with_boltz(state, batch_to_score)
-                        
-                        # Combine scored molecules with DB molecules
-                        all_batch_molecules = batch_from_db + (scored_batch if scored_batch else [])
-                        
-                        if all_batch_molecules:
-                            # Filter molecules with valid scores
-                            batch_with_scores = [m for m in all_batch_molecules if m.get('boltz_score') is not None]
-                            all_scored_molecules.extend(batch_with_scores)
-                            
-                            # Update best molecule so far (consider all scored molecules, including from DB)
-                            for mol in batch_with_scores:
-                                score = mol.get('boltz_score')
-                                if score is not None and score > best_score_so_far:
-                                    best_score_so_far = score
-                                    best_molecule_so_far = mol
-                                    source = mol.get('boltz_score_source', 'unknown')
-                                    bt.logging.info(
-                                        f"   🏆 New best in round {generation_round}, batch {batch_idx + 1}: "
-                                        f"{mol['name']} (score: {score:.6f}, source: {source})"
-                                    )
-                        
-                        # Check epoch boundary after each batch
-                        current_block_after_batch = await state['subtensor'].get_current_block()
-                        blocks_remaining_after = next_epoch_block - current_block_after_batch
-                        
-                        bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}, batch {batch_idx + 1}: {blocks_remaining_after}")
-                        
-                        # If we hit the 80 block threshold during batch scoring, exit batch loop
-                        if blocks_remaining_after < 80:
-                            break
-                    
-                    # After completing all batches for this round, check if we should continue
-                    if submitted:
-                        break
-                    
-                    # Check blocks remaining after all batches in this round
-                    current_block_after_round = await state['subtensor'].get_current_block()
-                    blocks_remaining_after_round = next_epoch_block - current_block_after_round
-                    
-                    bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}: {blocks_remaining_after_round}")
-                    
-                    # If blocks remaining < 80, submit and exit
-                    if blocks_remaining_after_round < 80:
-                        if best_molecule_so_far and last_submission_epoch != current_epoch:
-                            # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
-                            molecule_name = best_molecule_so_far['name']
-                            smiles = best_molecule_so_far.get('smiles')
-                            
-                            if not smiles:
-                                bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, finding next best...")
-                                # Try to find next best unique molecule
-                                best_molecule_so_far = None
-                                best_score_so_far = float('-inf')
-                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                    if mol.get('smiles'):
-                                        is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
-                                        if is_unique:
-                                            best_molecule_so_far = mol
-                                            best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                            bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
-                                            break
-                                
-                                if not best_molecule_so_far:
-                                    bt.logging.warning("⚠️  No unique molecules found to submit")
-                                    submitted = True
-                                    last_processed_epoch = current_epoch
-                                    state['last_processed_epoch'] = current_epoch
-                                    break
-                                molecule_name = best_molecule_so_far['name']
-                                smiles = best_molecule_so_far.get('smiles')
-                            
-                            # Check uniqueness
-                            is_unique = await check_molecule_unique(state, molecule_name, smiles)
-                            
-                            if not is_unique:
-                                bt.logging.warning(
-                                    f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
-                                    f"finding next best unique molecule..."
-                                )
-                                # Find next best unique molecule
-                                best_molecule_so_far = None
-                                best_score_so_far = float('-inf')
-                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
-                                    mol_name = mol['name']
-                                    mol_smiles = mol.get('smiles')
-                                    if not mol_smiles:
-                                        continue
-                                    
-                                    is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
-                                    if is_unique_check:
-                                        best_molecule_so_far = mol
-                                        best_score_so_far = mol.get('boltz_score', float('-inf'))
-                                        bt.logging.info(
-                                            f"✅ Found next best unique molecule: {mol_name} "
-                                            f"(score: {best_score_so_far:.6f})"
-                                        )
-                                        break
-                                
-                                if not best_molecule_so_far:
-                                    bt.logging.warning(
-                                        "⚠️  No unique molecules found in scored molecules. "
-                                        "Cannot submit non-unique molecule."
-                                    )
-                                    submitted = True
-                                    last_processed_epoch = current_epoch
-                                    state['last_processed_epoch'] = current_epoch
-                                    break
-                            
-                            # Check if molecule is already in DB
-                            db_score = get_score_from_db(best_molecule_so_far['name'])
-                            if db_score is not None:
-                                bt.logging.info(
-                                    f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
-                                    f"(score: {db_score:.6f}), but submitting as top molecule"
-                                )
-                            
-                            bt.logging.info(
-                                f"🏆 Best molecule from all rounds: {best_molecule_so_far['name']} "
-                                f"with Boltz score: {best_score_so_far:.6f} (unique: ✅)"
-                            )
-                            
-                            state['candidate_product'] = best_molecule_so_far['name']
-                            
-                            try:
-                                await submit_response(state)
-                                bt.logging.info(
-                                    f"✅ Submission successful for {best_molecule_so_far['name']} "
-                                    f"(score: {best_score_so_far:.6f})!"
-                                )
-                                state['last_submission_epoch'] = current_epoch
-                                submitted = True
-                                
-                                # After successful submission, mark epoch as processed and wait for next epoch
-                                last_processed_epoch = current_epoch
-                                state['last_processed_epoch'] = current_epoch
-                                bt.logging.info(f"⏳ Waiting for next epoch to start...")
-                            except Exception as e:
-                                bt.logging.error(f"❌ Error submitting response: {e}")
-                                import traceback
-                                bt.logging.error(traceback.format_exc())
-                                # Mark as submitted to exit loop even if submission failed
-                                submitted = True
-                                last_processed_epoch = current_epoch
-                                state['last_processed_epoch'] = current_epoch
-                        else:
-                            bt.logging.warning("No valid molecules to submit")
-                            submitted = True
-                            last_processed_epoch = current_epoch
-                            state['last_processed_epoch'] = current_epoch
-                        break  # Exit generation loop
-                    else:
-                        # Still have >= 80 blocks remaining, continue to next generation round
-                        score_str = f"{best_score_so_far:.6f}" if best_molecule_so_far else "N/A"
-                        bt.logging.info(
-                            f"⏭️  Blocks remaining ({blocks_remaining_after_round}) >= 80, "
-                            f"continuing to next generation round. "
-                            f"Best molecule so far: {best_molecule_so_far['name'] if best_molecule_so_far else 'None'} "
-                            f"(score: {score_str})"
-                        )
-                        # Continue to next iteration of generation loop
-            
-            # Check if we already submitted in this epoch
-            if last_submission_epoch == current_epoch:
-                bt.logging.info(
-                    f"⏭️  Already submitted in epoch {current_epoch}, waiting for next epoch..."
-                )
-                await asyncio.sleep(10)
-                continue
-            
-            # If we haven't processed this epoch yet, wait
-            if last_processed_epoch != current_epoch:
-                await asyncio.sleep(10)
-                continue
-            
-            # Wait a bit before checking again
-            await asyncio.sleep(10)
-        
-        except Exception as e:
-            bt.logging.error(f"Error in adaptive GA loop: {e}")
-            import traceback
-            bt.logging.error(traceback.format_exc())
-            await asyncio.sleep(10)
-
-
-# ============================================================================
-# ✅ STARTUP: LOAD CSV
-# ============================================================================
-
-def _import_boltz_wrapper():
-    """
-    Import BoltzWrapper following the same pattern as DataGenerator/main.py.
-    This is done as a function so it can be called after logging is initialized.
-    """
-    global BOLTZ_AVAILABLE, BoltzWrapper
-    
-    try:
-        # BASE_DIR is nova/ (parent of neurons/)
-        # So boltz-scoring should be at nova/boltz-scoring
-        BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
-        BOLTZ_SRC_DIR = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
-        
-        if not os.path.exists(BOLTZ_SCORING_DIR):
-            bt.logging.warning(f"⚠️  Boltz-scoring directory not found at {BOLTZ_SCORING_DIR}")
-            return False
-        
-        # Add boltz-scoring to path (same as DataGenerator/main.py does)
-        # This allows: from boltz.wrapper import BoltzWrapper
-        if BOLTZ_SCORING_DIR not in sys.path:
-            sys.path.append(BOLTZ_SCORING_DIR)
-        
-        # Add boltz-scoring/boltz/src to path BEFORE importing
-        # This is critical: the boltz package is at boltz/src/boltz/, so we need
-        # boltz/src/ in the path so that "from boltz.data import const" works
-        if BOLTZ_SRC_DIR not in sys.path:
-            sys.path.insert(0, BOLTZ_SRC_DIR)  # Insert at beginning for priority
-        
-        # Try to import from boltz-scoring's utils (local copy) - same as DataGenerator
-        boltz_utils_path = os.path.join(BOLTZ_SCORING_DIR, 'utils')
-        if os.path.exists(boltz_utils_path) and boltz_utils_path not in sys.path:
-            sys.path.insert(0, boltz_utils_path)
-        
-        # Now import BoltzWrapper (same as DataGenerator/main.py)
-        from boltz.wrapper import BoltzWrapper as BW
-        BoltzWrapper = BW
-        BOLTZ_AVAILABLE = True
-        bt.logging.info(f"✅ BoltzWrapper imported successfully from {BOLTZ_SCORING_DIR}")
-        return True
-        
-    except ImportError as e:
-        bt.logging.warning(f"⚠️  Failed to import BoltzWrapper: {e}")
-        import traceback
-        bt.logging.debug(traceback.format_exc())
-        return False
-    except Exception as e:
-        bt.logging.warning(f"⚠️  Error setting up BoltzWrapper: {e}")
-        import traceback
-        bt.logging.debug(traceback.format_exc())
-        return False
-
-
-async def startup_phase(state: Dict[str, Any]) -> None:
-    """
-    Startup phase:
-    1. Initialize score_results database
-    2. Import and initialize BoltzWrapper
-    3. Collect submissions (creates/updates CSV)
-    4. Load molecules from CSV
-    5. Prepare top_pool
-    """
-    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz, Collect Submissions & Load CSV...")
-    
-    try:
-        # Initialize score_results database
-        bt.logging.info("💾 Initializing score_results database...")
-        init_score_results_db()
-        bt.logging.info(f"✅ Score results database initialized at {SCORE_RESULTS_DB}")
-        
-        # Import BoltzWrapper (following DataGenerator/main.py pattern)
-        bt.logging.info("🔬 Importing BoltzWrapper...")
-        boltz_imported = _import_boltz_wrapper()
-        
-        # Initialize BoltzWrapper
-        if boltz_imported and BoltzWrapper is not None:
-            bt.logging.info("🔬 Initializing BoltzWrapper...")
-            try:
-                state['boltz_wrapper'] = BoltzWrapper()
-                bt.logging.info("✅ BoltzWrapper initialized successfully")
-            except Exception as e:
-                bt.logging.error(f"❌ Failed to initialize BoltzWrapper: {e}")
-                import traceback
-                bt.logging.error(traceback.format_exc())
-                state['boltz_wrapper'] = None
-        else:
-            bt.logging.warning("⚠️  BoltzWrapper not available, scoring will be skipped")
-            state['boltz_wrapper'] = None
-        
-        # Collect submissions FIRST (this creates/updates the CSV)
-        bt.logging.info("📥 Collecting submissions from epoch...")
-        top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, REACTION_TRAIN_CSV)
-        
-        if top_200_df.empty:
-            bt.logging.warning("⚠️  No submissions collected, CSV may be empty or outdated")
-            # Fallback: try loading from CSV anyway
-            bt.logging.info("📂 Fallback: Loading molecules from CSV...")
-            molecules_df = load_molecules_from_csv(
-                REACTION_TRAIN_CSV,
-                state['current_challenge_targets'],
-                STARTING_EPOCH,
-                HARDCODED_RXN_ID
-            )
-            if molecules_df.empty:
-                bt.logging.warning("No molecules loaded from CSV")
-                return
-            state['top_pool'] = molecules_df.copy()
-            state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-        else:
-            bt.logging.info(f"✅ Collected {len(top_200_df)} top submissions")
-            
-            # Convert top_200_df to the format needed for top_pool (name, smiles, InChIKey, score)
-            bt.logging.info("🔄 Processing top 200 molecules for top_pool...")
-            result_rows = []
-            successful_count = 0
-            failed_count = 0
-            
-            for _, row in top_200_df.iterrows():
-                molecule_name = row['molecule_name']
-                final_score = row.get('final_score', None)
-                if pd.isna(final_score):
-                    final_score = None
-                else:
-                    final_score = float(final_score)
-                
-                try:
-                    smiles = get_smiles_from_reaction(molecule_name)
-                    if not smiles:
-                        bt.logging.debug(f"No SMILES found for {molecule_name}")
-                        failed_count += 1
-                        continue
-                    
-                    inchikey = generate_inchikey(smiles)
-                    if not inchikey:
-                        bt.logging.debug(f"Could not generate InChIKey for {molecule_name}")
-                        failed_count += 1
-                        continue
-                    
-                    result_rows.append({
-                        'name': molecule_name,
-                        'smiles': smiles,
-                        'InChIKey': inchikey,
-                        'score': final_score,
-                    })
-                    successful_count += 1
-                    
-                except Exception as e:
-                    bt.logging.debug(f"Could not process {molecule_name}: {e}")
-                    failed_count += 1
-                    continue
-            
-            if result_rows:
-                molecules_df = pd.DataFrame(result_rows)
-                molecules_df = molecules_df.drop_duplicates(subset=['InChIKey'], keep='first')
-                # Sort by score descending (should already be sorted, but ensure it)
-                if 'score' in molecules_df.columns:
-                    molecules_df = molecules_df.sort_values(by='score', ascending=False, na_position='last')
-                
-                bt.logging.info(f"✅ Processed {len(molecules_df)} molecules from top 200 submissions (successful: {successful_count}, failed: {failed_count})")
-                
-                # Update state with top 200 from collected submissions
-                state['top_pool'] = molecules_df.copy()
-                state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-            else:
-                bt.logging.warning("⚠️  Could not process any molecules from top 200, falling back to loading from CSV...")
-                molecules_df = load_molecules_from_csv(
-                    REACTION_TRAIN_CSV,
-                    state['current_challenge_targets'],
-                    STARTING_EPOCH,
-                    HARDCODED_RXN_ID
-                )
-                if molecules_df.empty:
-                    bt.logging.warning("No molecules loaded from CSV")
-                    return
-                state['top_pool'] = molecules_df.copy()
-                state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-        
-        bt.logging.info(
-            f"✅ STARTUP COMPLETE:"
-            f"\n   Total molecules in pool: {len(state['top_pool'])}"
-            f"\n   Sample molecules: {state['top_pool']['name'].head(3).tolist()}"
-            f"\n   BoltzWrapper: {'✅ Ready' if state.get('boltz_wrapper') else '❌ Not available'}"
-        )
-        
-        state['startup_complete'] = True
-    
-    except Exception as e:
-        bt.logging.error(f"Error in startup phase: {e}")
-        import traceback
-        bt.logging.error(traceback.format_exc())
-
-
-# ============================================================================
-# SUBMISSION LOGIC
-# ============================================================================
 
 async def submit_response(state: Dict[str, Any]) -> None:
     """Encrypts and submits the current candidate product."""
@@ -2008,8 +1155,728 @@ async def submit_response(state: Dict[str, Any]) -> None:
 # MAIN MINING LOOP
 # ============================================================================
 
+async def generate_unique_molecules_from_top200(
+    state: Dict[str, Any], 
+    top_200_df: pd.DataFrame,
+    hybrid_generator: HybridMoleculeGenerator,
+    desired_count: int = 100
+) -> List[Dict[str, Any]]:
+    """
+    Generate unique molecules (NOT in HuggingFace) using HYBRID approach.
+    70% synthon search + 30% crossover.
+    """
+    if top_200_df.empty:
+        bt.logging.warning("Top 200 DataFrame is empty")
+        return []
+    
+    # ✅ FIX: Use 'name' column instead of 'molecule_name'
+    all_names = top_200_df['name'].tolist()
+    
+    bt.logging.info(f"🧬 Generating {desired_count} unique molecules using HYBRID approach (70% synthon + 30% crossover)...")
+    
+    unique_molecules = []
+    attempts = 0
+    max_attempts = 500
+    
+    generated_molecules = state.get('generated_molecules', set())
+    generated_inchikeys = state.get('generated_inchikeys', set())
+    
+    while len(unique_molecules) < desired_count and attempts < max_attempts:
+        attempts += 1
+        
+        # Apply hybrid generation (70% synthon + 30% crossover)
+        num_synthon = int(desired_count * 0.70)
+        num_crossover = int(desired_count * 0.30)
+        
+        new_molecules = hybrid_generator.apply_hybrid_generation(
+            all_names,
+            top_200_df,
+            num_synthon=num_synthon,
+            num_crossover=num_crossover
+        )
+        
+        # Check each new molecule for uniqueness
+        for mol in new_molecules:
+            if len(unique_molecules) >= desired_count:
+                break
+            
+            molecule_name = mol['name']
+            smiles = mol.get('smiles')
+            
+            if molecule_name in [m['name'] for m in unique_molecules]:
+                continue
+            
+            if molecule_name in generated_molecules:
+                bt.logging.debug(f"   ⏭️  Molecule {molecule_name} already generated, skipping")
+                continue
+            
+            inchikey = None
+            try:
+                inchikey = generate_inchikey(smiles) if smiles else None
+                if inchikey and inchikey in generated_inchikeys:
+                    bt.logging.debug(f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated, skipping")
+                    continue
+            except Exception as e:
+                bt.logging.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
+            
+            # Check if unique (NOT on HuggingFace)
+            is_unique = await check_molecule_unique(state, molecule_name, smiles)
+            
+            if is_unique:
+                unique_molecules.append(mol)
+                generated_molecules.add(molecule_name)
+                if inchikey:
+                    generated_inchikeys.add(inchikey)
+                bt.logging.info(
+                    f"   ✅ Added unique molecule {molecule_name} "
+                    f"({len(unique_molecules)}/{desired_count})"
+                )
+            else:
+                bt.logging.debug(f"   ❌ Molecule {molecule_name} is already on HuggingFace")
+        
+        if len(unique_molecules) >= desired_count:
+            break
+        
+        await asyncio.sleep(0.1)
+    
+    state['generated_molecules'] = generated_molecules
+    state['generated_inchikeys'] = generated_inchikeys
+    
+    bt.logging.info(f"✅ Generated {len(unique_molecules)} unique molecules (attempts: {attempts}, total tracked: {len(generated_molecules)})")
+    
+    return unique_molecules
+
+async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
+    """
+    Updated genetic algorithm loop with HYBRID generation (70% synthon + 30% crossover).
+    
+    Workflow:
+    1. Epoch changes
+    2. Load top 200 molecules from CSV
+    3. Generate 100 unique molecules (HYBRID: 70% synthon + 30% crossover)
+    4. Score molecules in batches of 10
+    5. Track best molecule
+    6. After each batch, check if < 50 blocks remain
+       - If YES: Submit best unique molecule and wait for next epoch
+       - If NO: Continue to next batch
+    7. After scoring all 100 molecules in current round:
+       - If < 50 blocks remain: Submit and wait for next epoch
+       - If >= 50 blocks remain: Generate another 100 molecules (Round 2) using top molecules as seed
+    8. Repeat steps 4-7 for each generation round until submission
+    """
+    bt.logging.info("🚀 Starting HYBRID genetic algorithm loop (70% synthon + 30% crossover)...")
+
+    csv_path = os.path.join(BASE_DIR, 'data', 'mols.csv')
+    last_processed_epoch = state.get('last_processed_epoch', -1)
+    desired_unique_count = 100  # Desired number of unique molecules to generate per round
+
+    # Initialize hybrid generator
+    hybrid_generator = HybridMoleculeGenerator(HARDCODED_RXN_ID, DB_PATH)
+
+    while not state['shutdown_event'].is_set():
+        try:
+            # Get current epoch
+            current_block = await state['subtensor'].get_current_block()
+            current_epoch = current_block // state['epoch_length']
+            last_submission_epoch = state.get('last_submission_epoch', -1)
+            
+            # Check if epoch changed - if so, load molecules and start generation
+            if current_epoch != last_processed_epoch:
+                bt.logging.info(f"\n{'='*70}")
+                bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
+                bt.logging.info(f"{'='*70}")
+                
+                # Load top 200 molecules from CSV
+                top_200_df = load_molecules_from_csv(
+                    csv_path,
+                    state['current_challenge_targets'],
+                    STARTING_EPOCH,
+                    HARDCODED_RXN_ID
+                )
+                
+                if top_200_df.empty:
+                    bt.logging.warning("No top 200 molecules found, skipping this epoch")
+                    last_processed_epoch = current_epoch
+                    state['last_processed_epoch'] = current_epoch
+                    await asyncio.sleep(10)
+                    continue
+                
+                # Limit to top 200
+                top_200_df = top_200_df.head(200)
+                state['top_200_df'] = top_200_df
+                
+                # Initialize synthon library (after we have molecules)
+                if not hybrid_generator.synthon_lib_ready:
+                    bt.logging.info("🔬 Initializing SynthonLibrary for hybrid generation...")
+                    hybrid_generator.initialize_synthon_library()
+                
+                # Calculate blocks until next epoch
+                next_epoch_block = (current_epoch + 1) * state['epoch_length']
+                
+                # ✅ CONTINUOUS GENERATION AND SCORING LOOP
+                # Keep generating and scoring batches until we're within 50 blocks of next epoch
+                generation_round = 0
+                all_scored_molecules = []
+                best_molecule_so_far = None
+                best_score_so_far = float('-inf')
+                current_seed_pool = top_200_df  # Start with top 200 as seed
+                submitted = False
+                
+                while not submitted:
+                    generation_round += 1
+                    
+                    # Check blocks remaining before starting this generation round
+                    current_block_before_round = await state['subtensor'].get_current_block()
+                    blocks_remaining_before_round = next_epoch_block - current_block_before_round
+                    
+                    bt.logging.info(f"\n{'='*70}")
+                    bt.logging.info(f"🧬 Generation Round {generation_round}")
+                    bt.logging.info(f"   Blocks remaining: {blocks_remaining_before_round}")
+                    bt.logging.info(f"{'='*70}")
+                    
+                    # If we're already within 50 blocks, submit and exit
+                    if blocks_remaining_before_round < 50:
+                        bt.logging.info(f"⏰ Only {blocks_remaining_before_round} blocks until next epoch, submitting best molecule...")
+                        
+                        if best_molecule_so_far and last_submission_epoch != current_epoch:
+                            # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
+                            molecule_name = best_molecule_so_far['name']
+                            smiles = best_molecule_so_far.get('smiles')
+                            
+                            if not smiles:
+                                bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, finding next best...")
+                                best_molecule_so_far = None
+                                best_score_so_far = float('-inf')
+                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                    if mol.get('smiles'):
+                                        is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
+                                        if is_unique:
+                                            best_molecule_so_far = mol
+                                            best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                            bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
+                                            break
+                                
+                                if not best_molecule_so_far:
+                                    bt.logging.warning("⚠️  No unique molecules found to submit")
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                                    submitted = True
+                                    break
+                                molecule_name = best_molecule_so_far['name']
+                                smiles = best_molecule_so_far.get('smiles')
+                            
+                            # Check uniqueness
+                            is_unique = await check_molecule_unique(state, molecule_name, smiles)
+                            
+                            if not is_unique:
+                                bt.logging.warning(
+                                    f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
+                                    f"finding next best unique molecule..."
+                                )
+                                best_molecule_so_far = None
+                                best_score_so_far = float('-inf')
+                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                    mol_name = mol['name']
+                                    mol_smiles = mol.get('smiles')
+                                    if not mol_smiles:
+                                        continue
+                                    
+                                    is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
+                                    if is_unique_check:
+                                        best_molecule_so_far = mol
+                                        best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                        bt.logging.info(
+                                            f"✅ Found next best unique molecule: {mol_name} "
+                                            f"(score: {best_score_so_far:.6f})"
+                                        )
+                                        break
+                                
+                                if not best_molecule_so_far:
+                                    bt.logging.warning(
+                                        "⚠️  No unique molecules found in scored molecules. "
+                                        "Cannot submit non-unique molecule."
+                                    )
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                                    submitted = True
+                                    break
+                            
+                            # Check if molecule is already in DB
+                            db_score = get_score_from_db(best_molecule_so_far['name'])
+                            if db_score is not None:
+                                bt.logging.info(
+                                    f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
+                                    f"(score: {db_score:.6f}), but submitting as top molecule"
+                                )
+                            
+                            bt.logging.info(
+                                f"🏆 Best molecule: {best_molecule_so_far['name']} "
+                                f"with Boltz score: {best_score_so_far:.6f} (unique: ✅)"
+                            )
+                            state['candidate_product'] = best_molecule_so_far['name']
+                            
+                            try:
+                                await submit_response(state)
+                                bt.logging.info(
+                                    f"✅ Submission successful for {best_molecule_so_far['name']} "
+                                    f"(score: {best_score_so_far:.6f})!"
+                                )
+                                state['last_submission_epoch'] = current_epoch
+                                last_processed_epoch = current_epoch
+                                state['last_processed_epoch'] = current_epoch
+                                bt.logging.info(f"⏳ Waiting for next epoch to start...")
+                            except Exception as e:
+                                bt.logging.error(f"❌ Error submitting response: {e}")
+                                import traceback
+                                bt.logging.error(traceback.format_exc())
+                                last_processed_epoch = current_epoch
+                                state['last_processed_epoch'] = current_epoch
+                            submitted = True
+                            break
+                        else:
+                            bt.logging.warning("No valid molecules to submit")
+                            last_processed_epoch = current_epoch
+                            state['last_processed_epoch'] = current_epoch
+                            submitted = True
+                            break
+                    
+                    # ✅ GENERATE 100 UNIQUE MOLECULES FOR THIS ROUND
+                    bt.logging.info(f"🧬 Generating {desired_unique_count} unique molecules for round {generation_round}...")
+                    unique_molecules = await generate_unique_molecules_from_top200(
+                        state, current_seed_pool, hybrid_generator, desired_unique_count
+                    )
+                    
+                    if not unique_molecules:
+                        bt.logging.warning(f"Failed to generate unique molecules in round {generation_round}, stopping generation")
+                        last_processed_epoch = current_epoch
+                        state['last_processed_epoch'] = current_epoch
+                        submitted = True
+                        break
+                    
+                    bt.logging.info(f"✅ Generated {len(unique_molecules)} unique molecules for round {generation_round}")
+                    
+                    # ✅ SCORE MOLECULES IN BATCHES OF 10
+                    batch_size = 10
+                    total_batches = (len(unique_molecules) + batch_size - 1) // batch_size
+                    
+                    bt.logging.info(f"🔬 Scoring {len(unique_molecules)} molecules in {total_batches} batches of {batch_size}...")
+                    
+                    for batch_idx in range(total_batches):
+                        current_block_before_batch = await state['subtensor'].get_current_block()
+                        blocks_remaining = next_epoch_block - current_block_before_batch
+                        
+                        # ✅ CHECK BLOCKS REMAINING AFTER EACH BATCH
+                        if blocks_remaining < 50:
+                            bt.logging.info(f"⏰ Only {blocks_remaining} blocks until next epoch after batch {batch_idx}, submitting best molecule...")
+                            
+                            if best_molecule_so_far and last_submission_epoch != current_epoch:
+                                # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
+                                molecule_name = best_molecule_so_far['name']
+                                smiles = best_molecule_so_far.get('smiles')
+                                
+                                if not smiles:
+                                    bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, finding next best...")
+                                    best_molecule_so_far = None
+                                    best_score_so_far = float('-inf')
+                                    for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                        if mol.get('smiles'):
+                                            is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
+                                            if is_unique:
+                                                best_molecule_so_far = mol
+                                                best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                                bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
+                                                break
+                                    
+                                    if not best_molecule_so_far:
+                                        bt.logging.warning("⚠️  No unique molecules found to submit")
+                                        last_processed_epoch = current_epoch
+                                        state['last_processed_epoch'] = current_epoch
+                                        submitted = True
+                                        break
+                                    molecule_name = best_molecule_so_far['name']
+                                    smiles = best_molecule_so_far.get('smiles')
+                                
+                                # Check uniqueness
+                                is_unique = await check_molecule_unique(state, molecule_name, smiles)
+                                
+                                if not is_unique:
+                                    bt.logging.warning(
+                                        f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
+                                        f"finding next best unique molecule..."
+                                    )
+                                    best_molecule_so_far = None
+                                    best_score_so_far = float('-inf')
+                                    for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                        mol_name = mol['name']
+                                        mol_smiles = mol.get('smiles')
+                                        if not mol_smiles:
+                                            continue
+                                        
+                                        is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
+                                        if is_unique_check:
+                                            best_molecule_so_far = mol
+                                            best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                            bt.logging.info(
+                                                f"✅ Found next best unique molecule: {mol_name} "
+                                                f"(score: {best_score_so_far:.6f})"
+                                            )
+                                            break
+                                    
+                                    if not best_molecule_so_far:
+                                        bt.logging.warning(
+                                            "⚠️  No unique molecules found in scored molecules. "
+                                            "Cannot submit non-unique molecule."
+                                        )
+                                        last_processed_epoch = current_epoch
+                                        state['last_processed_epoch'] = current_epoch
+                                        submitted = True
+                                        break
+                                
+                                # Check if molecule is already in DB
+                                db_score = get_score_from_db(best_molecule_so_far['name'])
+                                if db_score is not None:
+                                    bt.logging.info(
+                                        f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
+                                        f"(score: {db_score:.6f}), but submitting as top molecule"
+                                    )
+                                
+                                bt.logging.info(
+                                    f"🏆 Best molecule: {best_molecule_so_far['name']} "
+                                    f"with Boltz score: {best_score_so_far:.6f} (unique: ✅)"
+                                )
+                                state['candidate_product'] = best_molecule_so_far['name']
+                                
+                                try:
+                                    await submit_response(state)
+                                    bt.logging.info(
+                                        f"✅ Submission successful for {best_molecule_so_far['name']} "
+                                        f"(score: {best_score_so_far:.6f})!"
+                                    )
+                                    state['last_submission_epoch'] = current_epoch
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                                    bt.logging.info(f"⏳ Waiting for next epoch to start...")
+                                except Exception as e:
+                                    bt.logging.error(f"❌ Error submitting response: {e}")
+                                    import traceback
+                                    bt.logging.error(traceback.format_exc())
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                            else:
+                                bt.logging.warning("No valid molecules to submit")
+                                last_processed_epoch = current_epoch
+                                state['last_processed_epoch'] = current_epoch
+                            submitted = True
+                            break  # Exit batch loop
+                        
+                        # Get batch of molecules to score
+                        start_idx = batch_idx * batch_size
+                        end_idx = min(start_idx + batch_size, len(unique_molecules))
+                        batch = unique_molecules[start_idx:end_idx]
+                        
+                        bt.logging.info(
+                            f"📦 Round {generation_round}, Batch {batch_idx + 1}/{total_batches}: "
+                            f"Scoring {len(batch)} molecules "
+                            f"(blocks remaining: {blocks_remaining})"
+                        )
+                        
+                        # Score this batch
+                        scored_batch = await score_molecules_with_boltz(state, batch)
+                        
+                        if scored_batch:
+                            # Filter molecules with valid scores
+                            batch_with_scores = [m for m in scored_batch if m.get('boltz_score') is not None]
+                            all_scored_molecules.extend(batch_with_scores)
+                            
+                            # Update best molecule so far
+                            for mol in batch_with_scores:
+                                score = mol.get('boltz_score')
+                                if score is not None and score > best_score_so_far:
+                                    best_score_so_far = score
+                                    best_molecule_so_far = mol
+                                    bt.logging.info(
+                                        f"🏆 New best in round {generation_round}, batch {batch_idx + 1}: "
+                                        f"{mol['name']} (score: {score:.6f})"
+                                    )
+                    
+                    # After completing all batches for this round, check if we should continue
+                    if submitted:
+                        break
+                    
+                    # Check blocks remaining after all batches in this round
+                    current_block_after_round = await state['subtensor'].get_current_block()
+                    blocks_remaining_after_round = next_epoch_block - current_block_after_round
+                    
+                    bt.logging.info(f"✅ Completed round {generation_round}: Scored {len(unique_molecules)} molecules")
+                    bt.logging.info(f"   ⏱️  Blocks remaining after round {generation_round}: {blocks_remaining_after_round}")
+                    bt.logging.info(f"   🏆 Best molecule so far: {best_molecule_so_far['name'] if best_molecule_so_far else 'None'} (score: {best_score_so_far:.6f if best_molecule_so_far else 'N/A'})")
+                    
+                    # ✅ DECISION: Continue to next round or submit
+                    if blocks_remaining_after_round < 50:
+                        bt.logging.info(f"⏰ Only {blocks_remaining_after_round} blocks until next epoch, submitting best molecule...")
+                        
+                        if best_molecule_so_far and last_submission_epoch != current_epoch:
+                            # ✅ CHECK UNIQUENESS BEFORE SUBMISSION
+                            molecule_name = best_molecule_so_far['name']
+                            smiles = best_molecule_so_far.get('smiles')
+                            
+                            if not smiles:
+                                bt.logging.warning(f"⚠️  Best molecule {molecule_name} has no SMILES, finding next best...")
+                                best_molecule_so_far = None
+                                best_score_so_far = float('-inf')
+                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                    if mol.get('smiles'):
+                                        is_unique = await check_molecule_unique(state, mol['name'], mol['smiles'])
+                                        if is_unique:
+                                            best_molecule_so_far = mol
+                                            best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                            bt.logging.info(f"✅ Found next best unique molecule: {mol['name']} (score: {best_score_so_far:.6f})")
+                                            break
+                                
+                                if not best_molecule_so_far:
+                                    bt.logging.warning("⚠️  No unique molecules found to submit")
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                                    submitted = True
+                                    break
+                                molecule_name = best_molecule_so_far['name']
+                                smiles = best_molecule_so_far.get('smiles')
+                            
+                            # Check uniqueness
+                            is_unique = await check_molecule_unique(state, molecule_name, smiles)
+                            
+                            if not is_unique:
+                                bt.logging.warning(
+                                    f"❌ Best molecule {molecule_name} is NOT unique (already in HuggingFace), "
+                                    f"finding next best unique molecule..."
+                                )
+                                best_molecule_so_far = None
+                                best_score_so_far = float('-inf')
+                                for mol in sorted(all_scored_molecules, key=lambda m: m.get('boltz_score', float('-inf')), reverse=True):
+                                    mol_name = mol['name']
+                                    mol_smiles = mol.get('smiles')
+                                    if not mol_smiles:
+                                        continue
+                                    
+                                    is_unique_check = await check_molecule_unique(state, mol_name, mol_smiles)
+                                    if is_unique_check:
+                                        best_molecule_so_far = mol
+                                        best_score_so_far = mol.get('boltz_score', float('-inf'))
+                                        bt.logging.info(
+                                            f"✅ Found next best unique molecule: {mol_name} "
+                                            f"(score: {best_score_so_far:.6f})"
+                                        )
+                                        break
+                                
+                                if not best_molecule_so_far:
+                                    bt.logging.warning(
+                                        "⚠️  No unique molecules found in scored molecules. "
+                                        "Cannot submit non-unique molecule."
+                                    )
+                                    last_processed_epoch = current_epoch
+                                    state['last_processed_epoch'] = current_epoch
+                                    submitted = True
+                                    break
+                            
+                            # Check if molecule is already in DB
+                            db_score = get_score_from_db(best_molecule_so_far['name'])
+                            if db_score is not None:
+                                bt.logging.info(
+                                    f"⚠️  Best molecule {best_molecule_so_far['name']} already in DB "
+                                    f"(score: {db_score:.6f}), but submitting as top molecule"
+                                )
+                            
+                            bt.logging.info(
+                                f"🏆 Best molecule from all rounds: {best_molecule_so_far['name']} "
+                                f"with Boltz score: {best_score_so_far:.6f} (unique: ✅)"
+                            )
+                            state['candidate_product'] = best_molecule_so_far['name']
+                            
+                            try:
+                                await submit_response(state)
+                                bt.logging.info(
+                                    f"✅ Submission successful for {best_molecule_so_far['name']} "
+                                    f"(score: {best_score_so_far:.6f})!"
+                                )
+                                state['last_submission_epoch'] = current_epoch
+                                last_processed_epoch = current_epoch
+                                state['last_processed_epoch'] = current_epoch
+                                bt.logging.info(f"⏳ Waiting for next epoch to start...")
+                            except Exception as e:
+                                bt.logging.error(f"❌ Error submitting response: {e}")
+                                import traceback
+                                bt.logging.error(traceback.format_exc())
+                                last_processed_epoch = current_epoch
+                                state['last_processed_epoch'] = current_epoch
+                        else:
+                            bt.logging.warning("No valid molecules to submit")
+                            last_processed_epoch = current_epoch
+                            state['last_processed_epoch'] = current_epoch
+                        submitted = True
+                        break
+                    else:
+                        # ✅ CONTINUE TO NEXT GENERATION ROUND
+                        # Use top 30 scored molecules as seed for next round
+                        top_scored = sorted(
+                            all_scored_molecules,
+                            key=lambda m: m.get('boltz_score', float('-inf')),
+                            reverse=True
+                        )[:30]
+                        
+                        if top_scored:
+                            # Create DataFrame with top scored molecules for next round seed
+                            current_seed_pool = pd.DataFrame(top_scored)
+                            bt.logging.info(
+                                f"📈 Continuing to round {generation_round + 1}: "
+                                f"Using top 30 scored molecules as seed pool "
+                                f"(top score: {top_scored[0].get('boltz_score', 'N/A'):.6f})"
+                            )
+                        else:
+                            # Fallback to original top 200
+                            current_seed_pool = state['top_200_df']
+                            bt.logging.warning(
+                                f"📈 Continuing to round {generation_round + 1}: "
+                                f"No scored molecules available, using original top 200 as seed"
+                            )
+                
+                # Mark epoch as processed
+                if last_processed_epoch != current_epoch:
+                    last_processed_epoch = current_epoch
+                    state['last_processed_epoch'] = current_epoch
+            
+            # Check if we already submitted in this epoch
+            if last_submission_epoch == current_epoch:
+                bt.logging.info(
+                    f"⏭️  Already submitted in epoch {current_epoch}, waiting for next epoch..."
+                )
+                await asyncio.sleep(10)
+                continue
+            
+            # If we haven't processed this epoch yet, wait
+            if last_processed_epoch != current_epoch:
+                await asyncio.sleep(10)
+                continue
+            
+            # Wait a bit before checking again
+            await asyncio.sleep(10)
+        
+        except Exception as e:
+            bt.logging.error(f"Error in adaptive GA loop: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            await asyncio.sleep(10)
+
+async def startup_phase(state: Dict[str, Any]) -> None:
+    """
+    Startup phase:
+    1. Initialize score_results database
+    2. Import and initialize BoltzWrapper
+    3. Load molecules from CSV
+    4. Initialize hybrid generator with synthon library
+    5. Prepare for main loop
+    """
+    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz, Load CSV & Synthon Library...")
+
+    try:
+        # Initialize score_results database
+        bt.logging.info("💾 Initializing score_results database...")
+        init_score_results_db()
+        bt.logging.info(f"✅ Score results database initialized at {SCORE_RESULTS_DB}")
+        
+        # Import BoltzWrapper
+        bt.logging.info("🔬 Importing BoltzWrapper...")
+        boltz_imported = _import_boltz_wrapper()
+        
+        # Initialize BoltzWrapper
+        if boltz_imported and BoltzWrapper is not None:
+            bt.logging.info("🔬 Initializing BoltzWrapper...")
+            try:
+                state['boltz_wrapper'] = BoltzWrapper()
+                bt.logging.info("✅ BoltzWrapper initialized successfully")
+            except Exception as e:
+                bt.logging.error(f"❌ Failed to initialize BoltzWrapper: {e}")
+                import traceback
+                bt.logging.error(traceback.format_exc())
+                state['boltz_wrapper'] = None
+        else:
+            bt.logging.warning("⚠️  BoltzWrapper not available, scoring will be skipped")
+            state['boltz_wrapper'] = None
+        
+        # Load molecules from CSV
+        bt.logging.info("📂 Loading molecules from CSV...")
+        molecules_df = load_molecules_from_csv(
+            REACTION_TRAIN_CSV,
+            state['current_challenge_targets'],
+            STARTING_EPOCH,
+            HARDCODED_RXN_ID
+        )
+        
+        if molecules_df.empty:
+            bt.logging.warning("⚠️  No molecules loaded from CSV")
+            state['top_pool'] = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+            state['seen_inchikeys'] = set()
+        else:
+            bt.logging.info(f"✅ Loaded {len(molecules_df)} molecules from CSV")
+            state['top_pool'] = molecules_df.copy()
+            state['seen_inchikeys'] = set(molecules_df['InChIKey'].tolist())
+        
+        bt.logging.info(
+            f"✅ STARTUP COMPLETE:"
+            f"\n   Total molecules in pool: {len(state['top_pool'])}"
+            f"\n   Sample molecules: {state['top_pool']['name'].head(3).tolist() if not state['top_pool'].empty else 'None'}"
+            f"\n   BoltzWrapper: {'✅ Ready' if state.get('boltz_wrapper') else '❌ Not available'}"
+        )
+        
+        state['startup_complete'] = True
+
+    except Exception as e:
+        bt.logging.error(f"Error in startup phase: {e}")
+        import traceback
+        bt.logging.error(traceback.format_exc())
+
+def _import_boltz_wrapper():
+    """
+    Import BoltzWrapper following the same pattern as DataGenerator/main.py.
+    This is done as a function so it can be called after logging is initialized.
+    """
+    global BOLTZ_AVAILABLE, BoltzWrapper
+    try:
+        BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
+        BOLTZ_SRC_DIR = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
+        
+        if not os.path.exists(BOLTZ_SCORING_DIR):
+            bt.logging.warning(f"⚠️  Boltz-scoring directory not found at {BOLTZ_SCORING_DIR}")
+            return False
+        
+        if BOLTZ_SCORING_DIR not in sys.path:
+            sys.path.append(BOLTZ_SCORING_DIR)
+        
+        if BOLTZ_SRC_DIR not in sys.path:
+            sys.path.insert(0, BOLTZ_SRC_DIR)
+        
+        boltz_utils_path = os.path.join(BOLTZ_SCORING_DIR, 'utils')
+        if os.path.exists(boltz_utils_path) and boltz_utils_path not in sys.path:
+            sys.path.insert(0, boltz_utils_path)
+        
+        from boltz.wrapper import BoltzWrapper as BW
+        BoltzWrapper = BW
+        BOLTZ_AVAILABLE = True
+        bt.logging.info(f"✅ BoltzWrapper imported successfully from {BOLTZ_SCORING_DIR}")
+        return True
+        
+    except ImportError as e:
+        bt.logging.warning(f"⚠️  Failed to import BoltzWrapper: {e}")
+        import traceback
+        bt.logging.debug(traceback.format_exc())
+        return False
+    except Exception as e:
+        bt.logging.warning(f"⚠️  Error setting up BoltzWrapper: {e}")
+        import traceback
+        bt.logging.debug(traceback.format_exc())
+        return False
+
 async def run_miner(config: argparse.Namespace) -> None:
-    """Main mining loop."""
+    """Main mining loop with hybrid generation (70% synthon + 30% crossover)."""
 
     wallet, subtensor, metagraph, miner_uid, epoch_length = await setup_bittensor_objects(config)
 
@@ -2026,7 +1893,7 @@ async def run_miner(config: argparse.Namespace) -> None:
         'last_submitted_product': None,
         'last_submission_time': None,
         'last_submission_epoch': -1,
-        'last_processed_epoch': -1,  # Track last epoch we processed CSV for
+        'last_processed_epoch': -1,
         'startup_complete': False,
         'shutdown_event': asyncio.Event(),
         'current_challenge_targets': [],
@@ -2036,15 +1903,16 @@ async def run_miner(config: argparse.Namespace) -> None:
         'rxn_id': None,
         'top_pool': pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"]),
         'seen_inchikeys': set(),
-        'generated_molecules': set(),  # Track generated molecule names to avoid duplicates
-        'generated_inchikeys': set(),  # Track generated InChIKeys to avoid duplicates
-        'boltz_wrapper': None,  # Will be initialized in startup_phase
+        'generated_molecules': set(),
+        'generated_inchikeys': set(),
+        'boltz_wrapper': None,
+        'hybrid_generator': None,
     }
 
     bt.logging.info("🚀 Entering main miner loop...")
 
     state['rxn_id'] = HARDCODED_RXN_ID
-    
+
     current_block = await subtensor.get_current_block()
     last_boundary = (current_block // epoch_length) * epoch_length
     block_hash = await subtensor.determine_block_hash(last_boundary)
@@ -2075,10 +1943,10 @@ async def run_miner(config: argparse.Namespace) -> None:
             import traceback
             bt.logging.error(traceback.format_exc())
 
-        # Launch adaptive GA loop
+        # Launch adaptive GA loop with hybrid generation
         try:
             state['ga_task'] = asyncio.create_task(run_adaptive_genetic_loop(state))
-            bt.logging.info("✅ Adaptive GA loop started!")
+            bt.logging.info("✅ Adaptive hybrid GA loop started!")
         except Exception as e:
             bt.logging.error(f"Error starting GA loop: {e}")
             import traceback
@@ -2116,13 +1984,11 @@ async def run_miner(config: argparse.Namespace) -> None:
             state['shutdown_event'].set()
             break
 
-
 async def main() -> None:
     """Main entry point."""
     config = parse_arguments()
     setup_logging(config)
     await run_miner(config)
-
 
 if __name__ == "__main__":
     load_dotenv()
