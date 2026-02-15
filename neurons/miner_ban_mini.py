@@ -924,7 +924,7 @@ async def score_molecules_with_boltz_batched(
         current_block = await state['subtensor'].get_current_block()
         blocks_remaining = next_epoch_block - current_block
         
-        if blocks_remaining < 50:
+        if blocks_remaining < 30:
             bt.logging.warning(
                 f"⏰ Only {blocks_remaining} blocks until next epoch, "
                 f"stopping batch scoring and returning for submission"
