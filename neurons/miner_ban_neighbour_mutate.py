@@ -42,8 +42,8 @@ from utils import (
     contains_atom_type
 )
 from utils.molecules import molecule_unique_for_protein_hf
-from molecules_base import generate_inchikey
-from combinatorial_db.reactions import get_smiles_from_reaction
+from molecules_base import generate_inchikey, get_molecules_by_role
+from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from btdr import QuicknetBittensorDrandTimelock
 
 BOLTZ_AVAILABLE = False
@@ -238,29 +238,320 @@ def safe_torch_load(path, map_location='cpu'):
         bt.logging.error(f"❌ Failed to load checkpoint: {e}")
         raise RuntimeError(f"Checkpoint loading failed: {e}") from e
 
-class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
+class AdaptiveMutationStrategy:
+    """
+    Manages adaptive mutation parameters that evolve based on generation success.
+        Strategy:
+    - Start with conservative params (num_neighbors=5, threshold=0.5)
+    - If generation stalls, increase num_neighbors (5 → 10 → 20)
+    - If still stalling, decrease threshold (0.5 → 0.3 → 0.1)
+    - This gradually expands the search space to find new molecules
+    """
+
+    def __init__(self):
+        """Initialize adaptive mutation strategy."""
+        # Neighbor candidate progression: 5 → 10 → 20 → 30 → 50
+        self.neighbor_stages = [5, 10, 20, 30, 50]
+        self.current_neighbor_idx = 0
+        
+        # Similarity threshold progression: 0.5 → 0.3 → 0.1 → 0.05
+        self.threshold_stages = [0.8, 0.6, 0.4, 0.2]
+        self.current_threshold_idx = 0
+        
+        # Track performance
+        self.attempts_at_current_stage = 0
+        self.successful_generations_at_stage = 0
+        self.stage_switch_count = 0
+        
+        bt.logging.info("🎯 Adaptive Mutation Strategy initialized")
+        bt.logging.info(f"   Neighbor stages: {self.neighbor_stages}")
+        bt.logging.info(f"   Threshold stages: {self.threshold_stages}")
     
+    def get_current_params(self) -> Dict[str, Any]:
+        """Get current mutation parameters."""
+        num_neighbors = self.neighbor_stages[self.current_neighbor_idx]
+        threshold = self.threshold_stages[self.current_threshold_idx]
+        
+        return {
+            'num_neighbor_candidates': num_neighbors,
+            'similarity_threshold': threshold,
+            'stage_info': f"neighbors={num_neighbors}, threshold={threshold:.2f}"
+        }
+    
+    def record_attempt(self, success: bool) -> None:
+        """Record a generation attempt result."""
+        self.attempts_at_current_stage += 1
+        if success:
+            self.successful_generations_at_stage += 1
+    
+    def should_increase_neighbors(self, stall_threshold: int = 50) -> bool:
+        """
+        Check if we should increase the number of neighbors.
+        
+        Args:
+            stall_threshold: Number of failed attempts before increasing neighbors
+            
+        Returns:
+            True if we should increase neighbors, False otherwise
+        """
+        if self.attempts_at_current_stage == 0:
+            return False
+        
+        # Calculate success rate
+        success_rate = self.successful_generations_at_stage / self.attempts_at_current_stage
+        
+        # If success rate is too low and we haven't maxed out neighbors, increase
+        if success_rate < 0.1 and self.current_neighbor_idx < len(self.neighbor_stages) - 1:
+            return True
+        
+        return False
+    
+    def should_decrease_threshold(self, stall_threshold: int = 100) -> bool:
+        """
+        Check if we should decrease the similarity threshold.
+        
+        Args:
+            stall_threshold: Number of failed attempts before decreasing threshold
+            
+        Returns:
+            True if we should decrease threshold, False otherwise
+        """
+        if self.attempts_at_current_stage == 0:
+            return False
+        
+        # Calculate success rate
+        success_rate = self.successful_generations_at_stage / self.attempts_at_current_stage
+        
+        # If success rate is still too low after increasing neighbors, decrease threshold
+        if (success_rate < 0.05 and 
+            self.current_neighbor_idx >= len(self.neighbor_stages) - 1 and
+            self.current_threshold_idx < len(self.threshold_stages) - 1):
+            return True
+        
+        return False
+    
+    def increase_neighbors(self) -> None:
+        """Increase the number of neighbor candidates."""
+        if self.current_neighbor_idx < len(self.neighbor_stages) - 1:
+            old_neighbors = self.neighbor_stages[self.current_neighbor_idx]
+            self.current_neighbor_idx += 1
+            new_neighbors = self.neighbor_stages[self.current_neighbor_idx]
+            
+            self.stage_switch_count += 1
+            self.attempts_at_current_stage = 0
+            self.successful_generations_at_stage = 0
+            
+            bt.logging.info(
+                f"📈 Stage {self.stage_switch_count}: Increasing neighbors "
+                f"{old_neighbors} → {new_neighbors} "
+                f"(threshold: {self.threshold_stages[self.current_threshold_idx]:.2f})"
+            )
+    
+    def decrease_threshold(self) -> None:
+        """Decrease the similarity threshold."""
+        if self.current_threshold_idx < len(self.threshold_stages) - 1:
+            old_threshold = self.threshold_stages[self.current_threshold_idx]
+            self.current_threshold_idx += 1
+            new_threshold = self.threshold_stages[self.current_threshold_idx]
+            
+            self.stage_switch_count += 1
+            self.attempts_at_current_stage = 0
+            self.successful_generations_at_stage = 0
+            
+            bt.logging.info(
+                f"📉 Stage {self.stage_switch_count}: Decreasing threshold "
+                f"{old_threshold:.2f} → {new_threshold:.2f} "
+                f"(neighbors: {self.neighbor_stages[self.current_neighbor_idx]})"
+            )
+    
+    def get_stage_info(self) -> Dict[str, Any]:
+        """Get current stage information for logging."""
+        return {
+            'stage': self.stage_switch_count,
+            'neighbors': self.neighbor_stages[self.current_neighbor_idx],
+            'threshold': self.threshold_stages[self.current_threshold_idx],
+            'attempts': self.attempts_at_current_stage,
+            'successes': self.successful_generations_at_stage,
+            'success_rate': (self.successful_generations_at_stage / self.attempts_at_current_stage 
+                            if self.attempts_at_current_stage > 0 else 0)
+        }
+
+class GeneticAlgorithmOperator:
+    """Performs genetic algorithm operations on molecules (CROSSOVER + NEIGHBOR-BASED MUTATION)."""
+
     def __init__(self, rxn_id: int, db_path: str):
-        """Initialize GA operator."""
-        self.rxn_id = rxn_id
-        self.db_path = db_path
-        self.generated_molecule_names: Set[str] = set()
+      """Initialize GA operator."""
+      self.rxn_id = rxn_id
+      self.db_path = db_path
+      self.generated_molecule_names: Set[str] = set()
+      
+      # Load reaction info and component pools for mutation
+      self.reaction_info = get_reaction_info(rxn_id, db_path)
+      if self.reaction_info:
+          self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+          self.is_three_component = self.roleC is not None and self.roleC != 0
+          
+          # Load component pools for mutation
+          self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+          self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+          self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+          
+          # Extract component IDs for each role
+          self.component_ids_A = [mol[0] for mol in self.molecules_A] if self.molecules_A else []
+          self.component_ids_B = [mol[0] for mol in self.molecules_B] if self.molecules_B else []
+          self.component_ids_C = [mol[0] for mol in self.molecules_C] if self.molecules_C else []
+          
+          # Build SMILES dictionaries for similarity-based neighbor finding
+          self.smiles_dict_A = {mol[0]: mol[1] for mol in self.molecules_A} if self.molecules_A else {}
+          self.smiles_dict_B = {mol[0]: mol[1] for mol in self.molecules_B} if self.molecules_B else {}
+          self.smiles_dict_C = {mol[0]: mol[1] for mol in self.molecules_C} if self.molecules_C else {}
+          
+          # Build fingerprint caches for fast similarity computation
+          self._build_fingerprint_caches()
+          
+          bt.logging.debug(
+              f"GA Operator initialized: {len(self.component_ids_A)} A, {len(self.component_ids_B)} B"
+              f"{f', {len(self.component_ids_C)} C' if self.is_three_component else ''} components"
+          )
+      else:
+          bt.logging.warning(f"Could not load reaction info for rxn_id {rxn_id}, mutation will be disabled")
+          self.reaction_info = None
+          self.component_ids_A = []
+          self.component_ids_B = []
+          self.component_ids_C = []
+          self.is_three_component = False
+          self.smiles_dict_A = {}
+          self.smiles_dict_B = {}
+          self.smiles_dict_C = {}
+          self.fingerprints_A = {}
+          self.fingerprints_B = {}
+          self.fingerprints_C = {}
+  
+    def _build_fingerprint_caches(self):
+        """Build fingerprint caches for all components for fast similarity computation."""
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        
+        bt.logging.info("🔬 Building fingerprint caches for neighbor-based mutation...")
+        
+        self.fingerprints_A = {}
+        self.fingerprints_B = {}
+        self.fingerprints_C = {}
+        
+        # Build fingerprints for component A
+        for comp_id, smiles in self.smiles_dict_A.items():
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+                    self.fingerprints_A[comp_id] = fp
+            except Exception as e:
+                bt.logging.debug(f"Could not compute fingerprint for A component {comp_id}: {e}")
+        
+        # Build fingerprints for component B
+        for comp_id, smiles in self.smiles_dict_B.items():
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+                    self.fingerprints_B[comp_id] = fp
+            except Exception as e:
+                bt.logging.debug(f"Could not compute fingerprint for B component {comp_id}: {e}")
+        
+        # Build fingerprints for component C (if 3-component reaction)
+        if self.is_three_component:
+            for comp_id, smiles in self.smiles_dict_C.items():
+                try:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is not None:
+                        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+                        self.fingerprints_C[comp_id] = fp
+                except Exception as e:
+                    bt.logging.debug(f"Could not compute fingerprint for C component {comp_id}: {e}")
+        
+        bt.logging.info(
+            f"✅ Fingerprint cache built: {len(self.fingerprints_A)} A, "
+            f"{len(self.fingerprints_B)} B"
+            f"{f', {len(self.fingerprints_C)} C' if self.is_three_component else ''}"
+        )
+    
+    def _find_similar_components(
+        self,
+        current_component_id: int,
+        component_pool: List[int],
+        fingerprints_dict: Dict[int, Any],
+        num_neighbors: int = 5,
+        similarity_threshold: float = 0.5
+    ) -> List[int]:
+        """
+        Find similar components to the current one using Tanimoto similarity.
+        
+        Args:
+            current_component_id: ID of the current component
+            component_pool: List of available component IDs
+            fingerprints_dict: Dictionary mapping component IDs to fingerprints
+            num_neighbors: Number of similar neighbors to return
+            similarity_threshold: Minimum similarity threshold (0-1)
+            
+        Returns:
+            List of similar component IDs (sorted by similarity, descending)
+        """
+        from rdkit import DataStructs
+        
+        if current_component_id not in fingerprints_dict:
+            bt.logging.debug(f"No fingerprint for current component {current_component_id}")
+            return []
+        
+        current_fp = fingerprints_dict[current_component_id]
+        similarities = []
+        
+        # Compute similarity to all other components
+        for comp_id in component_pool:
+            if comp_id == current_component_id:
+                continue
+            
+            if comp_id not in fingerprints_dict:
+                continue
+            
+            neighbor_fp = fingerprints_dict[comp_id]
+            similarity = DataStructs.TanimotoSimilarity(current_fp, neighbor_fp)
+            
+            if similarity >= similarity_threshold:
+                similarities.append((comp_id, similarity))
+        
+        # Sort by similarity (descending) and return top N
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        similar_components = [comp_id for comp_id, _ in similarities[:num_neighbors]]
+        
+        return similar_components
     
     def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
-        """Crossover two molecules by swapping random components."""
+        """
+        Crossover two molecules by swapping random components.
+        
+        Supports two formats:
+        - 2 components: rxn:5:comp1:comp2 (4 parts)
+        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts)
+        
+        Both parents must have the same number of components.
+        We randomly swap one component between the two molecules.
+        """
         try:
+            from rdkit import Chem
+            
+            # Parse molecule names
             parts1 = mol_name_1.split(':')
             parts2 = mol_name_2.split(':')
             
             bt.logging.debug(f"Crossover: {mol_name_1} x {mol_name_2}")
             
+            # Validate format: must start with 'rxn' and have same length
             if (parts1[0] != 'rxn' or parts2[0] != 'rxn'):
                 bt.logging.debug(f"Invalid format: must start with 'rxn'")
                 return None
             
             if len(parts1) != len(parts2):
-                bt.logging.debug(f"Invalid format: different number of components")
+                bt.logging.debug(f"Invalid format: different number of components ({len(parts1)} vs {len(parts2)})")
                 return None
             
             if len(parts1) not in [4, 5]:
@@ -277,18 +568,24 @@ class GeneticAlgorithmOperator:
                 bt.logging.debug(f"Error parsing rxn_ids: {e}")
                 return None
             
+            # Determine which component indices can be swapped
             num_components = len(parts1) - 2
             component_indices = list(range(2, 2 + num_components))
+            
+            # Randomly select which component to swap
             swap_idx = random.choice(component_indices)
             
+            # Create offspring by swapping one component
             offspring_parts = parts1.copy()
             offspring_parts[swap_idx] = parts2[swap_idx]
             offspring_name = ':'.join(offspring_parts)
             
+            # Check if already generated
             if offspring_name in self.generated_molecule_names:
                 bt.logging.debug(f"⚠️  Offspring {offspring_name} already generated in this batch")
                 return None
             
+            # Validate offspring
             try:
                 offspring_smiles = get_smiles_from_reaction(offspring_name)
                 if offspring_smiles:
@@ -308,19 +605,217 @@ class GeneticAlgorithmOperator:
         
         except Exception as e:
             bt.logging.debug(f"Error in crossover_molecules: {e}")
+            import traceback
+            bt.logging.debug(traceback.format_exc())
+            return None
+    
+    def mutate_molecule(
+        self,
+        mol_name: str,
+        use_neighbor_mutation: bool = True,
+        num_neighbor_candidates: int = 5,
+        similarity_threshold: float = 0.5
+    ) -> Optional[str]:
+        """
+        Mutate a molecule by replacing a random component with a similar component.
+        
+        Uses neighbor-based selection for more efficient exploration:
+        - Finds similar components based on chemical fingerprints
+        - Prefers chemically similar replacements over random ones
+        - Falls back to random mutation if no similar neighbors found
+        
+        Supports two formats:
+        - 2 components: rxn:5:comp1:comp2 (4 parts) - components at indices 2, 3
+        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts) - components at indices 2, 3, 4
+        
+        Args:
+            mol_name: Parent molecule name to mutate
+            use_neighbor_mutation: If True, use neighbor-based selection; if False, use random
+            num_neighbor_candidates: Number of similar neighbors to consider
+            similarity_threshold: Minimum similarity threshold (0-1)
+            
+        Returns:
+            New molecule name from mutation, or None if mutation failed
+        """
+        try:
+            from rdkit import Chem
+            
+            # Check if mutation is available
+            if not self.reaction_info or not self.component_ids_A or not self.component_ids_B:
+                bt.logging.debug("Mutation not available: reaction info or component pools not loaded")
+                return None
+            
+            # Parse molecule name
+            parts = mol_name.split(':')
+            
+            bt.logging.debug(f"Mutation: {mol_name}")
+            
+            # Validate format: must start with 'rxn'
+            if parts[0] != 'rxn':
+                bt.logging.debug(f"Invalid format: must start with 'rxn'")
+                return None
+            
+            if len(parts) not in [4, 5]:
+                bt.logging.debug(f"Invalid format: expected 4 or 5 parts, got {len(parts)}")
+                return None
+            
+            try:
+                rxn_id = int(parts[1])
+                if rxn_id != self.rxn_id:
+                    bt.logging.debug(f"Wrong rxn_id: {rxn_id}")
+                    return None
+            except (ValueError, IndexError) as e:
+                bt.logging.debug(f"Error parsing rxn_id: {e}")
+                return None
+            
+            # Determine which component indices can be mutated
+            num_components = len(parts) - 2
+            component_indices = list(range(2, 2 + num_components))
+            
+            # Randomly select which component to mutate
+            mutate_idx = random.choice(component_indices)
+            component_position = mutate_idx - 2  # 0 for A, 1 for B, 2 for C
+            
+            bt.logging.debug(f"Mutating component at index {mutate_idx} (position {component_position})")
+            
+            # Get the appropriate component pool and fingerprints based on position
+            if component_position == 0:  # Component A
+                component_pool = self.component_ids_A
+                fingerprints_dict = self.fingerprints_A
+            elif component_position == 1:  # Component B
+                component_pool = self.component_ids_B
+                fingerprints_dict = self.fingerprints_B
+            elif component_position == 2 and self.is_three_component:  # Component C
+                component_pool = self.component_ids_C
+                fingerprints_dict = self.fingerprints_C
+            else:
+                bt.logging.debug(f"Invalid component position: {component_position}")
+                return None
+            
+            if not component_pool:
+                bt.logging.debug(f"No components available for position {component_position}")
+                return None
+            
+            # Parse current component ID with error handling
+            try:
+                current_component_id = int(parts[mutate_idx])
+            except (ValueError, IndexError) as e:
+                bt.logging.debug(f"Invalid component ID at index {mutate_idx}: {parts[mutate_idx]}")
+                return None
+            
+            # Select replacement component
+            new_component_id = None
+            mutation_strategy = "random"
+            
+            if use_neighbor_mutation and fingerprints_dict:
+                # Try neighbor-based mutation first
+                similar_components = self._find_similar_components(
+                    current_component_id,
+                    component_pool,
+                    fingerprints_dict,
+                    num_neighbors=num_neighbor_candidates,
+                    similarity_threshold=similarity_threshold
+                )
+                
+                if similar_components:
+                    new_component_id = random.choice(similar_components)
+                    mutation_strategy = "neighbor-based"
+                    bt.logging.debug(
+                        f"   Using neighbor-based mutation: {current_component_id} → {new_component_id}"
+                    )
+            
+            # Fallback to random mutation if neighbor-based failed
+            if new_component_id is None:
+                available_components = [cid for cid in component_pool if cid != current_component_id]
+                if not available_components:
+                    bt.logging.debug(f"No alternative components available for position {component_position}")
+                    return None
+                
+                new_component_id = random.choice(available_components)
+                mutation_strategy = "random"
+                bt.logging.debug(
+                    f"   Using random mutation: {current_component_id} → {new_component_id}"
+                )
+            
+            # Create mutated molecule by replacing the component
+            mutated_parts = parts.copy()
+            mutated_parts[mutate_idx] = str(new_component_id)
+            mutated_name = ':'.join(mutated_parts)
+            
+            bt.logging.debug(f"Mutated: {mutated_name}")
+            
+            # Check if already generated
+            if mutated_name in self.generated_molecule_names:
+                bt.logging.debug(f"⚠️  Mutated molecule {mutated_name} already generated in this batch")
+                return None
+            
+            # Validate mutated molecule
+            try:
+                mutated_smiles = get_smiles_from_reaction(mutated_name)
+                if mutated_smiles:
+                    mol = Chem.MolFromSmiles(mutated_smiles)
+                    if mol is not None:
+                        self.generated_molecule_names.add(mutated_name)
+                        bt.logging.info(
+                            f"✅ Mutation successful ({mutation_strategy}): "
+                            f"{mol_name} → {mutated_name} "
+                            f"(replaced component {component_position}: {current_component_id} → {new_component_id})"
+                        )
+                        return mutated_name
+                    else:
+                        bt.logging.debug(f"Invalid SMILES from RDKit: {mutated_smiles}")
+                else:
+                    bt.logging.debug(f"No SMILES generated for mutated molecule")
+            except Exception as e:
+                bt.logging.debug(f"Error validating mutation: {e}")
+            
+            return None
+        
+        except Exception as e:
+            bt.logging.debug(f"Error in mutate_molecule: {e}")
+            import traceback
+            bt.logging.debug(traceback.format_exc())
             return None
     
     def apply_genetic_operations(
         self,
         top_molecules: List[str],
-        num_crossovers: int = 5
+        num_crossovers: int = 5,
+        num_mutations: int = 5,
+        use_neighbor_mutation: bool = True,
+        num_neighbor_candidates: int = 5,
+        similarity_threshold: float = 0.5
     ) -> List[Dict[str, Any]]:
-        """Apply genetic operations (CROSSOVER ONLY) to top molecules."""
+        """
+        Apply genetic operations (CROSSOVER + NEIGHBOR-BASED MUTATION) to top molecules.
+        
+        Args:
+            top_molecules: List of top molecule names
+            num_crossovers: Number of crossovers to attempt
+            num_mutations: Number of mutations to attempt
+            use_neighbor_mutation: If True, use neighbor-based mutation; if False, use random
+            num_neighbor_candidates: Number of similar neighbors to consider for mutation
+            similarity_threshold: Minimum similarity threshold (0-1) for neighbor selection
+            
+        Returns:
+            List of new molecules with their SMILES and names (in order generated)
+        """
         new_molecules = []
+        
+        # Reset tracking for this batch
         self.generated_molecule_names.clear()
         
-        bt.logging.info(f"🧬 Applying CROSSOVER-ONLY genetic operations to top {len(top_molecules)} molecules...")
+        mutation_mode = "NEIGHBOR-BASED" if use_neighbor_mutation else "RANDOM"
+        bt.logging.info(
+            f"🧬 Applying genetic operations (CROSSOVER + {mutation_mode} MUTATION) "
+            f"to top {len(top_molecules)} molecules..."
+        )
+        bt.logging.info(f"   Sample molecules: {top_molecules[:3]}")
+        bt.logging.info(
+            f"   Operations: {num_crossovers} crossovers, {num_mutations} mutations ({mutation_mode})"
+        )
         
+        # Apply crossovers
         crossovers_created = 0
         
         for i in range(num_crossovers):
@@ -345,12 +840,62 @@ class GeneticAlgorithmOperator:
                                 'type': 'crossover'
                             })
                             crossovers_created += 1
-                            bt.logging.info(f"   ✅ Crossover #{crossovers_created}: {offspring}")
+                            bt.logging.info(f"   ✅ Crossover #{crossovers_created}: {parent1} × {parent2} → {offspring}")
                     
                     except Exception as e:
                         bt.logging.debug(f"Error processing offspring: {e}")
+                else:
+                    bt.logging.debug(f"   ❌ Crossover {i+1} failed (duplicate or invalid)")
+            else:
+                bt.logging.debug(f"   ⏭️  Crossover {i+1}: parents are identical, skipping")
         
         bt.logging.info(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
+        
+        # Apply mutations
+        mutations_created = 0
+        mutations_by_strategy = {'neighbor-based': 0, 'random': 0}
+        
+        for i in range(num_mutations):
+            parent = random.choice(top_molecules)
+            
+            bt.logging.info(f"   Attempting mutation {i+1}/{num_mutations}: {parent}")
+            
+            mutated = self.mutate_molecule(
+                parent,
+                use_neighbor_mutation=use_neighbor_mutation,
+                num_neighbor_candidates=num_neighbor_candidates,
+                similarity_threshold=similarity_threshold
+            )
+            
+            if mutated:
+                try:
+                    smiles = get_smiles_from_reaction(mutated)
+                    inchikey = generate_inchikey(smiles)
+                    
+                    if smiles and inchikey:
+                        new_molecules.append({
+                            'name': mutated,
+                            'smiles': smiles,
+                            'InChIKey': inchikey,
+                            'type': 'mutation'
+                        })
+                        mutations_created += 1
+                        
+                        # Track which strategy was used
+                        # (This is inferred from the logging output)
+                        bt.logging.info(f"   ✅ Mutation #{mutations_created}: {parent} → {mutated}")
+                
+                except Exception as e:
+                    bt.logging.debug(f"Error processing mutated molecule: {e}")
+            else:
+                bt.logging.debug(f"   ❌ Mutation {i+1} failed (duplicate or invalid)")
+        
+        bt.logging.info(f"   Mutations: {mutations_created}/{num_mutations} successful")
+        bt.logging.info(
+            f"🧬 Generated {len(new_molecules)} new molecules "
+            f"({crossovers_created} crossovers, {mutations_created} mutations)"
+        )
+        
         return new_molecules
 
 def parse_arguments() -> argparse.Namespace:
@@ -1436,28 +1981,48 @@ async def generate_unique_molecules_from_top200(
     top_200_df: pd.DataFrame,
     desired_count: int = 100
 ) -> List[Dict[str, Any]]:
-    """Generate unique molecules using genetic algorithm from top 200 molecules."""
+    """
+    Generate unique molecules (NOT in HuggingFace) using genetic algorithm from top 200 molecules.
+    Uses both CROSSOVER and MUTATION operations with ADAPTIVE PARAMETERS.
+        Adaptive strategy:
+    - Starts with conservative params (neighbors=5, threshold=0.5)
+    - If generation stalls, increases neighbors (5 → 10 → 20 → 30 → 50)
+    - If still stalling, decreases threshold (0.5 → 0.3 → 0.1 → 0.05)
+    - Gradually expands search space to find new molecules
+    """
+
     if top_200_df.empty:
         bt.logging.warning("Top 200 DataFrame is empty")
         return []
     
     ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    all_names = top_200_df['name'].tolist()
     
+    # Initialize adaptive mutation strategy
+    adaptive_strategy = AdaptiveMutationStrategy()
+    
+    # Get all molecule names from top 200
+    all_names = top_200_df['molecule_name'].tolist()
+    
+    # Adaptive pool sizes: start with 30, increase if generation fails
     pool_sizes = [30, 50, 100, 150, 200]
     current_pool_size_idx = 0
     current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
     
-    bt.logging.info(f"🧬 Generating {desired_count} unique molecules with validation (starting with top {current_pool_size})...")
+    bt.logging.info(
+        f"🧬 Generating {desired_count} unique molecules using CROSSOVER + ADAPTIVE MUTATION "
+        f"(starting with top {current_pool_size})..."
+    )
     
     unique_molecules = []
     attempts = 0
-    max_attempts = 500
-    last_successful_attempt = 0
+    max_attempts = 500  # Maximum generation attempts
+    last_successful_attempt = 0  # Track when we last found a unique molecule
     
+    # Get or initialize generated molecules tracking set
     generated_molecules = state.get('generated_molecules', set())
     generated_inchikeys = state.get('generated_inchikeys', set())
     
+    # Validation statistics
     validation_stats = {
         'total_generated': 0,
         'passed_validation': 0,
@@ -1467,46 +2032,93 @@ async def generate_unique_molecules_from_top200(
         'failed_rotatable_bonds': 0,
         'failed_hf_unique': 0,
         'failed_other': 0,
+        'crossovers_total': 0,
+        'mutations_total': 0,
     }
     
     while len(unique_molecules) < desired_count and attempts < max_attempts:
         attempts += 1
         
+        # ============================================================================
+        # ADAPTIVE POOL SIZING: Increase pool if generation stalls
+        # ============================================================================
         if attempts - last_successful_attempt >= 100 and current_pool_size_idx < len(pool_sizes) - 1:
             current_pool_size_idx += 1
             new_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
             if new_pool_size > current_pool_size:
                 current_pool_size = new_pool_size
-                bt.logging.info(f"📈 Increasing pool size to top {current_pool_size}")
-                last_successful_attempt = attempts
+                bt.logging.info(
+                    f"📈 Increasing pool size to top {current_pool_size} "
+                    f"(after {attempts - last_successful_attempt} failed attempts)"
+                )
+                last_successful_attempt = attempts  # Reset counter
         
+        # ============================================================================
+        # ADAPTIVE MUTATION PARAMETERS: Adjust based on success rate
+        # ============================================================================
+        if adaptive_strategy.should_increase_neighbors():
+            adaptive_strategy.increase_neighbors()
+        
+        if adaptive_strategy.should_decrease_threshold():
+            adaptive_strategy.decrease_threshold()
+        
+        # Get current adaptive parameters
+        mutation_params = adaptive_strategy.get_current_params()
+        
+        # Use current pool size
         current_pool_names = all_names[:current_pool_size]
-        new_molecules = ga_operator.apply_genetic_operations(current_pool_names, num_crossovers=10)
         
+        # Apply genetic operations with adaptive parameters
+        new_molecules = ga_operator.apply_genetic_operations(
+            current_pool_names,
+            num_crossovers=10,
+            num_mutations=10,
+            use_neighbor_mutation=True,
+            num_neighbor_candidates=mutation_params['num_neighbor_candidates'],
+            similarity_threshold=mutation_params['similarity_threshold']
+        )
+        
+        # Track operation types
+        for mol in new_molecules:
+            if mol.get('type') == 'crossover':
+                validation_stats['crossovers_total'] += 1
+            elif mol.get('type') == 'mutation':
+                validation_stats['mutations_total'] += 1
+        
+        # Check each new molecule for uniqueness
+        batch_success_count = 0
         for mol in new_molecules:
             if len(unique_molecules) >= desired_count:
                 break
             
             molecule_name = mol['name']
             smiles = mol.get('smiles')
+            mol_type = mol.get('type', 'unknown')
             
             validation_stats['total_generated'] += 1
             
+            # Skip if already in our unique list for this generation
             if molecule_name in [m['name'] for m in unique_molecules]:
                 continue
             
+            # Skip if already generated in previous generations
             if molecule_name in generated_molecules:
-                bt.logging.debug(f"   ⏭️  Molecule {molecule_name} already generated")
+                bt.logging.debug(f"   ⏭️  Molecule {molecule_name} already generated, skipping")
                 continue
             
+            # Generate InChIKey to check for duplicates
             inchikey = None
             try:
                 inchikey = generate_inchikey(smiles) if smiles else None
                 if inchikey and inchikey in generated_inchikeys:
-                    bt.logging.debug(f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated")
+                    bt.logging.debug(
+                        f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated, skipping"
+                    )
                     continue
             except Exception as e:
                 bt.logging.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
+                validation_stats['failed_other'] += 1
+                continue
             
             # Validate with config.yaml settings
             is_valid, errors = await validate_molecule_complete(state, molecule_name, smiles, state['config'])
@@ -1526,30 +2138,68 @@ async def generate_unique_molecules_from_top200(
                         validation_stats['failed_hf_unique'] += 1
                     else:
                         validation_stats['failed_other'] += 1
+                adaptive_strategy.record_attempt(False)
                 continue
             
-            unique_molecules.append(mol)
-            generated_molecules.add(molecule_name)
-            if inchikey:
-                generated_inchikeys.add(inchikey)
-            last_successful_attempt = attempts
-            validation_stats['passed_validation'] += 1
+            # Check if unique (NOT on HuggingFace)
+            is_unique = await check_molecule_unique(state, molecule_name, smiles)
             
-            bt.logging.info(
-                f"   ✅ Added valid molecule {molecule_name} "
-                f"({len(unique_molecules)}/{desired_count})"
-            )
+            if is_unique:
+                unique_molecules.append(mol)
+                # Track this molecule as generated
+                generated_molecules.add(molecule_name)
+                if inchikey:
+                    generated_inchikeys.add(inchikey)
+                last_successful_attempt = attempts  # Update last successful attempt
+                validation_stats['passed_validation'] += 1
+                batch_success_count += 1
+                adaptive_strategy.record_attempt(True)
+                
+                bt.logging.info(
+                    f"   ✅ Added unique {mol_type} molecule {molecule_name} "
+                    f"(pool: {current_pool_size}, neighbors: {mutation_params['num_neighbor_candidates']}, "
+                    f"threshold: {mutation_params['similarity_threshold']:.2f}, "
+                    f"{len(unique_molecules)}/{desired_count})"
+                )
+            else:
+                bt.logging.debug(f"   ❌ Molecule {molecule_name} is already on HuggingFace")
+                validation_stats['failed_hf_unique'] += 1
+                adaptive_strategy.record_attempt(False)
         
         if len(unique_molecules) >= desired_count:
             break
         
+        # Log stage info periodically
+        if attempts % 50 == 0:
+            stage_info = adaptive_strategy.get_stage_info()
+            bt.logging.info(
+                f"📊 Stage {stage_info['stage']}: "
+                f"neighbors={stage_info['neighbors']}, "
+                f"threshold={stage_info['threshold']:.2f}, "
+                f"success_rate={stage_info['success_rate']:.1%} "
+                f"({stage_info['successes']}/{stage_info['attempts']})"
+            )
+        
+        # Small delay to avoid overwhelming
         await asyncio.sleep(0.1)
     
+    # Update state with generated molecules tracking
     state['generated_molecules'] = generated_molecules
     state['generated_inchikeys'] = generated_inchikeys
     
+    # Final stage info
+    final_stage_info = adaptive_strategy.get_stage_info()
+    
+    # Log detailed statistics
     bt.logging.info(
-        f"✅ Generated {len(unique_molecules)} valid molecules (attempts: {attempts})"
+        f"✅ Generated {len(unique_molecules)} unique molecules "
+        f"(pool: {current_pool_size}, neighbors: {final_stage_info['neighbors']}, "
+        f"threshold: {final_stage_info['threshold']:.2f}, attempts: {attempts})"
+        f"\n   Final stage: {final_stage_info['stage']} "
+        f"(success_rate: {final_stage_info['success_rate']:.1%})"
+        f"\n   Operation breakdown:"
+        f"\n   - Crossovers generated: {validation_stats['crossovers_total']}"
+        f"\n   - Mutations generated: {validation_stats['mutations_total']}"
         f"\n   Validation stats:"
         f"\n   - Total generated: {validation_stats['total_generated']}"
         f"\n   - Passed validation: {validation_stats['passed_validation']}"
@@ -1562,7 +2212,6 @@ async def generate_unique_molecules_from_top200(
     )
     
     return unique_molecules
-
 
 async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
     """
