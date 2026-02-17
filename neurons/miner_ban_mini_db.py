@@ -11,6 +11,8 @@ import hashlib
 import time
 import sqlite3
 import pandas as pd
+import psycopg2
+from psycopg2 import sql
 from typing import Any, Dict, List, Optional, Tuple, Set
 from pathlib import Path
 from dotenv import load_dotenv
@@ -24,10 +26,17 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 2
+HARDCODED_RXN_ID = 1
 STARTING_EPOCH = 20934
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
-SCORE_RESULTS_DB = os.path.join(BASE_DIR,"score_results.sqlite")
+# SCORE_RESULTS_DB = os.path.join(BASE_DIR, "..", "nova-4090", "score_results.sqlite")
+
+# PostgreSQL Configuration
+POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
+POSTGRES_PORT = int(os.getenv('POSTGRES_PORT', 5432))
+POSTGRES_DB = os.getenv('POSTGRES_DB', 'P31652_rxn1_db')
+POSTGRES_USER = os.getenv('POSTGRES_USER', 'gentle')
+POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'gentleman')
 
 from config.config_loader import load_config
 from utils import (
@@ -456,13 +465,25 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
             else:
                 raise
 
-def init_score_results_db(db_path: str = None) -> None:
-    """Initialize/create the score_results.sqlite database."""
-    if db_path is None:
-        db_path = SCORE_RESULTS_DB
-    
+def get_postgres_connection():
+    """Create and return a PostgreSQL connection."""
     try:
-        conn = sqlite3.connect(db_path)
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            database=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            connect_timeout=5
+        )
+        return conn
+    except psycopg2.Error as e:
+        bt.logging.error(f"❌ Failed to connect to PostgreSQL: {e}")
+
+def init_score_results_db() -> None:
+    """Initialize PostgreSQL database and tables."""
+    try:
+        conn = get_postgres_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -478,88 +499,74 @@ def init_score_results_db(db_path: str = None) -> None:
         """)
         
         conn.commit()
+        cursor.close()
         conn.close()
-        bt.logging.debug(f"Initialized score_results database at {db_path}")
-    except Exception as e:
-        bt.logging.error(f"Error initializing score_results database: {e}")
+        bt.logging.debug(f"✅ PostgreSQL database initialized")
+    except psycopg2.Error as e:
+        bt.logging.error(f"❌ Error initializing PostgreSQL: {e}")
+        raise
 
 
-def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
-    """Get score for a molecule from the database."""
-    if db_path is None:
-        db_path = SCORE_RESULTS_DB
-    
+def get_score_from_db(molecule_name: str) -> Optional[float]:
+    """Get score from PostgreSQL."""
     try:
-        conn = sqlite3.connect(db_path)
+        conn = get_postgres_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT score FROM scored_molecules WHERE molecule_name = ?", (molecule_name,))
+        cursor.execute("SELECT score FROM scored_molecules WHERE molecule_name = %s", (molecule_name,))
         result = cursor.fetchone()
+        cursor.close()
         conn.close()
-        
-        if result:
-            return float(result[0])
-        return None
-    except Exception as e:
-        bt.logging.debug(f"Error getting score from DB for {molecule_name}: {e}")
+        return float(result[0]) if result else None
+    except psycopg2.Error as e:
+        bt.logging.debug(f"Error getting score: {e}")
         return None
 
-
-def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
-    """Write scored molecules to the database."""
-    if db_path is None:
-        db_path = SCORE_RESULTS_DB
-    
+def write_scores_to_db(molecules: List[Dict[str, Any]]) -> None:
+    """Write scores to PostgreSQL."""
     if not molecules:
         return
     
     try:
-        conn = sqlite3.connect(db_path)
+        conn = get_postgres_connection()
         cursor = conn.cursor()
         
-        to_insert = []
-        for mol in molecules:
-            molecule_name = mol.get('name')
-            score = mol.get('boltz_score')
-            
-            if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+        to_insert = [(mol.get('name'), float(mol.get('boltz_score'))) 
+                     for mol in molecules 
+                     if mol.get('name') and mol.get('boltz_score') is not None]
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                """INSERT INTO scored_molecules (molecule_name, score) VALUES (%s, %s)
+                   ON CONFLICT (molecule_name) DO UPDATE SET score = EXCLUDED.score""",
                 to_insert
             )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            bt.logging.info(f"✅ Wrote {len(to_insert)} molecules to PostgreSQL")
         
+        cursor.close()
         conn.close()
-    except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
+    except psycopg2.Error as e:
+        bt.logging.error(f"❌ Error writing scores: {e}")
 
-
-def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
-    """Get scores for multiple molecules from the database in batch."""
-    if db_path is None:
-        db_path = SCORE_RESULTS_DB
-    
+def batch_get_scores_from_db(molecule_names: List[str]) -> Dict[str, float]:
+    """Batch get scores from PostgreSQL."""
     if not molecule_names:
         return {}
     
     try:
-        conn = sqlite3.connect(db_path)
+        conn = get_postgres_connection()
         cursor = conn.cursor()
-        
-        placeholders = ','.join('?' * len(molecule_names))
+        placeholders = ','.join(['%s'] * len(molecule_names))
         cursor.execute(
             f"SELECT molecule_name, score FROM scored_molecules WHERE molecule_name IN ({placeholders})",
             molecule_names
         )
         results = cursor.fetchall()
+        cursor.close()
         conn.close()
-        
         return {name: float(score) for name, score in results}
-    except Exception as e:
-        bt.logging.debug(f"Error batch getting scores from DB: {e}")
+    except psycopg2.Error as e:
+        bt.logging.debug(f"Error batch getting scores: {e}")
         return {}
 
 def load_molecules_from_csv_with_validation(
