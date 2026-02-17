@@ -29,8 +29,8 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Continuously collect training data from competition API")
     parser.add_argument('--start_epoch', type=int, default=20934, help='Starting epoch number to collect from')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
-    parser.add_argument('--output', type=str, default='nova-4090/data/mols.csv', help='Output CSV file')
-    parser.add_argument('--time', type=int, default=None, 
+    parser.add_argument('--output', type=str, default='data/mols.csv', help='Output CSV file')
+    parser.add_argument('--time', type=int, default=60, 
                        help='Remaining time in seconds until first collection. If None, collect immediately.')
     
     args = parser.parse_args()
@@ -186,7 +186,7 @@ def find_latest_epoch(start_epoch: int, metric: str = 'boltz', max_search: int =
 
 
 def collect_single_epoch_data(epoch: int, metric: str = 'boltz', 
-                             output_file: str = 'nova-4090/data/mols.csv') -> int:
+                             output_file: str = 'data/mols.csv') -> int:
     """
     Collect training data for a single epoch.
     
