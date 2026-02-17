@@ -483,7 +483,6 @@ def init_score_results_db(db_path: str = None) -> None:
     except Exception as e:
         bt.logging.error(f"Error initializing score_results database: {e}")
 
-
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
     """Get score for a molecule from the database."""
     if db_path is None:

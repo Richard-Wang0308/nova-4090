@@ -24,7 +24,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 1
+HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 20934
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "..", "nova-4090", "score_results.sqlite")
@@ -42,7 +42,7 @@ from utils import (
     contains_atom_type
 )
 from utils.molecules import molecule_unique_for_protein_hf
-from molecules_base import generate_inchikey
+from molecules_base import generate_inchikey,SynthonLibrary, generate_molecules_from_synthon_library
 from combinatorial_db.reactions import get_smiles_from_reaction
 from btdr import QuicknetBittensorDrandTimelock
 
@@ -261,13 +261,22 @@ class HybridMoleculeGenerator:
             start_time = time.time()
             
             self.synthon_lib = SynthonLibrary(self.db_path, self.rxn_id)
-            self.synthon_lib_ready = self.synthon_lib.loaded
+            
+            # ✅ FIX: Check if library has components instead of 'loaded' attribute
+            has_components = (
+                len(self.synthon_lib.fps_A) > 0 and 
+                len(self.synthon_lib.fps_B) > 0
+            )
+            self.synthon_lib_ready = has_components
             
             elapsed = time.time() - start_time
             if self.synthon_lib_ready:
-                bt.logging.info(f"✅ SynthonLibrary initialized successfully in {elapsed:.2f}s")
+                bt.logging.info(
+                    f"✅ SynthonLibrary initialized successfully in {elapsed:.2f}s "
+                    f"({len(self.synthon_lib.fps_A)} A, {len(self.synthon_lib.fps_B)} B components)"
+                )
             else:
-                bt.logging.warning(f"⚠️  SynthonLibrary loaded but may be empty")
+                bt.logging.warning(f"⚠️  SynthonLibrary loaded but has no components")
             
             return self.synthon_lib_ready
         
@@ -277,28 +286,16 @@ class HybridMoleculeGenerator:
             bt.logging.error(traceback.format_exc())
             self.synthon_lib_ready = False
             return False
-    
+
+
     def generate_synthon_molecules(
         self,
         top_pool_df: pd.DataFrame,
         desired_count: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Generate molecules using hierarchical synthon search.
-        
-        Strategy:
-        1. Tight search on top 1-5 molecules (high similarity, many candidates)
-        2. Medium search on top 10-30 molecules (medium similarity)
-        3. Broad search on top 50 molecules (lower similarity)
-        
-        Falls back gracefully if not enough molecules found.
-        
-        Args:
-            top_pool_df: DataFrame with top molecules (name, smiles, InChIKey, score)
-            desired_count: Target number of molecules to generate
-            
-        Returns:
-            List of new molecules with name, smiles, InChIKey
+        Generate molecules using hierarchical synthon search with NEW API.
+        Uses generate_molecules_from_synthon_library() from molecules_base.py
         """
         if not self.synthon_lib_ready or self.synthon_lib is None:
             bt.logging.warning("⚠️  SynthonLibrary not ready, skipping synthon generation")
@@ -309,7 +306,6 @@ class HybridMoleculeGenerator:
             return []
         
         new_molecules = []
-        attempted_smiles = set()
         
         try:
             bt.logging.info(
@@ -324,170 +320,97 @@ class HybridMoleculeGenerator:
             has_high_score = current_max_score is not None and current_max_score > 0.01
             
             # Define hierarchical search strategy
-            search_strategy = []
-            
             if has_very_high_score:
                 bt.logging.info(
                     f"🎯 Very high score detected ({current_max_score:.6f}), "
                     f"using TIGHT hierarchical strategy"
                 )
-                
-                # Tier 1: Ultra-tight on top 1 (40% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 1 (Ultra-tight)',
-                    'molecules': top_pool_df.head(1),
-                    'budget': int(desired_count * 0.40),
-                    'min_similarity': 0.90,
-                    'n_per_base': 50
-                })
-                
-                # Tier 2: Tight on top 5 (30% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 2 (Tight)',
-                    'molecules': top_pool_df.head(5),
-                    'budget': int(desired_count * 0.30),
-                    'min_similarity': 0.80,
-                    'n_per_base': 30
-                })
-                
-                # Tier 3: Medium on top 20 (30% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 3 (Medium)',
-                    'molecules': top_pool_df.head(20),
-                    'budget': int(desired_count * 0.30),
-                    'min_similarity': 0.55,
-                    'n_per_base': 15
-                })
-            
+                search_configs = [
+                    {'tier': 'Tier 1 (Ultra-tight)', 'n_mols': 1, 'budget': 0.40, 'min_sim': 0.90, 'n_per': 50},
+                    {'tier': 'Tier 2 (Tight)', 'n_mols': 5, 'budget': 0.30, 'min_sim': 0.80, 'n_per': 30},
+                    {'tier': 'Tier 3 (Medium)', 'n_mols': 20, 'budget': 0.30, 'min_sim': 0.55, 'n_per': 15},
+                ]
             elif has_high_score:
                 bt.logging.info(
                     f"🎯 High score detected ({current_max_score:.6f}), "
                     f"using BALANCED hierarchical strategy"
                 )
-                
-                # Tier 1: Tight on top 5 (40% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 1 (Tight)',
-                    'molecules': top_pool_df.head(5),
-                    'budget': int(desired_count * 0.40),
-                    'min_similarity': 0.80,
-                    'n_per_base': 30
-                })
-                
-                # Tier 2: Medium on top 30 (35% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 2 (Medium)',
-                    'molecules': top_pool_df.head(30),
-                    'budget': int(desired_count * 0.35),
-                    'min_similarity': 0.65,
-                    'n_per_base': 20
-                })
-                
-                # Tier 3: Broad on top 50 (25% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 3 (Broad)',
-                    'molecules': top_pool_df.head(50),
-                    'budget': int(desired_count * 0.25),
-                    'min_similarity': 0.40,
-                    'n_per_base': 10
-                })
-            
+                search_configs = [
+                    {'tier': 'Tier 1 (Tight)', 'n_mols': 5, 'budget': 0.40, 'min_sim': 0.80, 'n_per': 30},
+                    {'tier': 'Tier 2 (Medium)', 'n_mols': 30, 'budget': 0.35, 'min_sim': 0.65, 'n_per': 20},
+                    {'tier': 'Tier 3 (Broad)', 'n_mols': 50, 'budget': 0.25, 'min_sim': 0.40, 'n_per': 10},
+                ]
             else:
                 bt.logging.info(
                     f"🎯 Standard score, using BROAD hierarchical strategy"
                 )
-                
-                # Tier 1: Medium on top 20 (50% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 1 (Medium)',
-                    'molecules': top_pool_df.head(20),
-                    'budget': int(desired_count * 0.50),
-                    'min_similarity': 0.65,
-                    'n_per_base': 20
-                })
-                
-                # Tier 2: Broad on top 50 (50% of budget)
-                search_strategy.append({
-                    'tier': 'Tier 2 (Broad)',
-                    'molecules': top_pool_df.head(50),
-                    'budget': int(desired_count * 0.50),
-                    'min_similarity': 0.40,
-                    'n_per_base': 10
-                })
+                search_configs = [
+                    {'tier': 'Tier 1 (Medium)', 'n_mols': 20, 'budget': 0.50, 'min_sim': 0.65, 'n_per': 20},
+                    {'tier': 'Tier 2 (Broad)', 'n_mols': 50, 'budget': 0.50, 'min_sim': 0.40, 'n_per': 10},
+                ]
             
-            # Execute hierarchical search
-            for tier_config in search_strategy:
-                tier_name = tier_config['tier']
-                tier_molecules = tier_config['molecules']
-                tier_budget = tier_config['budget']
-                min_sim = tier_config['min_similarity']
-                n_per_base = tier_config['n_per_base']
+            # Execute hierarchical search using NEW API
+            for config in search_configs:
+                tier_name = config['tier']
+                n_mols = config['n_mols']
+                tier_budget = int(desired_count * config['budget'])
+                min_sim = config['min_sim']
+                n_per = config['n_per']
                 
                 bt.logging.info(
                     f"   {tier_name}: budget={tier_budget}, "
-                    f"min_similarity={min_sim}, n_per_base={n_per_base}"
+                    f"min_similarity={min_sim}, n_per_base={n_per}"
+                )
+                
+                # Get top N molecules for this tier
+                tier_molecules = top_pool_df.head(n_mols)
+                
+                # ✅ Use NEW API from molecules_base.py
+                tier_df = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    tier_molecules,
+                    n_samples=tier_budget,
+                    min_similarity=min_sim,
+                    n_per_base=n_per
                 )
                 
                 tier_count = 0
-                
-                for _, base_mol in tier_molecules.iterrows():
-                    if tier_count >= tier_budget:
-                        break
+                for _, row in tier_df.iterrows():
+                    mol_name = row['name']
                     
-                    base_smiles = base_mol.get('smiles')
-                    if not base_smiles:
+                    if mol_name in self.generated_molecule_names:
                         continue
                     
-                    # Get similar synthons
-                    similar_synthons = self.synthon_lib.get_similar_synthons(
-                        base_smiles,
-                        min_similarity=min_sim,
-                        max_results=n_per_base
-                    )
-                    
-                    if not similar_synthons:
-                        continue
-                    
-                    # Generate molecules from similar synthons
-                    for synthon_smiles, similarity in similar_synthons:
+                    try:
+                        smiles = get_smiles_from_reaction(mol_name)
+                        if not smiles:
+                            continue
+                        
+                        mol = Chem.MolFromSmiles(smiles)
+                        if mol is None:
+                            continue
+                        
+                        inchikey = generate_inchikey(smiles)
+                        if not inchikey:
+                            continue
+                        
+                        new_molecules.append({
+                            'name': mol_name,
+                            'smiles': smiles,
+                            'InChIKey': inchikey,
+                            'type': 'synthon',
+                            'similarity': None  # Not tracked in new API
+                        })
+                        
+                        self.generated_molecule_names.add(mol_name)
+                        tier_count += 1
+                        
                         if tier_count >= tier_budget:
                             break
-                        
-                        if synthon_smiles in attempted_smiles:
-                            continue
-                        
-                        attempted_smiles.add(synthon_smiles)
-                        
-                        try:
-                            # Create molecule name from synthon
-                            mol_name = f"synthon:{self.rxn_id}:{hash(synthon_smiles) % 1000000}"
-                            
-                            if mol_name in self.generated_molecule_names:
-                                continue
-                            
-                            # Validate SMILES
-                            mol = Chem.MolFromSmiles(synthon_smiles)
-                            if mol is None:
-                                continue
-                            
-                            inchikey = generate_inchikey(synthon_smiles)
-                            if not inchikey:
-                                continue
-                            
-                            new_molecules.append({
-                                'name': mol_name,
-                                'smiles': synthon_smiles,
-                                'InChIKey': inchikey,
-                                'type': 'synthon',
-                                'similarity': similarity
-                            })
-                            
-                            self.generated_molecule_names.add(mol_name)
-                            tier_count += 1
-                        
-                        except Exception as e:
-                            bt.logging.debug(f"Error processing synthon: {e}")
-                            continue
+                    
+                    except Exception as e:
+                        bt.logging.debug(f"Error processing synthon molecule: {e}")
+                        continue
                 
                 bt.logging.info(f"   {tier_name}: Generated {tier_count}/{tier_budget} molecules")
             
@@ -1013,194 +936,159 @@ def load_molecules_from_csv_with_validation(
         bt.logging.error(f"Error loading molecules from CSV: {e}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
-async def collect_and_process_submissions(state: Dict[str, Any], start_epoch: int, csv_path: str, config: Dict[str, Any]) -> pd.DataFrame:
+async def load_submissions_from_csv(
+    state: Dict[str, Any],
+    csv_path: str,
+    start_epoch: int,
+    rxn_id: int,
+    config: Dict[str, Any]
+) -> pd.DataFrame:
     """
-    Collect submissions using prepare_training_data.py and process CSV.
+    Load submissions directly from CSV file (no collection).
     
-    Optimized to only collect new epochs:
-    1. Check latest epoch in CSV
-    2. Only collect from (latest_epoch + 1) to latest (or from start_epoch if CSV is empty)
-    3. Load CSV and deduplicate (remove duplicates)
-    4. Filter for rxn:5 molecules
-    5. Sort by score and return top 200
+    Args:
+        state: Miner state dictionary
+        csv_path: Path to CSV file
+        start_epoch: Minimum epoch to include
+        rxn_id: Reaction ID to filter
+        config: Configuration dictionary
+        
+    Returns:
+        DataFrame with top 200 molecules
     """
-    import subprocess
-    
-    # Check current state of CSV to determine where to start collecting
-    latest_epoch_in_csv = None
-    num_rows_before = 0
-    actual_start_epoch = start_epoch  # Default to provided start_epoch
-    
-    if os.path.exists(csv_path):
-        try:
-            df_before = pd.read_csv(csv_path)
-            num_rows_before = len(df_before)
-            if 'epoch' in df_before.columns and not df_before['epoch'].isna().all():
-                latest_epoch_in_csv = int(df_before['epoch'].max())
-                # Start collecting from the next epoch after the latest in CSV
-                actual_start_epoch = max(start_epoch, latest_epoch_in_csv + 1)
-                bt.logging.info(f"   CSV before: {num_rows_before} rows, latest epoch: {latest_epoch_in_csv}")
-                bt.logging.info(f"   Will collect from epoch {actual_start_epoch} (CSV has up to {latest_epoch_in_csv})")
-            else:
-                bt.logging.info(f"   CSV exists but has no epoch data, starting from {start_epoch}")
-        except Exception as e:
-            bt.logging.debug(f"Could not read CSV before collection: {e}, starting from {start_epoch}")
-    else:
-        bt.logging.info(f"   CSV does not exist, will create new one starting from epoch {start_epoch}")
-    
-    # If CSV already has the latest data, skip collection
-    if latest_epoch_in_csv is not None:
-        # We'll still run the script to check for newer epochs, but it will be fast if nothing new
-        bt.logging.info(f"📥 Collecting submissions from epoch {actual_start_epoch} (CSV has up to {latest_epoch_in_csv})...")
-    else:
-        bt.logging.info(f"📥 Collecting submissions from epoch {actual_start_epoch}...")
-    
-    # Run prepare_training_data.py (now in neurons/ folder)
-    script_path = os.path.join(BASE_DIR, 'neurons', 'prepare_training_data.py')
-    if not os.path.exists(script_path):
-        bt.logging.error(f"prepare_training_data.py not found at {script_path}")
+    if not os.path.exists(csv_path):
+        bt.logging.warning(f"CSV file not found at {csv_path}")
         return pd.DataFrame()
     
-    # Script needs to be run from BASE_DIR (nova-copy) so it can find:
-    # 1. The script itself (neurons/prepare_training_data.py)
-    # 2. The data directory (data/)
-    if not os.path.exists(BASE_DIR):
-        bt.logging.error(f"BASE_DIR not found at {BASE_DIR}")
-        return pd.DataFrame()
-    
-    # Use absolute path for output to avoid path issues
-    csv_path_abs = os.path.abspath(csv_path)
-    
-    # Get current epoch and calculate end_epoch (current_epoch - 2)
     try:
-        current_block = await state['subtensor'].get_current_block()
-        current_epoch = current_block // state['epoch_length']
-        end_epoch = current_epoch - 2  # Latest is current_epoch - 2
-        # Ensure end_epoch is at least as large as actual_start_epoch
-        if end_epoch < actual_start_epoch:
-            bt.logging.warning(f"   Calculated end_epoch ({end_epoch}) < start_epoch ({actual_start_epoch}), using start_epoch as end")
-            end_epoch = actual_start_epoch
-        bt.logging.info(f"   Current epoch: {current_epoch}, will collect up to epoch {end_epoch} (current - 2)")
-    except Exception as e:
-        bt.logging.warning(f"Could not get current epoch: {e}, will let script find latest epoch")
-        end_epoch = None
-    
-    try:
-        # Run the script starting from actual_start_epoch (will only collect new epochs)
-        # Run from BASE_DIR so it can find the data directory
-        bt.logging.info(f"   Running prepare_training_data.py from {BASE_DIR}")
-        if end_epoch is not None:
-            bt.logging.info(f"   Collecting from epoch {actual_start_epoch} to {end_epoch} (current_epoch - 2), output: {csv_path_abs}")
-            script_args = ['python3', script_path, '--start_epoch', str(actual_start_epoch), '--end_epoch', str(end_epoch), '--output', csv_path_abs]
+        bt.logging.info(f"📂 Loading molecules from {csv_path}...")
+        df = pd.read_csv(csv_path)
+        
+        # Filter by epoch
+        if 'epoch' in df.columns:
+            df = df[df['epoch'] >= start_epoch]
+            bt.logging.info(f"   Filtered to epoch >= {start_epoch}: {len(df)} rows")
         else:
-            bt.logging.info(f"   Collecting from epoch {actual_start_epoch} to latest, output: {csv_path_abs}")
-            script_args = ['python3', script_path, '--start_epoch', str(actual_start_epoch), '--output', csv_path_abs]
-        
-        result = subprocess.run(
-            script_args,
-            cwd=BASE_DIR,  # Run from BASE_DIR (nova-copy) so paths work correctly
-            capture_output=True,
-            text=True,
-            timeout=1800  # 30 minute timeout (collecting many epochs can take time)
-        )
-        
-        # Always log output for debugging (not just on error)
-        if result.stdout:
-            bt.logging.info(f"prepare_training_data.py stdout:\n{result.stdout}")
-        if result.stderr:
-            bt.logging.warning(f"prepare_training_data.py stderr:\n{result.stderr}")
-        
-        if result.returncode != 0:
-            bt.logging.error(f"prepare_training_data.py failed with return code {result.returncode}")
-            bt.logging.error(f"stderr: {result.stderr}")
-            if result.stdout:
-                bt.logging.error(f"stdout: {result.stdout}")
+            bt.logging.warning("CSV file does not have 'epoch' column")
             return pd.DataFrame()
         
-        bt.logging.info(f"✅ prepare_training_data.py completed successfully")
-        
-    except subprocess.TimeoutExpired as e:
-        bt.logging.error(f"prepare_training_data.py timed out after 1800 seconds (30 minutes)")
-        bt.logging.error(f"This might indicate the collection is taking longer than expected, or there's an issue with the API")
-        return pd.DataFrame()
-    except Exception as e:
-        bt.logging.error(f"Error running prepare_training_data.py: {e}")
-        import traceback
-        bt.logging.error(traceback.format_exc())
-        return pd.DataFrame()
-    
-    # Load and process CSV (use absolute path)
-    if not os.path.exists(csv_path_abs):
-        bt.logging.warning(f"CSV file not created at {csv_path_abs}")
-        bt.logging.warning(f"   Script may have failed or output path was incorrect")
-        return pd.DataFrame()
-    
-    try:
-        df = pd.read_csv(csv_path_abs)
-        num_rows_after = len(df)
-        latest_epoch_after = None
-        if 'epoch' in df.columns:
-            latest_epoch_after = int(df['epoch'].max()) if not df['epoch'].isna().all() else None
-        
-        # Verify CSV was updated
-        rows_added = num_rows_after - num_rows_before
-        if rows_added > 0:
-            bt.logging.info(f"✅ CSV updated: +{rows_added} rows (before: {num_rows_before}, after: {num_rows_after})")
-        if latest_epoch_after and latest_epoch_in_csv and latest_epoch_after > latest_epoch_in_csv:
-            bt.logging.info(f"✅ CSV updated: latest epoch {latest_epoch_in_csv} → {latest_epoch_after} (collected epochs {actual_start_epoch} to {latest_epoch_after})")
-        elif latest_epoch_after == latest_epoch_in_csv and latest_epoch_after is not None:
-            bt.logging.info(f"ℹ️  CSV already up to date (latest epoch: {latest_epoch_after}, no new epochs to collect)")
-        elif latest_epoch_after is None:
-            bt.logging.info(f"📊 Loaded {num_rows_after} rows from CSV (no epoch column found)")
-        else:
-            bt.logging.info(f"📊 Loaded {num_rows_after} rows from CSV")
-        
-        # Since prepare_training_data appends the whole result, remove duplicates and rewrite
-        original_len = len(df)
+        # Filter by reaction ID
         if 'molecule_name' in df.columns:
-            df = df.drop_duplicates(subset=['molecule_name'], keep='last')
-            if len(df) < original_len:
-                bt.logging.info(f"   Removed {original_len - len(df)} duplicates, rewriting CSV...")
-                # Rewrite CSV without duplicates
-                df.to_csv(csv_path, index=False)
-                bt.logging.info(f"   ✅ Rewrote CSV with {len(df)} unique rows")
-            else:
-                bt.logging.info(f"   No duplicates found ({len(df)} rows)")
-        
-        # Filter for rxn:5 molecules only
-        df = df[df['molecule_name'].str.startswith('rxn:5:', na=False)]
-        bt.logging.info(f"   After filtering rxn:5: {len(df)} rows")
+            df = df[df['molecule_name'].str.startswith(f"rxn:{rxn_id}:", na=False)]
+            bt.logging.info(f"   Filtered to rxn:{rxn_id}: {len(df)} rows")
+        else:
+            bt.logging.warning("CSV file does not have 'molecule_name' column")
+            return pd.DataFrame()
         
         if df.empty:
-            bt.logging.warning("No rxn:5 molecules found in CSV")
+            bt.logging.info("No matching molecules found in CSV")
             return pd.DataFrame()
-
-        for name in df['molecule_name']:
-            smiles = get_smiles_from_reaction(name)
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                bt.logging.warning(f"❌ Molecule {mol} is not a valid SMILES. Not submitting.")
-                df = df[df['molecule_name'] != name]
-            if contains_atom_type(mol, config.banned_atom_types):
-                bt.logging.warning(f"❌ Molecule {mol} contains banned atom types. Not submitting.")
-                df = df[df['molecule_name'] != name]
         
-        # Sort by final_score descending
-        if 'final_score' in df.columns:
-            df = df.sort_values(by='final_score', ascending=False, na_position='last')
-            bt.logging.info(f"   Sorted by final_score")
+        # Remove duplicates
+        original_len = len(df)
+        df = df.drop_duplicates(subset=['molecule_name'], keep='last')
+        if len(df) < original_len:
+            bt.logging.info(f"   Removed {original_len - len(df)} duplicates")
+        
+        # Validate molecules
+        result_rows = []
+        successful_count = 0
+        failed_count = 0
+        banned_atom_count = 0
+        heavy_atom_count = 0
+        
+        for _, row in df.iterrows():
+            molecule_name = row['molecule_name']
+            
+            try:
+                smiles = get_smiles_from_reaction(molecule_name)
+                if not smiles:
+                    failed_count += 1
+                    continue
+                
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    failed_count += 1
+                    continue
+                
+                # Check banned atoms
+                banned_atoms = config.get('banned_atom_types', [])
+                if banned_atoms and contains_atom_type(mol, banned_atoms):
+                    banned_atom_count += 1
+                    continue
+                
+                # Check heavy atom count
+                min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                heavy_atom_count_val = get_heavy_atom_count(smiles)
+                if heavy_atom_count_val < min_heavy_atoms:
+                    heavy_atom_count += 1
+                    continue
+                
+                inchikey = generate_inchikey(smiles)
+                if not inchikey:
+                    failed_count += 1
+                    continue
+                
+                final_score = row.get('final_score', None)
+                if pd.isna(final_score):
+                    final_score = None
+                else:
+                    final_score = float(final_score)
+                
+                result_rows.append({
+                    'name': molecule_name,
+                    'smiles': smiles,
+                    'InChIKey': inchikey,
+                    'score': final_score,
+                })
+                successful_count += 1
+                
+            except Exception as e:
+                bt.logging.debug(f"Could not process {molecule_name}: {e}")
+                failed_count += 1
+                continue
+        
+        if not result_rows:
+            bt.logging.warning(
+                f"No valid molecules loaded from CSV "
+                f"(successful: {successful_count}, failed: {failed_count}, "
+                f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
+            )
+            return pd.DataFrame()
+        
+        result_df = pd.DataFrame(result_rows)
+        result_df = result_df.drop_duplicates(subset=['InChIKey'], keep='first')
+        
+        # Sort by score
+        if 'score' in result_df.columns:
+            result_df = result_df.sort_values(by='score', ascending=False, na_position='last')
         
         # Take top 200
-        top_200 = df.head(200)
-        bt.logging.info(f"✅ Selected top 200 molecules (scores: {top_200['final_score'].head(5).tolist() if 'final_score' in top_200.columns else 'N/A'})")
+        top_200 = result_df.head(200)
         
+        bt.logging.info(
+            f"✅ Loaded {len(result_df)} valid molecules from CSV "
+            f"(successful: {successful_count}, failed: {failed_count}, "
+            f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
+        )
+        
+        if len(top_200) > 0 and 'score' in top_200.columns:
+            scores = top_200['score'].dropna()
+            if len(scores) > 0:
+                bt.logging.info(
+                    f"   Score range: {scores.min():.6f} to {scores.max():.6f} "
+                    f"(top 3: {scores.head(3).tolist()})"
+                )
+        
+        bt.logging.info(f"✅ Selected top 200 molecules")
         return top_200
         
     except Exception as e:
-        bt.logging.error(f"Error processing CSV: {e}")
+        bt.logging.error(f"Error loading molecules from CSV: {e}")
         import traceback
         bt.logging.error(traceback.format_exc())
         return pd.DataFrame()
+
 
 async def score_molecules_with_boltz_batched(
     state: Dict[str, Any],
@@ -1569,11 +1457,10 @@ async def startup_phase(state: Dict[str, Any]) -> None:
     Startup phase:
     1. Initialize score_results database
     2. Import and initialize BoltzWrapper
-    3. Collect submissions (creates/updates CSV)
-    4. Load molecules from CSV with validation
-    5. Prepare top_pool
+    3. Load molecules from CSV with validation
+    4. Prepare top_pool
     """
-    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz, Collect Submissions & Load CSV...")
+    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz, & Load CSV...")
     
     try:
         # Initialize score_results database
@@ -1581,7 +1468,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         init_score_results_db()
         bt.logging.info(f"✅ Score results database initialized")
         
-        # NEW: Initialize hybrid generator
+        # Initialize hybrid generator
         bt.logging.info("🧬 Initializing HybridMoleculeGenerator...")
         hybrid_generator = HybridMoleculeGenerator(HARDCODED_RXN_ID, DB_PATH)
         
@@ -1596,7 +1483,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         # Store generator in state
         state['hybrid_generator'] = hybrid_generator
 
-        # Log validation config from config.yaml
+        # Log validation config
         config = state['config']
         bt.logging.info(
             f"✅ Loaded validation config from config.yaml:"
@@ -1625,130 +1512,28 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             bt.logging.warning("⚠️  BoltzWrapper not available, scoring will be skipped")
             state['boltz_wrapper'] = None
         
-        # Collect submissions FIRST (this creates/updates the CSV)
-        bt.logging.info("📥 Collecting submissions from epoch...")
-        top_200_df = await collect_and_process_submissions(state, STARTING_EPOCH, REACTION_TRAIN_CSV, config)
+        # ✅ Load submissions directly from CSV (no collection)
+        bt.logging.info("📂 Loading submissions from CSV...")
+        top_200_df = await load_submissions_from_csv(
+            state,
+            REACTION_TRAIN_CSV,
+            STARTING_EPOCH,
+            HARDCODED_RXN_ID,
+            config
+        )
         
-        # Store top_200_df in state for use in adaptive GA loop
+        # Store top_200_df in state
         state['top_200_df'] = top_200_df
         
         if top_200_df.empty:
-            bt.logging.warning("⚠️  No submissions collected, CSV may be empty or outdated")
-            # Fallback: try loading from CSV anyway with validation
-            bt.logging.info("📂 Fallback: Loading molecules from CSV with validation...")
-            molecules_df = load_molecules_from_csv_with_validation(
-                REACTION_TRAIN_CSV,
-                state['current_challenge_targets'],
-                STARTING_EPOCH,
-                HARDCODED_RXN_ID,
-                config
-            )
-            if molecules_df.empty:
-                bt.logging.warning("No valid molecules loaded from CSV")
-                return
-            state['top_pool'] = molecules_df.copy()
-            state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-            state['top_200_df'] = molecules_df.head(200)
-        else:
-            bt.logging.info(f"✅ Collected {len(top_200_df)} top submissions")
-            
-            # Convert top_200_df to the format needed for top_pool (name, smiles, InChIKey, score)
-            # Apply validation during processing
-            bt.logging.info("🔄 Processing top 200 molecules for top_pool with validation...")
-            result_rows = []
-            successful_count = 0
-            failed_count = 0
-            banned_atom_count = 0
-            heavy_atom_count = 0
-            
-            for _, row in top_200_df.iterrows():
-                molecule_name = row['molecule_name']
-                final_score = row.get('final_score', None)
-                if pd.isna(final_score):
-                    final_score = None
-                else:
-                    final_score = float(final_score)
-                
-                try:
-                    smiles = get_smiles_from_reaction(molecule_name)
-                    if not smiles:
-                        bt.logging.debug(f"No SMILES found for {molecule_name}")
-                        failed_count += 1
-                        continue
-                    
-                    # Validate with RDKit
-                    mol = Chem.MolFromSmiles(smiles)
-                    if mol is None:
-                        bt.logging.debug(f"Cannot parse SMILES for {molecule_name}")
-                        failed_count += 1
-                        continue
-                    
-                    # Check banned atoms
-                    banned_atoms = config.get('banned_atom_types', [])
-                    if banned_atoms and contains_atom_type(mol, banned_atoms):
-                        bt.logging.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
-                        banned_atom_count += 1
-                        continue
-                    
-                    # Check heavy atom count
-                    min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                    heavy_atom_count_val = get_heavy_atom_count(smiles)
-                    if heavy_atom_count_val < min_heavy_atoms:
-                        bt.logging.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
-                        heavy_atom_count += 1
-                        continue
-                    
-                    inchikey = generate_inchikey(smiles)
-                    if not inchikey:
-                        bt.logging.debug(f"Could not generate InChIKey for {molecule_name}")
-                        failed_count += 1
-                        continue
-                    
-                    result_rows.append({
-                        'name': molecule_name,
-                        'smiles': smiles,
-                        'InChIKey': inchikey,
-                        'score': final_score,
-                    })
-                    successful_count += 1
-                    
-                except Exception as e:
-                    bt.logging.debug(f"Could not process {molecule_name}: {e}")
-                    failed_count += 1
-                    continue
-            
-            if result_rows:
-                molecules_df = pd.DataFrame(result_rows)
-                molecules_df = molecules_df.drop_duplicates(subset=['InChIKey'], keep='first')
-                # Sort by score descending (should already be sorted, but ensure it)
-                if 'score' in molecules_df.columns:
-                    molecules_df = molecules_df.sort_values(by='score', ascending=False, na_position='last')
-                
-                bt.logging.info(
-                    f"✅ Processed {len(molecules_df)} molecules from top 200 submissions "
-                    f"(successful: {successful_count}, failed: {failed_count}, "
-                    f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
-                )
-                
-                # Update state with top 200 from collected submissions
-                state['top_pool'] = molecules_df.copy()
-                state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-                state['top_200_df'] = molecules_df.head(200)
-            else:
-                bt.logging.warning("⚠️  Could not process any molecules from top 200, falling back to loading from CSV with validation...")
-                molecules_df = load_molecules_from_csv_with_validation(
-                    REACTION_TRAIN_CSV,
-                    state['current_challenge_targets'],
-                    STARTING_EPOCH,
-                    HARDCODED_RXN_ID,
-                    config
-                )
-                if molecules_df.empty:
-                    bt.logging.warning("No valid molecules loaded from CSV")
-                    return
-                state['top_pool'] = molecules_df.copy()
-                state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-                state['top_200_df'] = molecules_df.head(200)
+            bt.logging.warning("⚠️  No molecules loaded from CSV")
+            return
+        
+        bt.logging.info(f"✅ Loaded {len(top_200_df)} top molecules from CSV")
+        
+        # Update state with top molecules
+        state['top_pool'] = top_200_df.copy()
+        state['seen_inchikeys'].update(top_200_df['InChIKey'].tolist())
         
         bt.logging.info(
             f"✅ STARTUP COMPLETE:"
@@ -1950,12 +1735,12 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
                 bt.logging.info(f"{'='*70}")
                 
-                # Use existing top_200_df from startup if available
+                # ✅ Use existing top_200_df from startup (no re-loading needed)
                 if last_processed_epoch == -1 and 'top_200_df' in state and not state['top_200_df'].empty:
                     bt.logging.info("✅ Using top_200_df from startup phase")
                     top_200_df = state['top_200_df']
                 else:
-                    bt.logging.info("📥 Loading molecules for this epoch...")
+                    bt.logging.info("✅ Using existing top_200_df from state")
                     top_200_df = state.get('top_200_df', pd.DataFrame())
                 
                 if top_200_df.empty:
@@ -2124,7 +1909,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                         # First round: generate initial batch
                         bt.logging.info(f"🧬 Generating {desired_unique_count} unique molecules with validation...")
                         unique_molecules = await generate_unique_molecules_from_top200(
-                            state, top_200_df, desired_unique_count
+                            state, top_200_df, state['hybrid_generator'], desired_unique_count
                         )
                         
                         if not unique_molecules:
