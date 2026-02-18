@@ -1,7 +1,6 @@
 import os
 import sys
 import random
-import argparse
 import asyncio
 import datetime
 import tempfile
@@ -592,25 +591,6 @@ class HybridMoleculeGenerator:
         return new_molecules
 
 
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--target_protein', default='KRAS', help='Target protein for molecule generation')
-    parser.add_argument('--num_antitargets', type=int, default=0, help='Number of antitarget proteins')
-    
-    args = parser.parse_args()
-    
-    # Load config from config.yaml
-    config_dict = load_config()
-    
-    # Merge args and config
-    for key, value in config_dict.items():
-        if not hasattr(args, key):
-            setattr(args, key, value)
-    
-    return args
-
-
 def init_score_results_db(db_path: str = None) -> None:
     """Initialize/create the score_results.sqlite database."""
     if db_path is None:
@@ -765,20 +745,17 @@ def load_molecules_from_db_with_validation(
                 smiles = get_smiles_from_reaction(molecule_name)
                 
                 if not smiles:
-                    print(f"No SMILES found for {molecule_name}")
                     failed_count += 1
                     continue
                 
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None:
-                    print(f"Cannot parse SMILES for {molecule_name}")
                     failed_count += 1
                     continue
                 
                 # Check banned atoms
                 banned_atoms = config.get('banned_atom_types', [])
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
-                    print(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
                     continue
                 
@@ -786,13 +763,11 @@ def load_molecules_from_db_with_validation(
                 min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
-                    print(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
                     heavy_atom_count += 1
                     continue
                 
                 inchikey = generate_inchikey(smiles)
                 if not inchikey:
-                    print(f"Could not generate InChIKey for {molecule_name}")
                     failed_count += 1
                     continue
                 
@@ -805,7 +780,6 @@ def load_molecules_from_db_with_validation(
                 successful_count += 1
                 
             except Exception as e:
-                print(f"Could not process {molecule_name}: {e}")
                 failed_count += 1
                 continue
         
@@ -896,20 +870,17 @@ def load_molecules_from_csv_with_validation(
                 smiles = get_smiles_from_reaction(molecule_name)
                 
                 if not smiles:
-                    print(f"No SMILES found for {molecule_name}")
                     failed_count += 1
                     continue
                 
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None:
-                    print(f"Cannot parse SMILES for {molecule_name}")
                     failed_count += 1
                     continue
                 
                 # Check banned atoms
                 banned_atoms = config.get('banned_atom_types', [])
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
-                    print(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
                     continue
                 
@@ -917,13 +888,11 @@ def load_molecules_from_csv_with_validation(
                 min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
-                    print(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
                     heavy_atom_count += 1
                     continue
                 
                 inchikey = generate_inchikey(smiles)
                 if not inchikey:
-                    print(f"Could not generate InChIKey for {molecule_name}")
                     failed_count += 1
                     continue
                 
@@ -942,7 +911,6 @@ def load_molecules_from_csv_with_validation(
                 successful_count += 1
                 
             except Exception as e:
-                print(f"Could not process {molecule_name}: {e}")
                 failed_count += 1
                 continue
         
@@ -1259,13 +1227,13 @@ async def score_molecules_with_boltz_batched(
                 subnet_config = {
                     'weekly_target': primary_target,
                     'num_antitargets': len(antitarget_proteins),
-                    'binding_pocket': getattr(config, 'binding_pocket', None),
-                    'max_distance': getattr(config, 'max_distance', None),
-                    'force': getattr(config, 'force', False),
+                    'binding_pocket': config.get('binding_pocket'),
+                    'max_distance': config.get('max_distance'),
+                    'force': config.get('force', False),
                     'num_molecules_boltz': num_molecules_to_score,
-                    'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
-                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
-                    'sample_selection': getattr(config, 'sample_selection', 'first'),
+                    'boltz_metric': config.get('boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                    'combination_strategy': config.get('combination_strategy', 'heavy_atom_normalization'),
+                    'sample_selection': config.get('sample_selection', 'first'),
                 }
                 
                 final_block_hash = "0x" + "0" * 64
@@ -1767,15 +1735,27 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
             await asyncio.sleep(10)
 
 
-async def run_generator(config: argparse.Namespace) -> None:
+async def run_generator() -> None:
     """Main generation loop."""
     print("🚀 Starting molecule generator...")
     
+    # Load config from config.yaml
+    config_dict = load_config()
+    
+    # Get target protein from config
+    target_protein = config_dict.get('weekly_target', 'KRAS')
+    
+    print(f"Configuration loaded from config.yaml:")
+    print(f"  Target protein: {target_protein}")
+    print(f"  Reaction ID: {HARDCODED_RXN_ID}")
+    print(f"  Database: {DB_PATH}")
+    print(f"  Score DB: {SCORE_RESULTS_DB}")
+    
     state: Dict[str, Any] = {
-        'config': vars(config),
+        'config': config_dict,
         'startup_complete': False,
         'shutdown_event': asyncio.Event(),
-        'current_challenge_targets': [config.target_protein],
+        'current_challenge_targets': [target_protein],
         'current_challenge_antitargets': [],
         'rxn_id': HARDCODED_RXN_ID,
         'top_pool': pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"]),
@@ -1800,16 +1780,8 @@ async def run_generator(config: argparse.Namespace) -> None:
 
 def main():
     """Main entry point."""
-    config = parse_arguments()
-    
-    print(f"Configuration:")
-    print(f"  Target protein: {config.target_protein}")
-    print(f"  Reaction ID: {HARDCODED_RXN_ID}")
-    print(f"  Database: {DB_PATH}")
-    print(f"  Score DB: {SCORE_RESULTS_DB}")
-    
     try:
-        asyncio.run(run_generator(config))
+        asyncio.run(run_generator())
     except KeyboardInterrupt:
         print("\n🛑 Generator interrupted by user")
     except Exception as e:
@@ -1820,3 +1792,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

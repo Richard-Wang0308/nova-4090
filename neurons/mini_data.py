@@ -1266,12 +1266,13 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                         )
             
             # Summary for this round
+            best_score_str = f"{best_score_so_far:.6f}" if best_molecule_so_far else 'N/A'
             logger.info(
                 f"\n✅ Round {round_number} complete:"
                 f"\n   - Generated: {len(unique_molecules)} molecules"
                 f"\n   - Scored: {len(all_scored_molecules)} molecules"
                 f"\n   - Best molecule: {best_molecule_so_far['name'] if best_molecule_so_far else 'None'}"
-                f"\n   - Best score: {best_score_so_far:.6f if best_molecule_so_far else 'N/A'}"
+                f"\n   - Best score: {best_score_str}"
             )
             
             # Wait a bit before next round
