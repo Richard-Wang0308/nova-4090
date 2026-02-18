@@ -27,7 +27,7 @@ DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 20934
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "..", "nova-4090", "score_results.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -776,6 +776,133 @@ def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> 
         bt.logging.debug(f"Error batch getting scores from DB: {e}")
         return {}
 
+def load_molecules_from_db_with_validation(
+    db_path: str,
+    rxn_id: int,
+    config: Dict[str, Any] = None
+) -> pd.DataFrame:
+    """Load molecules from SQLite database with validation from config.yaml."""
+    if config is None:
+        config = {}
+    
+    if not os.path.exists(db_path):
+        bt.logging.warning(f"Database file not found at {db_path}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    
+    try:
+        bt.logging.info(
+            f"Loading molecules from database {db_path} for rxn_id={rxn_id}"
+        )
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Query all scored molecules
+        cursor.execute("SELECT molecule_name, score FROM scored_molecules")
+        db_results = cursor.fetchall()
+        conn.close()
+        
+        if not db_results:
+            bt.logging.info("No molecules found in database")
+            return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+        
+        result_rows = []
+        successful_count = 0
+        failed_count = 0
+        banned_atom_count = 0
+        heavy_atom_count = 0
+        wrong_rxn_id_count = 0
+        
+        for molecule_name, score in db_results:
+            try:
+                # Filter by rxn_id
+                if not molecule_name.startswith(f"rxn:{rxn_id}:"):
+                    wrong_rxn_id_count += 1
+                    continue
+                
+                smiles = get_smiles_from_reaction(molecule_name)
+                
+                if not smiles:
+                    bt.logging.debug(f"No SMILES found for {molecule_name}")
+                    failed_count += 1
+                    continue
+                
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    bt.logging.debug(f"Cannot parse SMILES for {molecule_name}")
+                    failed_count += 1
+                    continue
+                
+                # Check banned atoms
+                banned_atoms = config.get('banned_atom_types', [])
+                if banned_atoms and contains_atom_type(mol, banned_atoms):
+                    bt.logging.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
+                    banned_atom_count += 1
+                    continue
+                
+                # Check heavy atom count
+                min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                heavy_atom_count_val = get_heavy_atom_count(smiles)
+                if heavy_atom_count_val < min_heavy_atoms:
+                    bt.logging.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
+                    heavy_atom_count += 1
+                    continue
+                
+                inchikey = generate_inchikey(smiles)
+                if not inchikey:
+                    bt.logging.debug(f"Could not generate InChIKey for {molecule_name}")
+                    failed_count += 1
+                    continue
+                
+                result_rows.append({
+                    'name': molecule_name,
+                    'smiles': smiles,
+                    'InChIKey': inchikey,
+                    'score': float(score) if score is not None else None,
+                })
+                successful_count += 1
+                
+            except Exception as e:
+                bt.logging.debug(f"Could not process {molecule_name}: {e}")
+                failed_count += 1
+                continue
+        
+        result_df = pd.DataFrame(result_rows)
+        if not result_df.empty:
+            result_df = result_df.drop_duplicates(subset=['InChIKey'], keep='first')
+            
+            if 'score' in result_df.columns:
+                result_df = result_df.sort_values(by='score', ascending=False, na_position='last')
+                bt.logging.info(
+                    f"✅ Loaded {len(result_df)} molecules from database "
+                    f"(successful: {successful_count}, failed: {failed_count}, "
+                    f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count}, "
+                    f"wrong rxn_id: {wrong_rxn_id_count})"
+                )
+                if len(result_df) > 0:
+                    scores = result_df['score'].dropna()
+                    if len(scores) > 0:
+                        bt.logging.info(
+                            f"   Score range: {scores.min():.6f} to {scores.max():.6f} "
+                            f"(top 3: {scores.head(3).tolist()})"
+                        )
+        else:
+            bt.logging.warning(
+                f"No valid molecules loaded from database "
+                f"(successful: {successful_count}, failed: {failed_count}, "
+                f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count}, "
+                f"wrong rxn_id: {wrong_rxn_id_count})"
+            )
+        
+        return result_df
+        
+    except Exception as e:
+        bt.logging.error(f"Error loading molecules from database: {e}")
+        import traceback
+        bt.logging.error(traceback.format_exc())
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+
+
 def load_molecules_from_csv_with_validation(
     csv_path: str,
     target_proteins: List[str],
@@ -907,6 +1034,94 @@ def load_molecules_from_csv_with_validation(
     except Exception as e:
         bt.logging.error(f"Error loading molecules from CSV: {e}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+
+
+def load_molecules_combined(
+    csv_path: str,
+    db_path: str,
+    target_proteins: List[str],
+    starting_epoch: int,
+    rxn_id: int,
+    config: Dict[str, Any] = None
+) -> pd.DataFrame:
+    """
+    Load molecules from both CSV and database, merge them, and deduplicate.
+    When duplicates exist (by InChIKey), prefer the one with the higher score.
+    """
+    if config is None:
+        config = {}
+    
+    bt.logging.info(f"🔄 Loading molecules from CSV and database...")
+    
+    # Load from CSV
+    csv_df = load_molecules_from_csv_with_validation(
+        csv_path, target_proteins, starting_epoch, rxn_id, config
+    )
+    
+    # Load from database
+    db_df = load_molecules_from_db_with_validation(
+        db_path, rxn_id, config
+    )
+    
+    # Combine both dataframes
+    if csv_df.empty and db_df.empty:
+        bt.logging.warning("No molecules loaded from either CSV or database")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    
+    if csv_df.empty:
+        bt.logging.info("No molecules from CSV, using database only")
+        return db_df
+    
+    if db_df.empty:
+        bt.logging.info("No molecules from database, using CSV only")
+        return csv_df
+    
+    # Merge dataframes
+    # Add source column for tracking
+    csv_df['source'] = 'csv'
+    db_df['source'] = 'database'
+    
+    # Combine dataframes
+    combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    
+    # Deduplicate by InChIKey, keeping the one with the highest score
+    # If scores are equal, prefer database (more recent scoring)
+    combined_df = combined_df.sort_values(
+        by=['score', 'source'],
+        ascending=[False, True],  # Higher score first, then 'database' before 'csv'
+        na_position='last'
+    )
+    
+    # Keep first occurrence (highest score, or database if scores equal)
+    combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
+    
+    # Remove source column
+    combined_df = combined_df.drop(columns=['source'])
+    
+    # Sort by score
+    combined_df = combined_df.sort_values(by='score', ascending=False, na_position='last')
+    
+    csv_count = len(csv_df)
+    db_count = len(db_df)
+    combined_count = len(combined_df)
+    duplicates_removed = csv_count + db_count - combined_count
+    
+    bt.logging.info(
+        f"✅ Combined loading complete: "
+        f"{csv_count} from CSV, {db_count} from database, "
+        f"{combined_count} unique molecules after deduplication "
+        f"({duplicates_removed} duplicates removed)"
+    )
+    
+    if combined_count > 0:
+        scores = combined_df['score'].dropna()
+        if len(scores) > 0:
+            bt.logging.info(
+                f"   Combined score range: {scores.min():.6f} to {scores.max():.6f} "
+                f"(top 3: {scores.head(3).tolist()})"
+            )
+    
+    return combined_df
 
 async def score_molecules_with_boltz_batched(
     state: Dict[str, Any],
@@ -1275,10 +1490,10 @@ async def startup_phase(state: Dict[str, Any]) -> None:
     Startup phase:
     1. Initialize score_results database
     2. Import and initialize BoltzWrapper
-    3. Load molecules from CSV with validation (CSV is automatically updated every epoch)
+    3. Load molecules from CSV and database with validation (CSV is automatically updated every epoch)
     4. Prepare top_pool
     """
-    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz & Load CSV...")
+    bt.logging.info("🚀 Starting STARTUP phase: Initialize DB, Boltz & Load CSV/DB...")
     
     try:
         # Initialize score_results database
@@ -1315,10 +1530,11 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             bt.logging.warning("⚠️  BoltzWrapper not available, scoring will be skipped")
             state['boltz_wrapper'] = None
         
-        # Load molecules directly from CSV (CSV is automatically updated every epoch by prepare_training_data.py)
-        bt.logging.info("📂 Loading molecules from CSV with validation...")
-        molecules_df = load_molecules_from_csv_with_validation(
+        # Load molecules from both CSV and database (CSV is automatically updated every epoch by prepare_training_data.py)
+        bt.logging.info("📂 Loading molecules from CSV and database with validation...")
+        molecules_df = load_molecules_combined(
             REACTION_TRAIN_CSV,
+            SCORE_RESULTS_DB,
             state['current_challenge_targets'],
             STARTING_EPOCH,
             HARDCODED_RXN_ID,
@@ -1326,10 +1542,10 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         )
         
         if molecules_df.empty:
-            bt.logging.warning("⚠️  No valid molecules loaded from CSV")
+            bt.logging.warning("⚠️  No valid molecules loaded from CSV or database")
             return
         
-        # Get top 200 molecules (already sorted by score in load_molecules_from_csv_with_validation)
+        # Get top 200 molecules (already sorted by score in load_molecules_combined)
         top_200_df = molecules_df.head(200)
         
         # Store in state for use in adaptive GA loop
@@ -1337,7 +1553,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
         state['top_200_df'] = top_200_df
         
-        bt.logging.info(f"✅ Loaded {len(molecules_df)} molecules from CSV (top 200: {len(top_200_df)})")
+        bt.logging.info(f"✅ Loaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
         
         bt.logging.info(
             f"✅ STARTUP COMPLETE:"
@@ -1570,11 +1786,12 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info(f"🔄 Epoch changed: {last_processed_epoch} → {current_epoch}")
                 bt.logging.info(f"{'='*70}")
                 
-                # Reload molecules from CSV (CSV is automatically updated every epoch by prepare_training_data.py)
-                bt.logging.info("📂 Reloading molecules from CSV for new epoch...")
+                # Reload molecules from CSV and database (CSV is automatically updated every epoch by prepare_training_data.py)
+                bt.logging.info("📂 Reloading molecules from CSV and database for new epoch...")
                 config = state['config']
-                molecules_df = load_molecules_from_csv_with_validation(
+                molecules_df = load_molecules_combined(
                     REACTION_TRAIN_CSV,
+                    SCORE_RESULTS_DB,
                     state['current_challenge_targets'],
                     STARTING_EPOCH,
                     HARDCODED_RXN_ID,
@@ -1582,7 +1799,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 )
                 
                 if molecules_df.empty:
-                    bt.logging.warning("⚠️  No valid molecules loaded from CSV, skipping this epoch")
+                    bt.logging.warning("⚠️  No valid molecules loaded from CSV or database, skipping this epoch")
                     last_processed_epoch = current_epoch
                     state['last_processed_epoch'] = current_epoch
                     await asyncio.sleep(10)
@@ -1596,7 +1813,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
                 state['top_200_df'] = top_200_df
                 
-                bt.logging.info(f"✅ Reloaded {len(molecules_df)} molecules from CSV (top 200: {len(top_200_df)})")
+                bt.logging.info(f"✅ Reloaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
                 
                 # Calculate blocks until next epoch
                 next_epoch_block = (current_epoch + 1) * state['epoch_length']
