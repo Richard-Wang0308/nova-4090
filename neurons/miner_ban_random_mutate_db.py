@@ -71,10 +71,14 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = config.get('min_heavy_atoms', 10)
+        # min_atoms = config.get('min_heavy_atoms', 10)
+        min_atoms = config.get('min_heavy_atoms', 18)
+        max_atoms = config.get('max_heavy_atoms', 30)
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
+        if heavy_atom_count > max_atoms:
+            return False, f"Too many heavy atoms: {heavy_atom_count} > {max_atoms}"
         return True, ""
     except Exception as e:
         return False, f"Heavy atom count error: {str(e)}"
