@@ -67,8 +67,13 @@ def merge_databases(db1_path, db2_path, output_path):
                 unique_entries[score] = (scored_at, source)
             else:
                 # Keep the later timestamp for same score
+                # NoneType is always smaller than any other value
                 existing_time = unique_entries[score][0]
-                if scored_at > existing_time:
+                if existing_time is None:
+                    # If existing is None, always use the new one (if it's not None)
+                    if scored_at is not None:
+                        unique_entries[score] = (scored_at, source)
+                elif scored_at is not None and scored_at > existing_time:
                     unique_entries[score] = (scored_at, source)
         
         if len(unique_entries) == 1:
@@ -81,8 +86,13 @@ def merge_databases(db1_path, db2_path, output_path):
             scores = list(unique_entries.keys())
             avg_score = sum(scores) / len(scores)
             
-            # Get the latest timestamp
-            latest_time = max(unique_entries[s][0] for s in scores)
+            # Get the latest timestamp (NoneType is always smaller, so filter it out)
+            timestamps = [unique_entries[s][0] for s in scores if unique_entries[s][0] is not None]
+            if timestamps:
+                latest_time = max(timestamps)
+            else:
+                # All timestamps are None, use None
+                latest_time = None
             
             merged_data.append((mol_name, avg_score, latest_time))
     
