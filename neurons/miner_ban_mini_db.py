@@ -524,8 +524,14 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
                 to_insert.append((molecule_name, float(score)))
         
         if to_insert:
+            # Use INSERT ... ON CONFLICT to properly handle scored_at timestamp
+            # This will set scored_at to CURRENT_TIMESTAMP for new rows and update it for existing rows
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(molecule_name) DO UPDATE SET 
+                       score = excluded.score,
+                       scored_at = CURRENT_TIMESTAMP""",
                 to_insert
             )
             conn.commit()
