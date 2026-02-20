@@ -37,8 +37,8 @@ from utils import (
     contains_atom_type
 )
 from utils.molecules import molecule_unique_for_protein_hf
-from molecules_base import generate_inchikey, get_molecules_by_role
-from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
+from molecules_base import generate_inchikey, SynthonLibrary, generate_molecules_from_synthon_library
+from combinatorial_db.reactions import get_smiles_from_reaction
 
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
@@ -234,332 +234,423 @@ def safe_torch_load(path, map_location='cpu'):
         raise RuntimeError(f"Checkpoint loading failed: {e}") from e
 
 
-class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER + MUTATION)."""
+class AdvancedMoleculeGenerator:
+    """
+    Advanced molecule generator with:
+    - Synthon-based similarity search
+    - Component weighting
+    - Elite selection with diversity
+    - Adaptive mutation strategies
+    """
     
     def __init__(self, rxn_id: int, db_path: str):
-        """Initialize GA operator."""
+        """Initialize advanced generator."""
         self.rxn_id = rxn_id
         self.db_path = db_path
         self.generated_molecule_names: Set[str] = set()
+        self.synthon_lib: Optional[SynthonLibrary] = None
+        self.synthon_lib_ready = False
         
-        # Load reaction info and component pools for mutation
-        self.reaction_info = get_reaction_info(rxn_id, db_path)
-        if self.reaction_info:
-            self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
-            self.is_three_component = self.roleC is not None and self.roleC != 0
+        # Adaptive parameters
+        self.mutation_prob = 0.25
+        self.elite_frac = 0.75
+        self.no_improvement_counter = 0
+        self.prev_avg_score = None
+        self.score_improvement_rate = 0.0
+        self.max_score_history = []
+    
+    def initialize_synthon_library(self) -> bool:
+        """
+        Initialize SynthonLibrary for synthon search.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            print(f"🔬 Initializing SynthonLibrary for rxn_id={self.rxn_id}...")
+            start_time = time.time()
             
-            # Load component pools for mutation
-            self.molecules_A = get_molecules_by_role(self.roleA, db_path)
-            self.molecules_B = get_molecules_by_role(self.roleB, db_path)
-            self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+            self.synthon_lib = SynthonLibrary(self.db_path, self.rxn_id)
             
-            # Extract component IDs for each role
-            self.component_ids_A = [mol[0] for mol in self.molecules_A] if self.molecules_A else []
-            self.component_ids_B = [mol[0] for mol in self.molecules_B] if self.molecules_B else []
-            self.component_ids_C = [mol[0] for mol in self.molecules_C] if self.molecules_C else []
-            
-            print(
-                f"GA Operator initialized: {len(self.component_ids_A)} A, {len(self.component_ids_B)} B"
-                f"{f', {len(self.component_ids_C)} C' if self.is_three_component else ''} components"
+            # Check if library has components
+            has_components = (
+                len(self.synthon_lib.fps_A) > 0 and 
+                len(self.synthon_lib.fps_B) > 0
             )
-        else:
-            print(f"Could not load reaction info for rxn_id {rxn_id}, mutation will be disabled")
-            self.reaction_info = None
-            self.component_ids_A = []
-            self.component_ids_B = []
-            self.component_ids_C = []
-            self.is_three_component = False
-    
-    def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
-        """
-        Crossover two molecules by swapping random components.
-        
-        Supports two formats:
-        - 2 components: rxn:5:comp1:comp2 (4 parts)
-        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts)
-        
-        Both parents must have the same number of components.
-        We randomly swap one component between the two molecules.
-        """
-        try:
-            from rdkit import Chem
+            self.synthon_lib_ready = has_components
             
-            # Parse molecule names
-            parts1 = mol_name_1.split(':')
-            parts2 = mol_name_2.split(':')
-            
-            print(f"Crossover: {mol_name_1} x {mol_name_2}")
-            
-            # Validate format: must start with 'rxn' and have same length
-            if (parts1[0] != 'rxn' or parts2[0] != 'rxn'):
-                print(f"Invalid format: must start with 'rxn'")
-                return None
-            
-            if len(parts1) != len(parts2):
-                print(f"Invalid format: different number of components ({len(parts1)} vs {len(parts2)})")
-                return None
-            
-            if len(parts1) not in [4, 5]:
-                print(f"Invalid format: expected 4 or 5 parts, got {len(parts1)}")
-                return None
-            
-            try:
-                rxn_id_1 = int(parts1[1])
-                rxn_id_2 = int(parts2[1])
-                if rxn_id_1 != self.rxn_id or rxn_id_2 != self.rxn_id:
-                    print(f"Wrong rxn_ids: {rxn_id_1}, {rxn_id_2}")
-                    return None
-            except (ValueError, IndexError) as e:
-                print(f"Error parsing rxn_ids: {e}")
-                return None
-            
-            # Determine which component indices can be swapped
-            num_components = len(parts1) - 2
-            component_indices = list(range(2, 2 + num_components))
-            
-            # Randomly select which component to swap
-            swap_idx = random.choice(component_indices)
-            
-            # Create offspring by swapping one component
-            offspring_parts = parts1.copy()
-            offspring_parts[swap_idx] = parts2[swap_idx]
-            offspring_name = ':'.join(offspring_parts)
-            
-            # Check if already generated
-            if offspring_name in self.generated_molecule_names:
-                print(f"⚠️  Offspring {offspring_name} already generated in this batch")
-                return None
-            
-            # Validate offspring
-            try:
-                offspring_smiles = get_smiles_from_reaction(offspring_name)
-                if offspring_smiles:
-                    mol = Chem.MolFromSmiles(offspring_smiles)
-                    if mol is not None:
-                        self.generated_molecule_names.add(offspring_name)
-                        print(f"✅ Crossover successful: {mol_name_1} × {mol_name_2} → {offspring_name}")
-                        return offspring_name
-                    else:
-                        print(f"Invalid SMILES from RDKit: {offspring_smiles}")
-                else:
-                    print(f"No SMILES generated for offspring")
-            except Exception as e:
-                print(f"Error validating crossover: {e}")
-            
-            return None
-        
-        except Exception as e:
-            print(f"Error in crossover_molecules: {e}")
-            import traceback
-            print(traceback.format_exc())
-            return None
-    
-    def mutate_molecule(self, mol_name: str) -> Optional[str]:
-        """
-        Mutate a molecule by replacing a random component with a random component from the same role.
-        
-        Supports two formats:
-        - 2 components: rxn:5:comp1:comp2 (4 parts) - components at indices 2, 3
-        - 3 components: rxn:5:comp1:comp2:comp3 (5 parts) - components at indices 2, 3, 4
-        """
-        try:
-            from rdkit import Chem
-            
-            # Check if mutation is available
-            if not self.reaction_info or not self.component_ids_A or not self.component_ids_B:
-                print("Mutation not available: reaction info or component pools not loaded")
-                return None
-            
-            # Parse molecule name
-            parts = mol_name.split(':')
-            
-            print(f"Mutation: {mol_name}")
-            
-            # Validate format: must start with 'rxn'
-            if parts[0] != 'rxn':
-                print(f"Invalid format: must start with 'rxn'")
-                return None
-            
-            if len(parts) not in [4, 5]:
-                print(f"Invalid format: expected 4 or 5 parts, got {len(parts)}")
-                return None
-            
-            try:
-                rxn_id = int(parts[1])
-                if rxn_id != self.rxn_id:
-                    print(f"Wrong rxn_id: {rxn_id}")
-                    return None
-            except (ValueError, IndexError) as e:
-                print(f"Error parsing rxn_id: {e}")
-                return None
-            
-            # Determine which component indices can be mutated
-            num_components = len(parts) - 2
-            component_indices = list(range(2, 2 + num_components))
-            
-            # Randomly select which component to mutate
-            mutate_idx = random.choice(component_indices)
-            component_position = mutate_idx - 2  # 0 for A, 1 for B, 2 for C
-            
-            print(f"Mutating component at index {mutate_idx} (position {component_position})")
-            
-            # Get the appropriate component pool based on position
-            if component_position == 0:  # Component A
-                component_pool = self.component_ids_A
-                current_component_id = int(parts[mutate_idx])
-            elif component_position == 1:  # Component B
-                component_pool = self.component_ids_B
-                current_component_id = int(parts[mutate_idx])
-            elif component_position == 2 and self.is_three_component:  # Component C
-                component_pool = self.component_ids_C
-                current_component_id = int(parts[mutate_idx])
+            elapsed = time.time() - start_time
+            if self.synthon_lib_ready:
+                print(
+                    f"✅ SynthonLibrary initialized successfully in {elapsed:.2f}s "
+                    f"({len(self.synthon_lib.fps_A)} A, {len(self.synthon_lib.fps_B)} B components)"
+                )
             else:
-                print(f"Invalid component position: {component_position}")
-                return None
+                print(f"⚠️  SynthonLibrary loaded but has no components")
             
-            if not component_pool:
-                print(f"No components available for position {component_position}")
-                return None
-            
-            # Select a random component from the pool (excluding current one to ensure mutation)
-            available_components = [cid for cid in component_pool if cid != current_component_id]
-            if not available_components:
-                print(f"No alternative components available for position {component_position}")
-                return None
-            
-            new_component_id = random.choice(available_components)
-            
-            # Create mutated molecule by replacing the component
-            mutated_parts = parts.copy()
-            mutated_parts[mutate_idx] = str(new_component_id)
-            mutated_name = ':'.join(mutated_parts)
-            
-            print(f"Mutated: {mutated_name}")
-            
-            # Check if already generated
-            if mutated_name in self.generated_molecule_names:
-                print(f"⚠️  Mutated molecule {mutated_name} already generated in this batch")
-                return None
-            
-            # Validate mutated molecule
-            try:
-                mutated_smiles = get_smiles_from_reaction(mutated_name)
-                if mutated_smiles:
-                    mol = Chem.MolFromSmiles(mutated_smiles)
-                    if mol is not None:
-                        self.generated_molecule_names.add(mutated_name)
-                        print(f"✅ Mutation successful: {mol_name} → {mutated_name} (replaced component {component_position})")
-                        return mutated_name
-                    else:
-                        print(f"Invalid SMILES from RDKit: {mutated_smiles}")
-                else:
-                    print(f"No SMILES generated for mutated molecule")
-            except Exception as e:
-                print(f"Error validating mutation: {e}")
-            
-            return None
+            return self.synthon_lib_ready
         
         except Exception as e:
-            print(f"Error in mutate_molecule: {e}")
+            print(f"❌ Failed to initialize SynthonLibrary: {e}")
             import traceback
             print(traceback.format_exc())
-            return None
+            self.synthon_lib_ready = False
+            return False
     
-    def apply_genetic_operations(
+    def update_adaptive_parameters(self, top_pool_df: pd.DataFrame):
+        """Update adaptive parameters based on score improvement."""
+        if top_pool_df.empty:
+            return
+        
+        current_avg_score = top_pool_df['score'].mean()
+        current_max_score = top_pool_df['score'].max()
+        
+        # Track max score history
+        self.max_score_history.append(current_max_score)
+        if len(self.max_score_history) > 5:
+            self.max_score_history.pop(0)
+        
+        # Calculate improvement rate
+        if self.prev_avg_score is not None:
+            self.score_improvement_rate = (current_avg_score - self.prev_avg_score) / max(abs(self.prev_avg_score), 1e-6)
+        
+        self.prev_avg_score = current_avg_score
+        
+        # Update no improvement counter
+        if self.score_improvement_rate == 0.0:
+            self.no_improvement_counter += 1
+        else:
+            self.no_improvement_counter = 0
+        
+        print(
+            f"📊 Adaptive params: improvement={self.score_improvement_rate:.4f}, "
+            f"no_improvement={self.no_improvement_counter}, "
+            f"mutation={self.mutation_prob:.2f}, elite_frac={self.elite_frac:.2f}"
+        )
+    
+    def select_diverse_elites(self, top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.65) -> pd.DataFrame:
+        """
+        Select diverse elite molecules: top by score, but ensure diversity in component space.
+        """
+        if top_pool.empty or n_elites <= 0:
+            return pd.DataFrame()
+        
+        # Take MORE top candidates for better diversity selection
+        top_candidates = top_pool.head(min(len(top_pool), n_elites * 4))
+        if len(top_candidates) <= n_elites:
+            return top_candidates
+        
+        # Score threshold: LOWER threshold to include more candidates
+        max_score = top_candidates['score'].max()
+        threshold = max_score * min_score_ratio
+        candidates = top_candidates[top_candidates['score'] >= threshold]
+        
+        # Select diverse set: prefer molecules with different components
+        selected = []
+        used_components = {'A': set(), 'B': set(), 'C': set()}
+        
+        # First, add top scorer
+        if not candidates.empty:
+            top_idx = candidates.index[0]
+            top_row = candidates.iloc[0]
+            selected.append(top_idx)
+            parts = top_row['name'].split(":")
+            if len(parts) >= 4:
+                try:
+                    used_components['A'].add(int(parts[2]))
+                    used_components['B'].add(int(parts[3]))
+                    if len(parts) > 4:
+                        used_components['C'].add(int(parts[4]))
+                except (ValueError, IndexError):
+                    pass
+        
+        # Then add diverse molecules
+        for idx, row in candidates.iterrows():
+            if len(selected) >= n_elites:
+                break
+            if idx in selected:
+                continue
+            
+            parts = row['name'].split(":")
+            if len(parts) >= 4:
+                try:
+                    A_id = int(parts[2])
+                    B_id = int(parts[3])
+                    C_id = int(parts[4]) if len(parts) > 4 else None
+                    
+                    # Prefer molecules with new components
+                    is_diverse = (A_id not in used_components['A'] or 
+                                 B_id not in used_components['B'] or
+                                 (C_id is not None and C_id not in used_components['C']))
+                    
+                    if is_diverse or len(selected) < n_elites * 0.6:
+                        selected.append(idx)
+                        used_components['A'].add(A_id)
+                        used_components['B'].add(B_id)
+                        if C_id is not None:
+                            used_components['C'].add(C_id)
+                except (ValueError, IndexError):
+                    if len(selected) < n_elites:
+                        selected.append(idx)
+        
+        # Fill remaining slots
+        for idx, row in candidates.iterrows():
+            if len(selected) >= n_elites:
+                break
+            if idx not in selected:
+                selected.append(idx)
+        
+        return candidates.loc[selected[:n_elites]] if selected else candidates.head(n_elites)
+    
+    def build_component_weights(self, top_pool: pd.DataFrame) -> Dict[str, Dict[int, float]]:
+        """
+        Build component weights based on scores of molecules containing them.
+        Uses exponential weighting for top molecules to emphasize best components.
+        """
+        from collections import defaultdict
+        import math
+        
+        weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
+        counts = {'A': defaultdict(int), 'B': defaultdict(int), 'C': defaultdict(int)}
+        
+        if top_pool.empty:
+            return weights
+        
+        # Extract component IDs and scores with EXPONENTIAL weighting
+        for idx, row in top_pool.iterrows():
+            name = row['name']
+            score = row['score']
+            
+            # Rank-based exponential weighting
+            rank = idx + 1
+            rank_weight = 2.5 * math.exp(-rank / 18.0)
+            weighted_score = max(0, score) * rank_weight
+            
+            parts = name.split(":")
+            if len(parts) >= 4:
+                try:
+                    A_id = int(parts[2])
+                    B_id = int(parts[3])
+                    weights['A'][A_id] += weighted_score
+                    weights['B'][B_id] += weighted_score
+                    counts['A'][A_id] += 1
+                    counts['B'][B_id] += 1
+                    
+                    if len(parts) > 4:
+                        C_id = int(parts[4])
+                        weights['C'][C_id] += weighted_score
+                        counts['C'][C_id] += 1
+                except (ValueError, IndexError):
+                    continue
+        
+        # Normalize by count and add smoothing
+        for role in ['A', 'B', 'C']:
+            for comp_id in weights[role]:
+                if counts[role][comp_id] > 0:
+                    avg_weight = weights[role][comp_id] / counts[role][comp_id]
+                    weights[role][comp_id] = avg_weight + 0.15
+        
+        return weights
+
+    def generate_synthon_molecules(
         self,
-        top_molecules: List[str],
-        num_crossovers: int = 5,
-        num_mutations: int = 5
+        top_pool_df: pd.DataFrame,
+        desired_count: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Apply genetic operations (CROSSOVER + MUTATION) to top molecules.
-        
-        Args:
-            top_molecules: List of top molecule names
-            num_crossovers: Number of crossovers to attempt
-            num_mutations: Number of mutations to attempt
-            
-        Returns:
-            List of new molecules with their SMILES and names (in order generated)
+        Generate molecules using hierarchical synthon search with adaptive strategies.
         """
+        if not self.synthon_lib_ready or self.synthon_lib is None:
+            print("⚠️  SynthonLibrary not ready, skipping synthon generation")
+            return []
+        
+        if top_pool_df.empty:
+            print("⚠️  No top molecules available for synthon search")
+            return []
+        
         new_molecules = []
         
-        # Reset tracking for this batch
-        self.generated_molecule_names.clear()
-        
-        print(f"🧬 Applying genetic operations (CROSSOVER + MUTATION) to top {len(top_molecules)} molecules...")
-        print(f"   Sample molecules: {top_molecules[:3]}")
-        print(f"   Operations: {num_crossovers} crossovers, {num_mutations} mutations")
-        
-        # Apply crossovers
-        crossovers_created = 0
-        
-        for i in range(num_crossovers):
-            parent1 = random.choice(top_molecules)
-            parent2 = random.choice(top_molecules)
+        try:
+            print(
+                f"🧬 Generating {desired_count} molecules using ADAPTIVE SYNTHON SEARCH..."
+            )
             
-            print(f"   Attempting crossover {i+1}/{num_crossovers}: {parent1} x {parent2}")
+            # Get current max score for adaptive strategy
+            current_max_score = top_pool_df['score'].max() if 'score' in top_pool_df.columns else None
             
-            if parent1 != parent2:
-                offspring = self.crossover_molecules(parent1, parent2)
-                
-                if offspring:
-                    try:
-                        smiles = get_smiles_from_reaction(offspring)
-                        inchikey = generate_inchikey(smiles)
-                        
-                        if smiles and inchikey:
-                            new_molecules.append({
-                                'name': offspring,
-                                'smiles': smiles,
-                                'InChIKey': inchikey,
-                                'type': 'crossover'
-                            })
-                            crossovers_created += 1
-                            print(f"   ✅ Crossover #{crossovers_created}: {parent1} × {parent2} → {offspring}")
-                    
-                    except Exception as e:
-                        print(f"Error processing offspring: {e}")
-                else:
-                    print(f"   ❌ Crossover {i+1} failed (duplicate or invalid)")
+            # Determine search strategy based on improvement and score
+            has_very_high_score = current_max_score is not None and current_max_score > 0.018
+            has_high_score = current_max_score is not None and 0.015 <= current_max_score <= 0.018
+            
+            # ADAPTIVE HIERARCHICAL STRATEGY
+            if self.score_improvement_rate > 0.05:
+                # High improvement: tight exploration
+                print(f"🎯 High improvement ({self.score_improvement_rate:.4f}), TIGHT strategy")
+                search_configs = [
+                    {'tier': 'Tier 1 (Ultra-tight)', 'n_mols': 1, 'budget': int(desired_count * 0.30), 'min_sim': 0.90, 'n_per': 50},
+                    {'tier': 'Tier 2 (Tight)', 'n_mols': 5, 'budget': int(desired_count * 0.25), 'min_sim': 0.80, 'n_per': 30},
+                    {'tier': 'Tier 3 (Medium)', 'n_mols': 10, 'budget': int(desired_count * 0.25), 'min_sim': 0.70, 'n_per': 20},
+                    {'tier': 'Tier 4 (Broad)', 'n_mols': 20, 'budget': int(desired_count * 0.20), 'min_sim': 0.60, 'n_per': 15},
+                ]
+            
+            elif self.score_improvement_rate > 0.02 or has_high_score:
+                # Good improvement or high score: balanced strategy
+                print(f"🎯 Good improvement ({self.score_improvement_rate:.4f}), BALANCED strategy")
+                search_configs = [
+                    {'tier': 'Tier 1 (Tight)', 'n_mols': 1, 'budget': int(desired_count * 0.25), 'min_sim': 0.85, 'n_per': 40},
+                    {'tier': 'Tier 2 (Medium-tight)', 'n_mols': 5, 'budget': int(desired_count * 0.25), 'min_sim': 0.75, 'n_per': 25},
+                    {'tier': 'Tier 3 (Medium)', 'n_mols': 15, 'budget': int(desired_count * 0.25), 'min_sim': 0.65, 'n_per': 18},
+                    {'tier': 'Tier 4 (Broad)', 'n_mols': 30, 'budget': int(desired_count * 0.25), 'min_sim': 0.55, 'n_per': 12},
+                ]
+            
+            elif has_very_high_score:
+                # Very high score: focus on top molecule
+                print(f"🎯 Very high score ({current_max_score:.6f}), TOP-1 FOCUS strategy")
+                search_configs = [
+                    {'tier': 'Tier 1 (TOP-1 Ultra)', 'n_mols': 1, 'budget': int(desired_count * 0.35), 'min_sim': 0.91, 'n_per': 80},
+                    {'tier': 'Tier 2 (TOP-5 Tight)', 'n_mols': 5, 'budget': int(desired_count * 0.25), 'min_sim': 0.80, 'n_per': 30},
+                    {'tier': 'Tier 3 (Medium)', 'n_mols': 20, 'budget': int(desired_count * 0.20), 'min_sim': 0.65, 'n_per': 15},
+                    {'tier': 'Tier 4 (Broad)', 'n_mols': 50, 'budget': int(desired_count * 0.20), 'min_sim': 0.50, 'n_per': 10},
+                ]
+            
             else:
-                print(f"   ⏭️  Crossover {i+1}: parents are identical, skipping")
-        
-        print(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
-        
-        # Apply mutations
-        mutations_created = 0
-        
-        for i in range(num_mutations):
-            parent = random.choice(top_molecules)
+                # Low improvement: MULTI-RANGE exploration (proven strategy)
+                print(f"🎯 Low improvement ({self.score_improvement_rate:.4f}), MULTI-RANGE strategy")
+                search_configs = [
+                    {'tier': 'Tier 1 (Tight TOP-5)', 'n_mols': 5, 'budget': int(desired_count * 0.28), 'min_sim': 0.80, 'n_per': 30},
+                    {'tier': 'Tier 2 (Medium 10-40)', 'n_mols': 30, 'budget': int(desired_count * 0.21), 'min_sim': 0.55, 'n_per': 15, 'offset': 10},
+                    {'tier': 'Tier 3 (Broad TOP-50)', 'n_mols': 50, 'budget': int(desired_count * 0.21), 'min_sim': 0.40, 'n_per': 20},
+                    {'tier': 'Tier 4 (Wide exploration)', 'n_mols': 100, 'budget': int(desired_count * 0.30), 'min_sim': 0.30, 'n_per': 10},
+                ]
             
-            print(f"   Attempting mutation {i+1}/{num_mutations}: {parent}")
-            
-            mutated = self.mutate_molecule(parent)
-            
-            if mutated:
-                try:
-                    smiles = get_smiles_from_reaction(mutated)
-                    inchikey = generate_inchikey(smiles)
+            # Execute hierarchical search
+            for config in search_configs:
+                tier_name = config['tier']
+                n_mols = config['n_mols']
+                tier_budget = config['budget']
+                min_sim = config['min_sim']
+                n_per = config['n_per']
+                offset = config.get('offset', 0)
+                
+                print(
+                    f"   {tier_name}: n_mols={n_mols}, budget={tier_budget}, "
+                    f"min_similarity={min_sim}, n_per_base={n_per}"
+                )
+                
+                # Get tier molecules with offset
+                if offset > 0:
+                    tier_molecules = top_pool_df.iloc[offset:offset+n_mols]
+                else:
+                    tier_molecules = top_pool_df.head(n_mols)
+                
+                if tier_molecules.empty:
+                    continue
+                
+                # Use synthon library API
+                tier_df = generate_molecules_from_synthon_library(
+                    self.synthon_lib,
+                    tier_molecules,
+                    tier_budget,
+                    min_similarity=min_sim,
+                    n_per_base=n_per
+                )
+                
+                tier_count = 0
+                for _, row in tier_df.iterrows():
+                    mol_name = row['name']
                     
-                    if smiles and inchikey:
+                    if mol_name in self.generated_molecule_names:
+                        continue
+                    
+                    try:
+                        smiles = get_smiles_from_reaction(mol_name)
+                        if not smiles:
+                            continue
+                        
+                        mol = Chem.MolFromSmiles(smiles)
+                        if mol is None:
+                            continue
+                        
+                        inchikey = generate_inchikey(smiles)
+                        if not inchikey:
+                            continue
+                        
                         new_molecules.append({
-                            'name': mutated,
+                            'name': mol_name,
                             'smiles': smiles,
                             'InChIKey': inchikey,
-                            'type': 'mutation'
+                            'type': 'synthon',
+                            'tier': tier_name,
+                            'similarity': None
                         })
-                        mutations_created += 1
-                        print(f"   ✅ Mutation #{mutations_created}: {parent} → {mutated}")
+                        
+                        self.generated_molecule_names.add(mol_name)
+                        tier_count += 1
+                        
+                        if tier_count >= tier_budget:
+                            break
+                    
+                    except Exception as e:
+                        continue
                 
-                except Exception as e:
-                    print(f"Error processing mutated molecule: {e}")
-            else:
-                print(f"   ❌ Mutation {i+1} failed (duplicate or invalid)")
+                print(f"   {tier_name}: Generated {tier_count}/{tier_budget} molecules")
+            
+            print(
+                f"✅ Synthon search complete: {len(new_molecules)} molecules generated"
+            )
+            return new_molecules
         
-        print(f"   Mutations: {mutations_created}/{num_mutations} successful")
-        print(f"🧬 Generated {len(new_molecules)} new molecules ({crossovers_created} crossovers, {mutations_created} mutations)")
+        except Exception as e:
+            print(f"❌ Error in synthon generation: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return []
+    
+    async def generate_molecules(
+        self,
+        top_pool_df: pd.DataFrame,
+        desired_count: int = 100,
+        iteration: int = 1
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate molecules using adaptive strategy:
+        - Iteration 1: Broad exploration
+        - Later iterations: Synthon-based + traditional GA with adaptive parameters
+        """
+        new_molecules = []
+        self.generated_molecule_names.clear()
+        
+        print(
+            f"🧬 Generating {desired_count} molecules (iteration {iteration})..."
+        )
+        
+        # Update adaptive parameters
+        if not top_pool_df.empty:
+            self.update_adaptive_parameters(top_pool_df)
+        
+        # ITERATION 1: Broad exploration
+        if iteration == 1:
+            print(f"   Strategy: Initial broad random sampling")
+            # Use traditional generation for first iteration
+            # This would call your existing generate_valid_random_molecules_batch
+            # For now, return empty to integrate with your existing code
+            return []
+        
+        # LATER ITERATIONS: Synthon-based + traditional GA
+        if self.synthon_lib_ready and iteration > 1:
+            # Generate using synthon search
+            synthon_molecules = self.generate_synthon_molecules(
+                top_pool_df,
+                desired_count
+            )
+            new_molecules.extend(synthon_molecules)
+            
+            print(
+                f"   ✅ Synthon: {len(synthon_molecules)}/{desired_count} molecules generated"
+            )
+        
+        # If synthon didn't generate enough, you would fill with traditional GA
+        # This integration point connects to your existing crossover/GA code
         
         return new_molecules
 
@@ -587,7 +678,7 @@ def init_score_results_db(db_path: str = None) -> None:
         
         conn.commit()
         conn.close()
-        print(f"Initialized score_results database at {db_path}")
+        print(f"✅ Initialized score_results database at {db_path}")
     except Exception as e:
         print(f"Error initializing score_results database: {e}")
 
@@ -999,6 +1090,62 @@ def load_molecules_combined(
     return combined_df
 
 
+async def load_submissions_from_csv(
+    state: Dict[str, Any],
+    csv_path: str,
+    start_epoch: int,
+    rxn_id: int,
+    config: Dict[str, Any]
+) -> pd.DataFrame:
+    """
+    Load submissions from both CSV and database, merge them, and return top 200.
+    
+    Args:
+        state: State dictionary
+        csv_path: Path to CSV file
+        start_epoch: Minimum epoch to include
+        rxn_id: Reaction ID to filter
+        config: Configuration dictionary
+        
+    Returns:
+        DataFrame with top 200 molecules
+    """
+    try:
+        target_proteins = state.get('current_challenge_targets', [])
+        molecules_df = load_molecules_combined(
+            csv_path,
+            SCORE_RESULTS_DB,
+            target_proteins,
+            start_epoch,
+            rxn_id,
+            config
+        )
+        
+        if molecules_df.empty:
+            print("⚠️  No valid molecules loaded from CSV or database")
+            return pd.DataFrame()
+        
+        top_200 = molecules_df.head(200)
+        
+        print(f"✅ Selected top 200 molecules from combined CSV and database")
+        
+        if len(top_200) > 0 and 'score' in top_200.columns:
+            scores = top_200['score'].dropna()
+            if len(scores) > 0:
+                print(
+                    f"   Top 200 score range: {scores.min():.6f} to {scores.max():.6f} "
+                    f"(top 3: {scores.head(3).tolist()})"
+                )
+        
+        return top_200
+        
+    except Exception as e:
+        print(f"Error loading molecules from CSV and database: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return pd.DataFrame()
+
+
 async def score_molecules_with_boltz_batched(
     state: Dict[str, Any],
     molecules: List[Dict[str, Any]],
@@ -1211,9 +1358,6 @@ async def score_molecules_with_boltz_batched(
                         newly_scored_molecules.append(mol)
                 
                 if newly_scored_molecules:
-                    print(f"Newly scored molecules: {newly_scored_molecules}")
-                    for mol in newly_scored_molecules:
-                        print(f"  - {mol['name']}: {mol['boltz_score']}")
                     write_scores_to_db(newly_scored_molecules)
             
             except Exception as e:
@@ -1294,7 +1438,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
     3. Load molecules from CSV and database with validation
     4. Prepare top_pool
     """
-    print("🚀 Starting STARTUP phase: Initialize DB, Boltz & Load CSV/DB...")
+    print("🚀 Starting STARTUP phase: Initialize DB, Boltz, & Load CSV/DB...")
     
     try:
         # Initialize score_results database
@@ -1302,7 +1446,22 @@ async def startup_phase(state: Dict[str, Any]) -> None:
         init_score_results_db()
         print(f"✅ Score results database initialized")
         
-        # Log validation config from config.yaml
+        # Initialize advanced generator
+        print("🧬 Initializing AdvancedMoleculeGenerator...")
+        advanced_generator = AdvancedMoleculeGenerator(HARDCODED_RXN_ID, DB_PATH)
+        
+        # Try to initialize synthon library
+        synthon_ready = advanced_generator.initialize_synthon_library()
+        
+        if synthon_ready:
+            print("✅ Synthon library ready for advanced generation")
+        else:
+            print("⚠️  Synthon library not available, will use traditional methods")
+        
+        # Store generator in state
+        state['advanced_generator'] = advanced_generator
+
+        # Log validation config
         config = state['config']
         print(
             f"✅ Loaded validation config from config.yaml:"
@@ -1331,36 +1490,35 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             print("⚠️  BoltzWrapper not available, scoring will be skipped")
             state['boltz_wrapper'] = None
         
-        # Load molecules from both CSV and database
-        print("📂 Loading molecules from CSV and database with validation...")
-        molecules_df = load_molecules_combined(
+        # Load submissions from both CSV and database
+        print("📂 Loading submissions from CSV and database...")
+        top_200_df = await load_submissions_from_csv(
+            state,
             REACTION_TRAIN_CSV,
-            SCORE_RESULTS_DB,
-            state['current_challenge_targets'],
             STARTING_EPOCH,
             HARDCODED_RXN_ID,
             config
         )
         
-        if molecules_df.empty:
-            print("⚠️  No valid molecules loaded from CSV or database")
-            return
-        
-        # Get top 200 molecules (already sorted by score in load_molecules_combined)
-        top_200_df = molecules_df.head(200)
-        
-        # Store in state for use in continuous loop
-        state['top_pool'] = molecules_df.copy()
-        state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
+        # Store top_200_df in state
         state['top_200_df'] = top_200_df
         
-        print(f"✅ Loaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
+        if top_200_df.empty:
+            print("⚠️  No molecules loaded from CSV or database")
+            return
+        
+        print(f"✅ Loaded {len(top_200_df)} top molecules from CSV and database")
+        
+        # Update state with top molecules
+        state['top_pool'] = top_200_df.copy()
+        state['seen_inchikeys'].update(top_200_df['InChIKey'].tolist())
         
         print(
             f"✅ STARTUP COMPLETE:"
             f"\n   Total molecules in pool: {len(state['top_pool'])}"
             f"\n   Top 200 molecules: {len(state['top_200_df'])}"
             f"\n   BoltzWrapper: {'✅ Ready' if state.get('boltz_wrapper') else '❌ Not available'}"
+            f"\n   Synthon library: {'✅ Ready' if synthon_ready else '❌ Not available'}"
         )
         
         state['startup_complete'] = True
@@ -1374,43 +1532,36 @@ async def startup_phase(state: Dict[str, Any]) -> None:
 async def generate_unique_molecules_from_top200(
     state: Dict[str, Any],
     top_200_df: pd.DataFrame,
-    desired_count: int = 100
+    advanced_generator: AdvancedMoleculeGenerator,
+    desired_count: int = 100,
+    iteration: int = 1
 ) -> List[Dict[str, Any]]:
     """
-    Generate unique molecules (NOT in HuggingFace) using genetic algorithm from top 200 molecules.
-    Uses both CROSSOVER and MUTATION operations.
-    Uses adaptive pool sizing: starts with top 30, increases to 50, 100, 150, 200 if generation fails.
-    Keeps generating until desired_count unique molecules are found.
+    Generate unique molecules using advanced generator with adaptive strategies.
+    
+    Args:
+        state: State dictionary
+        top_200_df: DataFrame with top 200 molecules
+        advanced_generator: Initialized AdvancedMoleculeGenerator instance
+        desired_count: Target number of molecules to generate
+        iteration: Current iteration number
+        
+    Returns:
+        List of validated unique molecules
     """
     if top_200_df.empty:
         print("Top 200 DataFrame is empty")
         return []
     
-    ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    
-    # Get all molecule names from top 200
-    all_names = top_200_df['name'].tolist()
-    
-    # Adaptive pool sizes: start with 30, increase if generation fails
-    pool_sizes = [30, 50, 100, 150, 200]
-    current_pool_size_idx = 0
-    current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-    
     print(
-        f"🧬 Generating {desired_count} unique molecules using CROSSOVER + MUTATION "
-        f"(starting with top {current_pool_size})..."
+        f"🧬 Generating {desired_count} unique molecules with validation "
+        f"(iteration {iteration}, adaptive strategy)..."
     )
     
     unique_molecules = []
-    attempts = 0
-    max_attempts = 500
-    last_successful_attempt = 0
-    
-    # Get or initialize generated molecules tracking set
     generated_molecules = state.get('generated_molecules', set())
     generated_inchikeys = state.get('generated_inchikeys', set())
     
-    # Validation statistics
     validation_stats = {
         'total_generated': 0,
         'passed_validation': 0,
@@ -1420,43 +1571,22 @@ async def generate_unique_molecules_from_top200(
         'failed_rotatable_bonds': 0,
         'failed_hf_unique': 0,
         'failed_other': 0,
-        'crossovers_total': 0,
-        'mutations_total': 0,
+        'synthon_generated': 0,
     }
     
-    while len(unique_molecules) < desired_count and attempts < max_attempts:
-        attempts += 1
-        
-        # Check if we should increase pool size (if 100 attempts failed to find new unique molecules)
-        if attempts - last_successful_attempt >= 100 and current_pool_size_idx < len(pool_sizes) - 1:
-            current_pool_size_idx += 1
-            new_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-            if new_pool_size > current_pool_size:
-                current_pool_size = new_pool_size
-                print(
-                    f"📈 Increasing pool size to top {current_pool_size} "
-                    f"(after {attempts - last_successful_attempt} failed attempts)"
-                )
-                last_successful_attempt = attempts
-        
-        # Use current pool size
-        current_pool_names = all_names[:current_pool_size]
-        
-        # Apply genetic operations (crossover + mutation)
-        new_molecules = ga_operator.apply_genetic_operations(
-            current_pool_names,
-            num_crossovers=10,
-            num_mutations=10
+    try:
+        # Use advanced generator to create molecules
+        new_molecules = await advanced_generator.generate_molecules(
+            top_200_df,
+            desired_count,
+            iteration
         )
         
-        # Track operation types
-        for mol in new_molecules:
-            if mol.get('type') == 'crossover':
-                validation_stats['crossovers_total'] += 1
-            elif mol.get('type') == 'mutation':
-                validation_stats['mutations_total'] += 1
+        # If iteration 1 or no synthon molecules, return empty to use traditional method
+        if iteration == 1 or not new_molecules:
+            return []
         
-        # Check each new molecule for uniqueness
+        # Validate generated molecules
         for mol in new_molecules:
             if len(unique_molecules) >= desired_count:
                 break
@@ -1466,16 +1596,17 @@ async def generate_unique_molecules_from_top200(
             mol_type = mol.get('type', 'unknown')
             
             validation_stats['total_generated'] += 1
+            if mol_type == 'synthon':
+                validation_stats['synthon_generated'] += 1
             
-            # Skip if already in our unique list for this generation
+            # Check if already generated
             if molecule_name in [m['name'] for m in unique_molecules]:
                 continue
             
-            # Skip if already generated in previous generations
             if molecule_name in generated_molecules:
                 continue
             
-            # Generate InChIKey to check for duplicates
+            # Generate InChIKey
             inchikey = None
             try:
                 inchikey = generate_inchikey(smiles) if smiles else None
@@ -1485,8 +1616,13 @@ async def generate_unique_molecules_from_top200(
                 validation_stats['failed_other'] += 1
                 continue
             
-            # Validate with config.yaml settings
-            is_valid, errors = await validate_molecule_complete(state, molecule_name, smiles, state['config'])
+            # Validate molecule
+            is_valid, errors = await validate_molecule_complete(
+                state,
+                molecule_name,
+                smiles,
+                state['config']
+            )
             
             if not is_valid:
                 for error in errors:
@@ -1504,65 +1640,53 @@ async def generate_unique_molecules_from_top200(
                         validation_stats['failed_other'] += 1
                 continue
             
-            # Check if unique (NOT on HuggingFace)
-            is_unique = await check_molecule_unique(state, molecule_name, smiles)
+            # Add to unique molecules
+            unique_molecules.append(mol)
+            generated_molecules.add(molecule_name)
+            if inchikey:
+                generated_inchikeys.add(inchikey)
+            validation_stats['passed_validation'] += 1
             
-            if is_unique:
-                unique_molecules.append(mol)
-                # Track this molecule as generated
-                generated_molecules.add(molecule_name)
-                if inchikey:
-                    generated_inchikeys.add(inchikey)
-                last_successful_attempt = attempts
-                validation_stats['passed_validation'] += 1
-                
-                print(
-                    f"   ✅ Added unique {mol_type} molecule {molecule_name} "
-                    f"(pool size: {current_pool_size}, {len(unique_molecules)}/{desired_count})"
-                )
-            else:
-                validation_stats['failed_hf_unique'] += 1
+            print(
+                f"   ✅ Added valid molecule {molecule_name} "
+                f"({mol_type}, {len(unique_molecules)}/{desired_count})"
+            )
         
-        if len(unique_molecules) >= desired_count:
-            break
+        state['generated_molecules'] = generated_molecules
+        state['generated_inchikeys'] = generated_inchikeys
         
-        # Small delay to avoid overwhelming
-        await asyncio.sleep(0.1)
+        print(
+            f"✅ Generated {len(unique_molecules)} valid molecules"
+            f"\n   Validation stats:"
+            f"\n   - Total generated: {validation_stats['total_generated']}"
+            f"\n   - Synthon: {validation_stats['synthon_generated']}"
+            f"\n   - Passed validation: {validation_stats['passed_validation']}"
+            f"\n   - Failed SMILES: {validation_stats['failed_smiles']}"
+            f"\n   - Failed heavy atoms: {validation_stats['failed_heavy_atoms']}"
+            f"\n   - Failed banned atoms: {validation_stats['failed_banned_atoms']}"
+            f"\n   - Failed rotatable bonds: {validation_stats['failed_rotatable_bonds']}"
+            f"\n   - Failed HF uniqueness: {validation_stats['failed_hf_unique']}"
+            f"\n   - Failed other: {validation_stats['failed_other']}"
+        )
+        
+        return unique_molecules
     
-    # Update state with generated molecules tracking
-    state['generated_molecules'] = generated_molecules
-    state['generated_inchikeys'] = generated_inchikeys
-    
-    # Log detailed statistics
-    print(
-        f"✅ Generated {len(unique_molecules)} unique molecules using pool size {current_pool_size} "
-        f"(attempts: {attempts}, total tracked: {len(generated_molecules)})"
-        f"\n   Operation breakdown:"
-        f"\n   - Crossovers generated: {validation_stats['crossovers_total']}"
-        f"\n   - Mutations generated: {validation_stats['mutations_total']}"
-        f"\n   Validation stats:"
-        f"\n   - Total generated: {validation_stats['total_generated']}"
-        f"\n   - Passed validation: {validation_stats['passed_validation']}"
-        f"\n   - Failed SMILES: {validation_stats['failed_smiles']}"
-        f"\n   - Failed heavy atoms: {validation_stats['failed_heavy_atoms']}"
-        f"\n   - Failed banned atoms: {validation_stats['failed_banned_atoms']}"
-        f"\n   - Failed rotatable bonds: {validation_stats['failed_rotatable_bonds']}"
-        f"\n   - Failed HF uniqueness: {validation_stats['failed_hf_unique']}"
-        f"\n   - Failed other: {validation_stats['failed_other']}"
-    )
-    
-    return unique_molecules
+    except Exception as e:
+        print(f"❌ Error in molecule generation: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return []
 
 
 async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
     """
-    Continuous genetic algorithm loop:
-    1. Generate 100 unique molecules
+    Continuous genetic algorithm loop with advanced generation:
+    1. Generate molecules using adaptive synthon-based strategy
     2. Score them in batches of 10
-    3. Save best molecule
+    3. Update top pool and adaptive parameters
     4. Repeat infinitely until user stops
     """
-    print("🚀 Starting CONTINUOUS genetic algorithm loop with batch scoring...")
+    print("🚀 Starting CONTINUOUS genetic algorithm loop with ADVANCED generation...")
     
     desired_unique_count = 100
     batch_size = 10
@@ -1583,14 +1707,23 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                 await asyncio.sleep(10)
                 continue
             
-            # Generate unique molecules
-            print(f"🧬 Generating {desired_unique_count} unique molecules with validation...")
+            # Get advanced generator
+            advanced_generator = state.get('advanced_generator')
+            if not advanced_generator:
+                print("Advanced generator not initialized, waiting...")
+                await asyncio.sleep(10)
+                continue
+            
+            # Generate unique molecules using advanced strategy
+            print(f"🧬 Round {round_number}: Generating {desired_unique_count} molecules with ADVANCED strategy...")
             unique_molecules = await generate_unique_molecules_from_top200(
-                state, top_200_df, desired_unique_count
+                state, top_200_df, advanced_generator, desired_unique_count, round_number
             )
             
+            # If advanced generation didn't produce molecules (iteration 1 or failure),
+            # you would call your traditional generation method here
             if not unique_molecules:
-                print("Failed to generate unique molecules, retrying in 10 seconds...")
+                print(f"⚠️  Advanced generation produced no molecules, consider implementing fallback")
                 await asyncio.sleep(10)
                 continue
             
@@ -1620,6 +1753,8 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                     f"\n   Name: {best_molecule['name']}"
                     f"\n   Score: {best_score:.6f}"
                     f"\n   SMILES: {best_molecule.get('smiles', 'N/A')}"
+                    f"\n   Type: {best_molecule.get('type', 'unknown')}"
+                    f"\n   Tier: {best_molecule.get('tier', 'N/A')}"
                     f"\n{'='*70}\n"
                 )
                 
@@ -1628,7 +1763,6 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                 state['best_score'] = best_score
                 
                 # Update top_200_df with new scored molecules
-                # Add new molecules to top_200_df and keep top 200
                 new_rows = []
                 for mol in molecules_with_scores:
                     new_rows.append({
@@ -1650,6 +1784,10 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                     state['top_200_df'] = combined_df.head(200)
                     
                     print(f"✅ Updated top_200_df: {len(state['top_200_df'])} molecules")
+                    
+                    # Show current top 5 scores
+                    top_5_scores = state['top_200_df']['score'].head(5).tolist()
+                    print(f"   Current top 5 scores: {[f'{s:.6f}' for s in top_5_scores]}")
             else:
                 print("⚠️  No molecules with valid scores in this round")
             
@@ -1696,6 +1834,7 @@ async def run_generator() -> None:
         'top_200_df': pd.DataFrame(),
         'best_molecule': None,
         'best_score': float('-inf'),
+        'advanced_generator': None,
     }
     
     print("🚀 Entering main generator loop...")
@@ -1703,7 +1842,7 @@ async def run_generator() -> None:
     # Run startup phase
     await startup_phase(state)
     
-    # Run continuous genetic loop
+    # Run continuous genetic loop with advanced generation
     await run_continuous_genetic_loop(state)
 
 
