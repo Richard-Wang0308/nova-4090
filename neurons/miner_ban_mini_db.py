@@ -71,10 +71,13 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = config.get('min_heavy_atoms', 10)
-        
+        # min_atoms = config.get('min_heavy_atoms', 10)
+        min_atoms = 18
+        max_atoms = 30
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
+        if heavy_atom_count > max_atoms:
+            return False, f"Too many heavy atoms: {heavy_atom_count} > {max_atoms}"
         return True, ""
     except Exception as e:
         return False, f"Heavy atom count error: {str(e)}"
@@ -465,13 +468,44 @@ def init_score_results_db(db_path: str = None) -> None:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
+        # Check if table exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='scored_molecules'
+        """)
+        table_exists = cursor.fetchone() is not None
+        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scored_molecules (
                 molecule_name TEXT PRIMARY KEY,
                 score REAL NOT NULL,
-                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                scored_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        
+        # If table already existed, check if scored_at column exists and has NULL values
+        if table_exists:
+            # Check if scored_at column exists
+            cursor.execute("PRAGMA table_info(scored_molecules)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'scored_at' not in columns:
+                # Add scored_at column if it doesn't exist
+                cursor.execute("""
+                    ALTER TABLE scored_molecules 
+                    ADD COLUMN scored_at TEXT DEFAULT (datetime('now'))
+                """)
+                bt.logging.info("Added scored_at column to existing table")
+            
+            # Backfill NULL scored_at values with current timestamp
+            cursor.execute("""
+                UPDATE scored_molecules 
+                SET scored_at = datetime('now') 
+                WHERE scored_at IS NULL
+            """)
+            rows_updated = cursor.rowcount
+            if rows_updated > 0:
+                bt.logging.info(f"Backfilled {rows_updated} NULL scored_at values")
         
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
@@ -526,14 +560,16 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         if to_insert:
             # Use INSERT ... ON CONFLICT to properly handle scored_at timestamp
             # This will set scored_at to CURRENT_TIMESTAMP for new rows and update it for existing rows
-            cursor.executemany(
-                """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
-                   VALUES (?, ?, CURRENT_TIMESTAMP)
-                   ON CONFLICT(molecule_name) DO UPDATE SET 
-                       score = excluded.score,
-                       scored_at = CURRENT_TIMESTAMP""",
-                to_insert
-            )
+            # Note: CURRENT_TIMESTAMP is a SQL function, not a parameter, so we execute individually
+            for molecule_name, score in to_insert:
+                cursor.execute(
+                    """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
+                       VALUES (?, ?, datetime('now'))
+                       ON CONFLICT(molecule_name) DO UPDATE SET 
+                           score = excluded.score,
+                           scored_at = datetime('now')""",
+                    (molecule_name, score)
+                )
             conn.commit()
             bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
