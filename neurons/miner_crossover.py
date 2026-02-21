@@ -1476,7 +1476,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
 async def generate_unique_molecules_from_top200(
     state: Dict[str, Any],
     top_200_df: pd.DataFrame,
-    desired_count: int = 500
+    desired_count: int = 100
 ) -> List[Dict[str, Any]]:
     """Generate unique molecules using genetic algorithm from top 500 molecules."""
     if top_200_df.empty:
@@ -1610,16 +1610,16 @@ async def generate_unique_molecules_from_top200(
 async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
     """
     Updated genetic algorithm loop with continuous generation:
-    1. When epoch changes, generate 500 unique molecules
+    1. When epoch changes, generate 100 unique molecules
     2. Score them in batches of 10, checking blocks remaining after each batch
     3. If blocks remaining < 50, submit best molecule and exit
-    4. If blocks remaining >= 50 after all batches, generate another round of 500 molecules and repeat
+    4. If blocks remaining >= 50 after all batches, generate another round of 100 molecules and repeat
     5. Continue until blocks remaining < 50, then submit
     """
     bt.logging.info("🚀 Starting ADAPTIVE genetic algorithm loop with continuous generation and batch scoring...")
     
     last_processed_epoch = state.get('last_processed_epoch', -1)
-    desired_unique_count = 500
+    desired_unique_count = 100
     
     while not state['shutdown_event'].is_set():
         try:
@@ -1666,7 +1666,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                 next_epoch_block = (current_epoch + 1) * state['epoch_length']
                 
                 # ✅ CONTINUOUS GENERATION AND SCORING LOOP
-                # Keep generating and scoring batches of 500 until we're within 50 blocks of next epoch
+                # Keep generating and scoring batches of 100 until we're within 50 blocks of next epoch
                 batch_size = 10
                 all_scored_molecules = []
                 best_molecule_so_far = None
@@ -1791,7 +1791,7 @@ async def run_adaptive_genetic_loop(state: Dict[str, Any]) -> None:
                             submitted = True
                             break
                     
-                    # If this is not the first round, generate another batch of 500 unique molecules
+                    # If this is not the first round, generate another batch of 100 unique molecules
                     if generation_round > 1:
                         bt.logging.info(
                             f"\n{'='*70}"
