@@ -1188,7 +1188,7 @@ async def load_submissions_from_csv(
             return pd.DataFrame()
         
         # Take top 200 (already sorted by score in load_molecules_combined)
-        top_200 = molecules_df.head(200)
+        top_200 = molecules_df.head(500)
         
         bt.logging.info(f"✅ Selected top 200 molecules from combined CSV and database")
         
