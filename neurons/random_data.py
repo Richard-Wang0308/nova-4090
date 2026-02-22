@@ -65,10 +65,14 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = config.get('min_heavy_atoms', 10)
+        # min_atoms = config.get('min_heavy_atoms', 10)
+        min_atoms = 18
+        max_atoms = 30
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
+        if heavy_atom_count > max_atoms:
+            return False, f"Too many heavy atoms: {heavy_atom_count} > {max_atoms}"
         return True, ""
     except Exception as e:
         return False, f"Heavy atom count error: {str(e)}"
@@ -733,9 +737,14 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check heavy atom count
-                min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                # min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                min_heavy_atoms = 18
+                max_heavy_atoms = 30
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
+                    heavy_atom_count += 1
+                    continue
+                if heavy_atom_count_val > max_heavy_atoms:
                     heavy_atom_count += 1
                     continue
                 
@@ -1347,7 +1356,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             return
         
         # Get top 200 molecules (already sorted by score in load_molecules_combined)
-        top_200_df = molecules_df.head(200)
+        top_200_df = molecules_df.head(500)
         
         # Store in state for use in continuous loop
         state['top_pool'] = molecules_df.copy()

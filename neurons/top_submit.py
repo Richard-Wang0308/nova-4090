@@ -57,7 +57,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument('--network', default=os.getenv('SUBTENSOR_NETWORK'), help='Network to use')
     parser.add_argument('--netuid', type=int, default=68, help="The chain subnet uid.")
-    parser.add_argument('--max-attempts', type=int, default=200, help="Maximum number of molecules to try")
+    parser.add_argument('--max-attempts', type=int, default=500, help="Maximum number of molecules to try")
     parser.add_argument('--rxn-id', type=int, default=None, help="Filter by reaction ID (optional)")
     bt.subtensor.add_args(parser)
     bt.logging.add_args(parser)
@@ -371,7 +371,7 @@ async def run_top_submit(config: argparse.Namespace) -> None:
     
     # Load top molecules from database
     rxn_id = getattr(config, 'rxn_id', None)
-    max_attempts = getattr(config, 'max_attempts', 200)
+    max_attempts = getattr(config, 'max_attempts', 500)
     
     molecules = load_top_molecules_from_db(
         SCORE_RESULTS_DB,
