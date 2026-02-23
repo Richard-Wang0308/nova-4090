@@ -65,8 +65,7 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        # min_atoms = config.get('min_heavy_atoms', 10)
-        min_atoms = 18
+        min_atoms = config.get('min_heavy_atoms', 10)
         max_atoms = 30
 
         if heavy_atom_count < min_atoms:
@@ -366,20 +365,20 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+                # Add True for available column
+                to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            logger.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        logger.error(f"Error writing scores to database: {e}")
-
+        print(f"Error writing scores to database: {e}")
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
     """Get scores for multiple molecules from the database in batch."""
@@ -472,8 +471,7 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check heavy atom count
-                # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 18
+                min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 max_heavy_atoms = 30
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
@@ -1217,7 +1215,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(500)
+            top_200_df = molecules_df.head(100)
             
             # Update state with new molecules
             state['top_pool'] = molecules_df.copy()

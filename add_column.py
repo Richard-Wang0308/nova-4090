@@ -239,6 +239,31 @@ def get_statistics(db_path: str):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
+        # Check if 'available' column exists
+        cursor.execute("PRAGMA table_info(scored_molecules)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'available' not in columns:
+            # Column doesn't exist yet
+            cursor.execute("SELECT COUNT(*) FROM scored_molecules")
+            total = cursor.fetchone()[0]
+            conn.close()
+            
+            bt.logging.info("=" * 60)
+            bt.logging.info("DATABASE STATISTICS")
+            bt.logging.info("=" * 60)
+            bt.logging.info(f"Total molecules:        {total}")
+            bt.logging.info("Available column:       Not yet created")
+            bt.logging.info("=" * 60)
+            
+            return {
+                'total': total,
+                'null': 0,
+                'true': 0,
+                'false': 0,
+                'column_exists': False
+            }
+        
         # Total rows
         cursor.execute("SELECT COUNT(*) FROM scored_molecules")
         total = cursor.fetchone()[0]
@@ -270,7 +295,8 @@ def get_statistics(db_path: str):
             'total': total,
             'null': null_count,
             'true': true_count,
-            'false': false_count
+            'false': false_count,
+            'column_exists': True
         }
         
     except Exception as e:
@@ -289,20 +315,21 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
     # Set database path
     db_path = "score_results.sqlite"
     
-    # Show current statistics
-    bt.logging.info("Checking current database state...")
-    get_statistics(db_path)
-    
-    # Fix available column (only needed once)
+    # Fix available column first (only needed once)
+    # This ensures the column exists before we try to get statistics
     if not skip_column_fix:
-        bt.logging.info("\nFixing column type...")
+        bt.logging.info("Fixing column type...")
         # Method 1: Simple approach - drops and recreates column (loses existing data)
         # fix_available_column_simple(db_path)
         
         # Method 2: Complex approach - preserves existing data
         fix_available_column(db_path)
     else:
-        bt.logging.info("\nSkipping column fix (already done)")
+        bt.logging.info("Skipping column fix (already done)")
+    
+    # Show current statistics (after column is fixed)
+    bt.logging.info("\nChecking current database state...")
+    get_statistics(db_path)
     
     # Update available values (only NULL values by default)
     bt.logging.info("\nUpdating available values...")

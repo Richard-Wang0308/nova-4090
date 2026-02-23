@@ -483,12 +483,59 @@ def init_score_results_db(db_path: str = None) -> None:
             )
         """)
         
-        # If table already existed, check if scored_at column exists and has NULL values
+        # If table already existed, check schema and fix issues
         if table_exists:
-            # Check if scored_at column exists
+            # Check table schema
             cursor.execute("PRAGMA table_info(scored_molecules)")
-            columns = [row[1] for row in cursor.fetchall()]
+            columns_info = cursor.fetchall()
+            columns = {row[1]: row for row in columns_info}
             
+            # Check if PRIMARY KEY exists on molecule_name
+            has_primary_key = any(row[5] == 1 for row in columns_info if row[1] == 'molecule_name')
+            
+            # Migrate table if PRIMARY KEY is missing
+            if not has_primary_key:
+                bt.logging.info("🔄 Migrating table to add PRIMARY KEY constraint...")
+                
+                # Get row count for logging
+                cursor.execute("SELECT COUNT(*) FROM scored_molecules")
+                row_count = cursor.fetchone()[0]
+                bt.logging.info(f"   Found {row_count} existing rows to migrate")
+                
+                # Create new table with PRIMARY KEY
+                cursor.execute("""
+                    CREATE TABLE scored_molecules_new (
+                        molecule_name TEXT PRIMARY KEY,
+                        score REAL NOT NULL,
+                        scored_at TEXT DEFAULT (datetime('now'))
+                    )
+                """)
+                
+                # Copy data from old table to new table
+                # Handle case where scored_at might not exist in old table
+                if 'scored_at' in columns:
+                    cursor.execute("""
+                        INSERT INTO scored_molecules_new (molecule_name, score, scored_at)
+                        SELECT molecule_name, score, 
+                               COALESCE(scored_at, datetime('now')) as scored_at
+                        FROM scored_molecules
+                    """)
+                else:
+                    cursor.execute("""
+                        INSERT INTO scored_molecules_new (molecule_name, score, scored_at)
+                        SELECT molecule_name, score, datetime('now') as scored_at
+                        FROM scored_molecules
+                    """)
+                
+                # Drop old table
+                cursor.execute("DROP TABLE scored_molecules")
+                
+                # Rename new table
+                cursor.execute("ALTER TABLE scored_molecules_new RENAME TO scored_molecules")
+                
+                bt.logging.info(f"✅ Successfully migrated {row_count} rows to table with PRIMARY KEY")
+            
+            # Handle scored_at column if it doesn't exist (shouldn't happen after migration, but safety check)
             if 'scored_at' not in columns:
                 # Add scored_at column if it doesn't exist
                 cursor.execute("""
@@ -555,27 +602,20 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+                # Add True for available column
+                to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
-            # Use INSERT ... ON CONFLICT to properly handle scored_at timestamp
-            # This will set scored_at to CURRENT_TIMESTAMP for new rows and update it for existing rows
-            # Note: CURRENT_TIMESTAMP is a SQL function, not a parameter, so we execute individually
-            for molecule_name, score in to_insert:
-                cursor.execute(
-                    """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
-                       VALUES (?, ?, datetime('now'))
-                       ON CONFLICT(molecule_name) DO UPDATE SET 
-                           score = excluded.score,
-                           scored_at = datetime('now')""",
-                    (molecule_name, score)
-                )
+            cursor.executemany(
+                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                to_insert
+            )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
+        print(f"Error writing scores to database: {e}")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
@@ -668,10 +708,17 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check heavy atom count
-                min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                # min_heavy_atoms = config.get('min_heavy_atoms', 10)
+                min_heavy_atoms = 18
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     bt.logging.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
+                    heavy_atom_count += 1
+                    continue
+
+                max_heavy_atoms = 30
+                if heavy_atom_count_val > max_heavy_atoms:
+                    bt.logging.debug(f"Molecule {molecule_name} has too many heavy atoms ({heavy_atom_count_val} > {max_heavy_atoms}), skipping")
                     heavy_atom_count += 1
                     continue
                 

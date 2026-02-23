@@ -521,20 +521,20 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+                # Add True for available column
+                to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
-
+        print(f"Error writing scores to database: {e}")
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
     """Get scores for multiple molecules from the database in batch."""

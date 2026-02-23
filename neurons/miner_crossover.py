@@ -584,7 +584,7 @@ def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float
         return None
 
 
-def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
+# def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
     """Write scored molecules to the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
@@ -602,56 +602,20 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+                # Add True for available column
+                to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
-            # Try to use ON CONFLICT (requires PRIMARY KEY), fallback to check-then-insert/update if not available
-            try:
-                # Use efficient ON CONFLICT approach (requires PRIMARY KEY)
-                for molecule_name, score in to_insert:
-                    cursor.execute(
-                        """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
-                           VALUES (?, ?, datetime('now'))
-                           ON CONFLICT(molecule_name) DO UPDATE SET 
-                               score = excluded.score,
-                               scored_at = datetime('now')""",
-                        (molecule_name, score)
-                    )
-            except sqlite3.OperationalError as e:
-                # Fallback if PRIMARY KEY doesn't exist (shouldn't happen after migration)
-                if "ON CONFLICT clause" in str(e):
-                    bt.logging.debug("ON CONFLICT not available, using fallback method")
-                    for molecule_name, score in to_insert:
-                        # Check if row exists
-                        cursor.execute(
-                            "SELECT COUNT(*) FROM scored_molecules WHERE molecule_name = ?",
-                            (molecule_name,)
-                        )
-                        exists = cursor.fetchone()[0] > 0
-                        
-                        if exists:
-                            # Update existing row
-                            cursor.execute(
-                                """UPDATE scored_molecules 
-                                   SET score = ?, scored_at = datetime('now')
-                                   WHERE molecule_name = ?""",
-                                (score, molecule_name)
-                            )
-                        else:
-                            # Insert new row
-                            cursor.execute(
-                                """INSERT INTO scored_molecules (molecule_name, score, scored_at) 
-                                   VALUES (?, ?, datetime('now'))""",
-                                (molecule_name, score)
-                            )
-                else:
-                    raise
+            cursor.executemany(
+                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                to_insert
+            )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
+        print(f"Error writing scores to database: {e}")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
