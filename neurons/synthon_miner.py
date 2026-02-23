@@ -666,40 +666,37 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
 
 
 def init_score_results_db(db_path: str = None) -> None:
-    """Initialize/create the score_results.sqlite database."""
+    """
+    Initialize/create the score_results.sqlite database.
+    
+    Creates a table with molecule_name and score fields.
+    """
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-
+        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scored_molecules (
                 molecule_name TEXT PRIMARY KEY,
                 score REAL NOT NULL,
                 scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                available BOOLEAN
+                available BOOLEAN DEFAULT TRUE
             )
         """)
-
+        
+        # Create index on score for faster queries
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
         """)
-
-        # Add available column if it doesn't exist (for existing databases)
-        cursor.execute("PRAGMA table_info(scored_molecules)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'available' not in columns:
-            cursor.execute("ALTER TABLE scored_molecules ADD COLUMN available BOOLEAN")
-            bt.logging.info("✅ Added 'available' column to scored_molecules table")
-
+        
         conn.commit()
         conn.close()
         bt.logging.debug(f"Initialized score_results database at {db_path}")
     except Exception as e:
         bt.logging.error(f"Error initializing score_results database: {e}")
-
 
 def mark_molecule_unavailable(molecule_name: str, db_path: str = None) -> None:
     """
@@ -758,33 +755,34 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
     """Write scored molecules to the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
+    
     if not molecules:
         return
-
+    
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-
+        
         to_insert = []
         for mol in molecules:
             molecule_name = mol.get('name')
             score = mol.get('boltz_score')
-
+            
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
-
+                to_insert.append((molecule_name, float(score), True))
+        
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
-
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
+        
         conn.close()
     except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
+        print(f"Error writing scores to database: {e}")
+
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:

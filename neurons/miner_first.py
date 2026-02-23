@@ -154,7 +154,7 @@ class GeneticAlgorithmOperator:
             bt.logging.debug(f"  Parts1: {parts1}, Parts2: {parts2}")
             
             # Expected format: rxn:3:comp1:comp2:comp3 (5 parts each for 3-component reaction)
-            if (len(parts1) != 5 or len(parts2) != 5 or 
+            if (len(parts1) != 4 or len(parts2) != 4 or 
                 parts1[0] != 'rxn' or parts2[0] != 'rxn'):
                 bt.logging.debug(f"Invalid format for crossover: expected 5 parts (rxn:3:comp1:comp2:comp3), got {len(parts1)} and {len(parts2)}")
                 return None
@@ -171,7 +171,7 @@ class GeneticAlgorithmOperator:
             
             # Randomly select which component to swap: comp1 (index 2), comp2 (index 3), or comp3 (index 4)
             # rxn (index 0) and 3 (index 1) cannot be replaced
-            swap_idx = random.choice([2, 3, 4])
+            swap_idx = random.choice([2, 3])
             bt.logging.debug(f"Swapping component at index {swap_idx} (comp{swap_idx-1})")
             
             # Create offspring by swapping one component
@@ -378,7 +378,8 @@ def init_score_results_db(db_path: str = None) -> None:
             CREATE TABLE IF NOT EXISTS scored_molecules (
                 molecule_name TEXT PRIMARY KEY,
                 score REAL NOT NULL,
-                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                available BOOLEAN DEFAULT TRUE
             )
         """)
         
@@ -420,13 +421,7 @@ def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float
 
 
 def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
-    """
-    Write scored molecules to the database.
-    
-    Args:
-        molecules: List of molecule dicts with 'name' and 'boltz_score'
-        db_path: Path to database (default: SCORE_RESULTS_DB)
-    """
+    """Write scored molecules to the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -437,28 +432,25 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Prepare data for insertion (only molecules with valid scores)
         to_insert = []
         for mol in molecules:
             molecule_name = mol.get('name')
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score)))
+                to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score) VALUES (?, ?)",
+                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            bt.logging.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        bt.logging.error(f"Error writing scores to database: {e}")
-        import traceback
-        bt.logging.error(traceback.format_exc())
+        print(f"Error writing scores to database: {e}")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
@@ -641,16 +633,26 @@ def generate_random_initial_molecules(
                 continue
             
             # Filter by max_heavy_atoms if specified (validate_molecules doesn't check this)
-            if 'max_heavy_atoms' in subnet_config and subnet_config['max_heavy_atoms'] is not None:
-                if 'heavy_atoms' in batch_df.columns:
-                    max_heavy = subnet_config['max_heavy_atoms']
-                    batch_df = batch_df[batch_df['heavy_atoms'] <= max_heavy]
-                    if batch_df.empty:
-                        bt.logging.debug(f"   Batch {batch_count}: No molecules with heavy_atoms <= {max_heavy}")
-                        continue
-                else:
-                    bt.logging.warning(f"   Batch {batch_count}: heavy_atoms column not found in batch_df")
+            # if 'max_heavy_atoms' in subnet_config and subnet_config['max_heavy_atoms'] is not None:
+            #     if 'heavy_atoms' in batch_df.columns:
+            #         max_heavy = subnet_config['max_heavy_atoms']
+            #         batch_df = batch_df[batch_df['heavy_atoms'] <= max_heavy]
+            #         if batch_df.empty:
+            #             bt.logging.debug(f"   Batch {batch_count}: No molecules with heavy_atoms <= {max_heavy}")
+            #             continue
+            #     else:
+            #         bt.logging.warning(f"   Batch {batch_count}: heavy_atoms column not found in batch_df")
             
+            if 'heavy_atoms' in batch_df.columns:
+                max_heavy = 28
+                batch_df = batch_df[batch_df['heavy_atoms'] <= max_heavy]
+                if batch_df.empty:
+                    bt.logging.debug(f"   Batch {batch_count}: No molecules with heavy_atoms <= {max_heavy}")
+                    continue
+            else:
+                bt.logging.warning(f"   Batch {batch_count}: heavy_atoms column not found in batch_df")
+            
+
             # Remove duplicates by InChIKey
             batch_df = batch_df.drop_duplicates(subset=["InChIKey"], keep="first")
             

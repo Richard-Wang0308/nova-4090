@@ -1005,7 +1005,11 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
                 raise
 
 def init_score_results_db(db_path: str = None) -> None:
-    """Initialize/create the score_results.sqlite database."""
+    """
+    Initialize/create the score_results.sqlite database.
+    
+    Creates a table with molecule_name and score fields.
+    """
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -1017,10 +1021,12 @@ def init_score_results_db(db_path: str = None) -> None:
             CREATE TABLE IF NOT EXISTS scored_molecules (
                 molecule_name TEXT PRIMARY KEY,
                 score REAL NOT NULL,
-                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                available BOOLEAN DEFAULT TRUE
             )
         """)
         
+        # Create index on score for faster queries
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
         """)
@@ -1030,6 +1036,8 @@ def init_score_results_db(db_path: str = None) -> None:
         bt.logging.debug(f"Initialized score_results database at {db_path}")
     except Exception as e:
         bt.logging.error(f"Error initializing score_results database: {e}")
+
+
 
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:

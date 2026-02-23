@@ -460,7 +460,11 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
                 raise
 
 def init_score_results_db(db_path: str = None) -> None:
-    """Initialize/create the score_results.sqlite database."""
+    """
+    Initialize/create the score_results.sqlite database.
+    
+    Creates a table with molecule_name and score fields.
+    """
     if db_path is None:
         db_path = SCORE_RESULTS_DB
     
@@ -468,92 +472,16 @@ def init_score_results_db(db_path: str = None) -> None:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Check if table exists
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='scored_molecules'
-        """)
-        table_exists = cursor.fetchone() is not None
-        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scored_molecules (
                 molecule_name TEXT PRIMARY KEY,
                 score REAL NOT NULL,
-                scored_at TEXT DEFAULT (datetime('now'))
+                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                available BOOLEAN DEFAULT TRUE
             )
         """)
         
-        # If table already existed, check schema and fix issues
-        if table_exists:
-            # Check table schema
-            cursor.execute("PRAGMA table_info(scored_molecules)")
-            columns_info = cursor.fetchall()
-            columns = {row[1]: row for row in columns_info}
-            
-            # Check if PRIMARY KEY exists on molecule_name
-            has_primary_key = any(row[5] == 1 for row in columns_info if row[1] == 'molecule_name')
-            
-            # Migrate table if PRIMARY KEY is missing
-            if not has_primary_key:
-                bt.logging.info("🔄 Migrating table to add PRIMARY KEY constraint...")
-                
-                # Get row count for logging
-                cursor.execute("SELECT COUNT(*) FROM scored_molecules")
-                row_count = cursor.fetchone()[0]
-                bt.logging.info(f"   Found {row_count} existing rows to migrate")
-                
-                # Create new table with PRIMARY KEY
-                cursor.execute("""
-                    CREATE TABLE scored_molecules_new (
-                        molecule_name TEXT PRIMARY KEY,
-                        score REAL NOT NULL,
-                        scored_at TEXT DEFAULT (datetime('now'))
-                    )
-                """)
-                
-                # Copy data from old table to new table
-                # Handle case where scored_at might not exist in old table
-                if 'scored_at' in columns:
-                    cursor.execute("""
-                        INSERT INTO scored_molecules_new (molecule_name, score, scored_at)
-                        SELECT molecule_name, score, 
-                               COALESCE(scored_at, datetime('now')) as scored_at
-                        FROM scored_molecules
-                    """)
-                else:
-                    cursor.execute("""
-                        INSERT INTO scored_molecules_new (molecule_name, score, scored_at)
-                        SELECT molecule_name, score, datetime('now') as scored_at
-                        FROM scored_molecules
-                    """)
-                
-                # Drop old table
-                cursor.execute("DROP TABLE scored_molecules")
-                
-                # Rename new table
-                cursor.execute("ALTER TABLE scored_molecules_new RENAME TO scored_molecules")
-                
-                bt.logging.info(f"✅ Successfully migrated {row_count} rows to table with PRIMARY KEY")
-            
-            # Handle scored_at column if it doesn't exist (shouldn't happen after migration, but safety check)
-            if 'scored_at' not in columns:
-                # Add scored_at column if it doesn't exist
-                cursor.execute("""
-                    ALTER TABLE scored_molecules 
-                    ADD COLUMN scored_at TEXT DEFAULT (datetime('now'))
-                """)
-                bt.logging.info("Added scored_at column to existing table")
-            
-            # Backfill NULL scored_at values with current timestamp
-            cursor.execute("""
-                UPDATE scored_molecules 
-                SET scored_at = datetime('now') 
-                WHERE scored_at IS NULL
-            """)
-            rows_updated = cursor.rowcount
-            if rows_updated > 0:
-                bt.logging.info(f"Backfilled {rows_updated} NULL scored_at values")
-        
+        # Create index on score for faster queries
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
         """)
@@ -602,12 +530,11 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
             score = mol.get('boltz_score')
             
             if molecule_name and score is not None:
-                # Add True for available column
                 to_insert.append((molecule_name, float(score), True))
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
@@ -616,7 +543,6 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         conn.close()
     except Exception as e:
         print(f"Error writing scores to database: {e}")
-
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
     """Get scores for multiple molecules from the database in batch."""
