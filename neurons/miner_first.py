@@ -37,8 +37,8 @@ sys.path.append(BASE_DIR)
 
 # Database path for combinatorial DB
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 3
-STARTING_EPOCH = 20795
+HARDCODED_RXN_ID = 2
+STARTING_EPOCH = 21074
 
 # ✅ CSV for loading initial molecules
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'BoltzPredictor', 'data', 'mols.csv')
