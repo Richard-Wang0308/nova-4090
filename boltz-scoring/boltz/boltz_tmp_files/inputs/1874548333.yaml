@@ -6,7 +6,7 @@ sequences:
         msa: /root/workspace/nova-4090/boltz-scoring/boltz/msa_files/P31645.a3m
     - ligand:
         id: B
-        smiles: 'CC(CSc1nc2ccccc2[nH]1)NC(C)CC1CC1'
+        smiles: 'CCNC1CCCC(c2cccc(C)c2C)C1'
         
 properties:
     - affinity:

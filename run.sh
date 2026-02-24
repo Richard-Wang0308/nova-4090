@@ -1,10 +1,10 @@
-pm2 start "python3 neurons/miner_ban_mini.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotb --logging.debug" --name "miner_ban_mini"
-pm2 start "python3 neurons/miner_ban_synthon.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotb --logging.debug" --name "miner_ban_synthon"
+pm2 start "python3 neurons/miner_ban_mini.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug" --name "miner_ban_mini"
+pm2 start "python3 neurons/miner_ban_synthon.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug" --name "miner_ban_synthon"
 pm2 start "python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug" --name "miner_ban_random_mutate"
 
 
 #crossover
-python3 neurons/miner_ban_mini.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotb --logging.debug
+python3 neurons/miner_ban_mini.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #crossover with db
 python3 neurons/miner_ban_mini_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
@@ -13,7 +13,7 @@ python3 neurons/miner_ban_mini_db.py --wallet.name multisig-jjpes-shib --wallet.
 python3 neurons/miner_ban_synthon_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #neighbour mutate
-python3 neurons/miner_ban_neighbour_mutate.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotb --logging.debug
+python3 neurons/miner_ban_neighbour_mutate.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #random mutate
 python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug

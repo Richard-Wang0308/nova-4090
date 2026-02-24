@@ -26,8 +26,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 2
-STARTING_EPOCH = 21074
+HARDCODED_RXN_ID = 1
+STARTING_EPOCH = 21075
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
@@ -985,9 +985,9 @@ def init_score_results_db(db_path: str = None) -> None:
         
         conn.commit()
         conn.close()
-        bt.logging.debug(f"Initialized score_results database at {db_path}")
+        print(f"Initialized score_results database at {db_path}")
     except Exception as e:
-        bt.logging.error(f"Error initializing score_results database: {e}")
+        print(f"Error initializing score_results database: {e}")
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
     """Get score for a molecule from the database."""
@@ -1126,6 +1126,11 @@ def load_molecules_from_db_with_validation(
                 min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
+                    heavy_atom_count += 1
+                    continue
+
+                max_heavy_atoms = 25
+                if heavy_atom_count_val > max_heavy_atoms:
                     heavy_atom_count += 1
                     continue
                 
@@ -1402,7 +1407,7 @@ async def load_submissions_from_csv(
             print("⚠️  No valid molecules loaded from CSV or database")
             return pd.DataFrame()
         
-        top_200 = molecules_df.head(200)
+        top_200 = molecules_df.head(20)
         
         print(f"✅ Selected top 200 molecules from combined CSV and database")
         

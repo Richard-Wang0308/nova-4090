@@ -6,7 +6,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "P31652"  # Replace with actual target protein
+TARGET_PROTEIN = "P31645"  # Replace with actual target protein
 
 
 async def check_molecule_unique(target_protein: str, molecule_name: str, smiles: str) -> bool:
@@ -313,7 +313,7 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
         skip_column_fix: If True, skip the column type fix (useful for subsequent runs)
     """
     # Set database path
-    db_path = "score_results.sqlite"
+    db_path = "score_results_copy.sqlite"
     
     # Fix available column first (only needed once)
     # This ensures the column exists before we try to get statistics
