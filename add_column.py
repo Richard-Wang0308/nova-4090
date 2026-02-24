@@ -313,7 +313,7 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
         skip_column_fix: If True, skip the column type fix (useful for subsequent runs)
     """
     # Set database path
-    db_path = "score_results_copy.sqlite"
+    db_path = "score_results.sqlite"
     
     # Fix available column first (only needed once)
     # This ensures the column exists before we try to get statistics
