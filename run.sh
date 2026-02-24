@@ -28,3 +28,8 @@ python3 neurons/synthon_miner.py --wallet.name multisig-jjpes-shib --wallet.hotk
 
 python3 neurons/mini_data.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
+
+
+pm2 start "python3 neurons/advanced_data.py --logging.debug" --name "advanced_data"
+
+
