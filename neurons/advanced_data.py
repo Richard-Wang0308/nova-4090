@@ -1030,8 +1030,8 @@ class AdaptiveStrategyManager:
             # No valid scores: increase exploration
             print("📊 No valid scores, increasing exploration")
             return GenerationStrategy(
-                crossover_ratio=0.3,
-                mutation_ratio=0.7,
+                crossover_ratio=0.2,
+                mutation_ratio=0.8,
                 local_search_ratio=0.0,
                 pool_size=100,
                 use_guided_ops=False,
@@ -2181,7 +2181,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             return
         
         # Get top 500 molecules
-        top_500_df = molecules_df.head(500)
+        top_500_df = molecules_df.head(1000)
         
         # Store in state
         state['top_pool'] = molecules_df.copy()

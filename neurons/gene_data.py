@@ -26,7 +26,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 1
+HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 21075
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
@@ -681,6 +681,7 @@ def validate_molecules_batch(data: pd.DataFrame, config: dict) -> pd.DataFrame:
     
     mask = (
         (data['heavy_atoms'] >= config['min_heavy_atoms']) &
+        (data['heavy_atoms'] <= 32) &
         (data['bonds'] >= config['min_rotatable_bonds']) &
         (data['bonds'] <= config['max_rotatable_bonds'])
     )
@@ -1407,7 +1408,7 @@ async def load_submissions_from_csv(
             print("⚠️  No valid molecules loaded from CSV or database")
             return pd.DataFrame()
         
-        top_200 = molecules_df.head(20)
+        top_200 = molecules_df.head(100)
         
         print(f"✅ Selected top 200 molecules from combined CSV and database")
         

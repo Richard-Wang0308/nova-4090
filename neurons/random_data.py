@@ -5,6 +5,7 @@ import asyncio
 import datetime
 import tempfile
 import traceback
+import bittensor as bt
 import base64
 import hashlib
 import time
@@ -66,8 +67,8 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         # min_atoms = config.get('min_heavy_atoms', 10)
-        min_atoms = 18
-        max_atoms = 30
+        min_atoms = 15
+        max_atoms = 32
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -744,8 +745,8 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 18
-                max_heavy_atoms = 30
+                min_heavy_atoms = 15
+                max_heavy_atoms = 32
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     heavy_atom_count += 1

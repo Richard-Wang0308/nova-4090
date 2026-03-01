@@ -66,7 +66,7 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         min_atoms = config.get('min_heavy_atoms', 10)
-        max_atoms = 28
+        max_atoms = 32
 
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -478,7 +478,7 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                max_heavy_atoms = 28
+                max_heavy_atoms = 32
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
@@ -1221,7 +1221,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(500)
+            top_200_df = molecules_df.head(2000)
             
             # Update state with new molecules
             state['top_pool'] = molecules_df.copy()
