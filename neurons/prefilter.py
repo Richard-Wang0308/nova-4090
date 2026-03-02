@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from pathlib import Path
 from dotenv import load_dotenv
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem import AllChem, Descriptors, Crippen, Lipinski, rdMolDescriptors
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -29,8 +29,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 5
-STARTING_EPOCH = 21213
+HARDCODED_RXN_ID = 2
+STARTING_EPOCH = 21075
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
@@ -75,6 +75,158 @@ class GenerationStrategy:
     pool_size: int
     use_guided_ops: bool
     phase: str  # 'exploration', 'exploitation', 'refinement'
+
+
+# ============================================================================
+# RDKit Feature Calculation
+# ============================================================================
+
+def calculate_rdkit_features(smiles: str) -> Optional[Dict[str, float]]:
+    """Calculate RDKit features for pre-filtering."""
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        
+        heavy_atoms = mol.GetNumHeavyAtoms()
+        rings = rdMolDescriptors.CalcNumRings(mol)
+        aromatic_rings = rdMolDescriptors.CalcNumAromaticRings(mol)
+        
+        aromatic_atoms = sum(1 for a in mol.GetAtoms() if a.GetIsAromatic())
+        aromatic_atom_frac = aromatic_atoms / max(1, heavy_atoms)
+        aromatic_ring_ratio = aromatic_rings / max(1, rings) if rings else 0.0
+        ring_heavy_ratio = rings / max(1, heavy_atoms)
+        
+        mw = Descriptors.MolWt(mol)
+        logp = Crippen.MolLogP(mol)
+        tpsa = rdMolDescriptors.CalcTPSA(mol)
+        hbd = Lipinski.NumHDonors(mol)
+        hba = Lipinski.NumHAcceptors(mol)
+        rot = Lipinski.NumRotatableBonds(mol)
+        frac_csp3 = rdMolDescriptors.CalcFractionCSP3(mol)
+        mw_per_heavy = mw / max(1, heavy_atoms)
+        
+        # Count heteroatoms
+        def count_atom(mol, symbol):
+            return sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == symbol)
+        
+        n_count = count_atom(mol, 'N')
+        o_count = count_atom(mol, 'O')
+        s_count = count_atom(mol, 'S')
+        f_count = count_atom(mol, 'F')
+        cl_count = count_atom(mol, 'Cl')
+        
+        return {
+            'heavy_atoms': heavy_atoms,
+            'aromatic_atom_frac': aromatic_atom_frac,
+            'aromatic_ring_ratio': aromatic_ring_ratio,
+            'aromatic_rings': aromatic_rings,
+            'logp': logp,
+            'mw_per_heavy': mw_per_heavy,
+            'ring_heavy_ratio': ring_heavy_ratio,
+            'tpsa': tpsa,
+            'hba': hba,
+            'hbd': hbd,
+            'frac_csp3': frac_csp3,
+            'rotb': rot,
+            'mw': mw,
+            'o_count': o_count,
+            'n_count': n_count,
+            's_count': s_count,
+            'f_count': f_count,
+            'cl_count': cl_count,
+        }
+    except Exception as e:
+        return None
+
+
+def apply_prefilter(smiles: str, strict: bool = False) -> Tuple[bool, str]:
+    """
+    Apply pre-filtering based on feature analysis.
+    
+    Args:
+        smiles: SMILES string
+        strict: If True, use strict filter; otherwise use balanced filter
+        
+    Returns:
+        (passes_filter, reason_if_failed)
+    """
+    features = calculate_rdkit_features(smiles)
+    if features is None:
+        return False, "Cannot calculate features"
+    
+    if strict:
+        # Strict filter (higher precision)
+        if features['aromatic_atom_frac'] < 0.70:
+            return False, f"aromatic_atom_frac {features['aromatic_atom_frac']:.3f} < 0.70"
+        if features['aromatic_ring_ratio'] < 0.90:
+            return False, f"aromatic_ring_ratio {features['aromatic_ring_ratio']:.3f} < 0.90"
+        if features['aromatic_rings'] < 3:
+            return False, f"aromatic_rings {features['aromatic_rings']} < 3"
+        if features['logp'] < 4.0 or features['logp'] > 6.5:
+            return False, f"logp {features['logp']:.3f} not in [4.0, 6.5]"
+        if features['mw_per_heavy'] < 14.1:
+            return False, f"mw_per_heavy {features['mw_per_heavy']:.3f} < 14.1"
+        if features['tpsa'] > 45:
+            return False, f"tpsa {features['tpsa']:.3f} > 45"
+        if features['hba'] > 3:
+            return False, f"hba {features['hba']} > 3"
+        if features['hbd'] > 1:
+            return False, f"hbd {features['hbd']} > 1"
+        if features['frac_csp3'] > 0.35:
+            return False, f"frac_csp3 {features['frac_csp3']:.3f} > 0.35"
+        if features['rotb'] > 5:
+            return False, f"rotb {features['rotb']} > 5"
+        if features['heavy_atoms'] > 25:
+            return False, f"heavy_atoms {features['heavy_atoms']} > 25"
+        if features['mw'] > 360:
+            return False, f"mw {features['mw']:.3f} > 360"
+        if features['o_count'] > 1:
+            return False, f"o_count {features['o_count']} > 1"
+        if features['n_count'] != 1:
+            return False, f"n_count {features['n_count']} != 1"
+        if features['s_count'] > 0:
+            return False, f"s_count {features['s_count']} > 0"
+        if features['f_count'] > 0:
+            return False, f"f_count {features['f_count']} > 0"
+        if features['cl_count'] > 0:
+            return False, f"cl_count {features['cl_count']} > 0"
+    else:
+        # Balanced filter (recommended)
+        if features['aromatic_atom_frac'] < 0.65:
+            return False, f"aromatic_atom_frac {features['aromatic_atom_frac']:.3f} < 0.65"
+        if features['aromatic_ring_ratio'] < 0.85:
+            return False, f"aromatic_ring_ratio {features['aromatic_ring_ratio']:.3f} < 0.85"
+        if features['aromatic_rings'] < 3:
+            return False, f"aromatic_rings {features['aromatic_rings']} < 3"
+        if features['logp'] < 3.5:
+            return False, f"logp {features['logp']:.3f} < 3.5"
+        if features['mw_per_heavy'] < 14.0:
+            return False, f"mw_per_heavy {features['mw_per_heavy']:.3f} < 14.0"
+        if features['ring_heavy_ratio'] < 0.145:
+            return False, f"ring_heavy_ratio {features['ring_heavy_ratio']:.3f} < 0.145"
+        if features['tpsa'] > 50:
+            return False, f"tpsa {features['tpsa']:.3f} > 50"
+        if features['hba'] > 4:
+            return False, f"hba {features['hba']} > 4"
+        if features['hbd'] > 2:
+            return False, f"hbd {features['hbd']} > 2"
+        if features['frac_csp3'] > 0.40:
+            return False, f"frac_csp3 {features['frac_csp3']:.3f} > 0.40"
+        if features['rotb'] > 6:
+            return False, f"rotb {features['rotb']} > 6"
+        if features['heavy_atoms'] > 26:
+            return False, f"heavy_atoms {features['heavy_atoms']} > 26"
+        if features['mw'] > 370:
+            return False, f"mw {features['mw']:.3f} > 370"
+        if features['o_count'] > 1:
+            return False, f"o_count {features['o_count']} > 1"
+        if features['n_count'] > 1:
+            return False, f"n_count {features['n_count']} > 1"
+        if features['s_count'] > 0:
+            return False, f"s_count {features['s_count']} > 0"
+    
+    return True, ""
 
 
 # ============================================================================
@@ -210,7 +362,8 @@ async def validate_molecule_complete(
     state: Dict[str, Any],
     molecule_name: str,
     smiles: str,
-    config: Dict[str, Any] = None
+    config: Dict[str, Any] = None,
+    apply_feature_filter: bool = True
 ) -> Tuple[bool, List[str]]:
     """Perform complete validation on a molecule."""
     if config is None:
@@ -224,27 +377,136 @@ async def validate_molecule_complete(
         errors.append(f"[SMILES] {error_msg}")
         return False, errors
     
-    # 2. Heavy atom count
+    # 2. Feature-based pre-filtering (NEW)
+    if apply_feature_filter:
+        passes_filter, filter_reason = apply_prefilter(smiles, strict=False)
+        if not passes_filter:
+            errors.append(f"[PREFILTER] {filter_reason}")
+            return False, errors
+    
+    # 3. Heavy atom count
     is_valid, error_msg = validate_molecule_heavy_atoms(molecule_name, smiles, config)
     if not is_valid:
         errors.append(f"[HEAVY_ATOMS] {error_msg}")
     
-    # 3. Banned atoms
+    # 4. Banned atoms
     is_valid, error_msg = validate_molecule_banned_atoms(molecule_name, smiles, config)
     if not is_valid:
         errors.append(f"[BANNED_ATOMS] {error_msg}")
     
-    # 4. Rotatable bonds
+    # 5. Rotatable bonds
     is_valid, error_msg = validate_molecule_rotatable_bonds(molecule_name, smiles, config)
     if not is_valid:
         errors.append(f"[ROTATABLE_BONDS] {error_msg}")
     
-    # 5. HuggingFace uniqueness
+    # 6. HuggingFace uniqueness
     is_valid, error_msg = await validate_molecule_huggingface_unique(state, molecule_name, smiles)
     if not is_valid:
         errors.append(f"[HF_UNIQUE] {error_msg}")
     
     return len(errors) == 0, errors
+
+
+# ============================================================================
+# Random Molecule Generator
+# ============================================================================
+
+class RandomMoleculeGenerator:
+    """Generate random molecules from component pools."""
+    
+    def __init__(self, rxn_id: int, db_path: str):
+        self.rxn_id = rxn_id
+        self.db_path = db_path
+        self.generated_molecule_names: Set[str] = set()
+        
+        # Load reaction info and component pools
+        self.reaction_info = get_reaction_info(rxn_id, db_path)
+        if self.reaction_info:
+            self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+            self.is_three_component = self.roleC is not None and self.roleC != 0
+            
+            # Load component pools
+            self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+            self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+            self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+            
+            # Extract component IDs
+            self.component_ids_A = [mol[0] for mol in self.molecules_A] if self.molecules_A else []
+            self.component_ids_B = [mol[0] for mol in self.molecules_B] if self.molecules_B else []
+            self.component_ids_C = [mol[0] for mol in self.molecules_C] if self.molecules_C else []
+            
+            print(
+                f"🎲 Random Generator initialized: "
+                f"{len(self.component_ids_A)} A, {len(self.component_ids_B)} B"
+                f"{f', {len(self.component_ids_C)} C' if self.is_three_component else ''} components"
+            )
+        else:
+            print(f"Could not load reaction info for rxn_id {rxn_id}")
+            self.reaction_info = None
+            self.component_ids_A = []
+            self.component_ids_B = []
+            self.component_ids_C = []
+            self.is_three_component = False
+    
+    def generate_random_molecule(self) -> Optional[str]:
+        """Generate a random molecule by selecting random components."""
+        if not self.reaction_info or not self.component_ids_A or not self.component_ids_B:
+            return None
+        
+        try:
+            # Select random components
+            comp_a = random.choice(self.component_ids_A)
+            comp_b = random.choice(self.component_ids_B)
+            
+            if self.is_three_component and self.component_ids_C:
+                comp_c = random.choice(self.component_ids_C)
+                molecule_name = f"rxn:{self.rxn_id}:{comp_a}:{comp_b}:{comp_c}"
+            else:
+                molecule_name = f"rxn:{self.rxn_id}:{comp_a}:{comp_b}"
+            
+            # Check if already generated
+            if molecule_name in self.generated_molecule_names:
+                return None
+            
+            # Validate
+            smiles = get_smiles_from_reaction(molecule_name)
+            if smiles:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    self.generated_molecule_names.add(molecule_name)
+                    return molecule_name
+            
+            return None
+        
+        except Exception as e:
+            return None
+    
+    def generate_random_molecules(self, count: int) -> List[Dict[str, Any]]:
+        """Generate multiple random molecules."""
+        molecules = []
+        attempts = 0
+        max_attempts = count * 10  # Try up to 10x the desired count
+        
+        while len(molecules) < count and attempts < max_attempts:
+            attempts += 1
+            
+            mol_name = self.generate_random_molecule()
+            if mol_name:
+                try:
+                    smiles = get_smiles_from_reaction(mol_name)
+                    inchikey = generate_inchikey(smiles)
+                    
+                    if smiles and inchikey:
+                        molecules.append({
+                            'name': mol_name,
+                            'smiles': smiles,
+                            'InChIKey': inchikey,
+                            'type': 'random'
+                        })
+                except Exception as e:
+                    continue
+        
+        return molecules
 
 
 # ============================================================================
@@ -1119,8 +1381,9 @@ class AdaptiveStrategyManager:
 async def generate_molecules_adaptive(
     state: Dict[str, Any],
     top_200_df: pd.DataFrame,
-    desired_count: int = 100,
-    max_rounds: int = 10
+    desired_count: int = 1000,  # INCREASED FROM 100
+    max_rounds: int = 10,
+    min_valid_molecules: int = 50  # Minimum valid molecules before adding random ones
 ) -> List[Dict[str, Any]]:
     """
     Adaptive molecule generation with intelligent strategies.
@@ -1143,6 +1406,7 @@ async def generate_molecules_adaptive(
     parent_selector = SmartParentSelector(top_200_df)
     ga_operator = AdvancedGeneticOperator(HARDCODED_RXN_ID, DB_PATH)
     strategy_manager = AdaptiveStrategyManager()
+    random_generator = RandomMoleculeGenerator(HARDCODED_RXN_ID, DB_PATH)  # NEW
     
     # Share component scores with GA operator
     ga_operator.set_component_scores(parent_selector.component_scores)
@@ -1163,6 +1427,7 @@ async def generate_molecules_adaptive(
         'mutations_successful': 0,
         'local_searches_attempted': 0,
         'local_searches_successful': 0,
+        'random_generated': 0,  # NEW
     }
     
     # Main generation loop
@@ -1197,7 +1462,7 @@ async def generate_molecules_adaptive(
         
         # Calculate operation counts
         remaining = desired_count - len(unique_molecules)
-        total_ops = min(remaining * 2, 100)  # Generate 2x needed
+        total_ops = min(remaining * 2, 200)  # Generate 2x needed (max 200 per round)
         
         num_crossovers = int(total_ops * strategy.crossover_ratio)
         num_mutations = int(total_ops * strategy.mutation_ratio)
@@ -1335,15 +1600,16 @@ async def generate_molecules_adaptive(
                     except Exception as e:
                         pass
         
-        # ====================================================================
-        # VALIDATION
+                # ====================================================================
+        # VALIDATION WITH PRE-FILTERING
         # ====================================================================
         
-        print(f"Validating {len(new_molecules)} generated molecules...")
+        print(f"Validating {len(new_molecules)} generated molecules with pre-filtering...")
         
         validated_molecules = []
         validation_failures = {
             'smiles': 0,
+            'prefilter': 0,
             'heavy_atoms': 0,
             'banned_atoms': 0,
             'rotatable_bonds': 0,
@@ -1352,9 +1618,9 @@ async def generate_molecules_adaptive(
         }
         
         for mol in new_molecules:
-            # Validate with config settings
+            # Validate with config settings (includes pre-filtering)
             is_valid, errors = await validate_molecule_complete(
-                state, mol['name'], mol['smiles'], state['config']
+                state, mol['name'], mol['smiles'], state['config'], apply_feature_filter=True
             )
             
             if is_valid:
@@ -1369,6 +1635,8 @@ async def generate_molecules_adaptive(
                 for error in errors:
                     if "[SMILES]" in error:
                         validation_failures['smiles'] += 1
+                    elif "[PREFILTER]" in error:
+                        validation_failures['prefilter'] += 1
                     elif "[HEAVY_ATOMS]" in error:
                         validation_failures['heavy_atoms'] += 1
                     elif "[BANNED_ATOMS]" in error:
@@ -1379,6 +1647,48 @@ async def generate_molecules_adaptive(
                         validation_failures['hf_unique'] += 1
                     else:
                         validation_failures['other'] += 1
+        
+        # ====================================================================
+        # ADD RANDOM MOLECULES IF NEEDED (NEW)
+        # ====================================================================
+        
+        if len(validated_molecules) < min_valid_molecules:
+            shortage = min_valid_molecules - len(validated_molecules)
+            print(
+                f"\n⚠️  Only {len(validated_molecules)} valid molecules generated "
+                f"(minimum: {min_valid_molecules})"
+            )
+            print(f"🎲 Generating {shortage} random molecules to compensate...")
+            
+            random_molecules = random_generator.generate_random_molecules(shortage * 3)  # Generate 3x for filtering
+            
+            print(f"   Generated {len(random_molecules)} random candidates")
+            
+            # Validate random molecules
+            random_validated = []
+            for mol in random_molecules:
+                # Check if already generated
+                if mol['name'] in generated_molecules or mol['InChIKey'] in generated_inchikeys:
+                    continue
+                
+                # Validate with pre-filtering
+                is_valid, errors = await validate_molecule_complete(
+                    state, mol['name'], mol['smiles'], state['config'], apply_feature_filter=True
+                )
+                
+                if is_valid:
+                    mol['type'] = 'random'
+                    mol['round'] = round_num + 1
+                    random_validated.append(mol)
+                    generated_molecules.add(mol['name'])
+                    generated_inchikeys.add(mol['InChIKey'])
+                    total_stats['random_generated'] += 1
+                    
+                    if len(random_validated) >= shortage:
+                        break
+            
+            validated_molecules.extend(random_validated)
+            print(f"   ✅ Added {len(random_validated)} random molecules (validated)")
         
         unique_molecules.extend(validated_molecules)
         
@@ -1395,6 +1705,7 @@ async def generate_molecules_adaptive(
             f"   Validated: {len(validated_molecules)}/{len(new_molecules)}\n"
             f"   Validation failures:\n"
             f"   - SMILES: {validation_failures['smiles']}\n"
+            f"   - Pre-filter: {validation_failures['prefilter']}\n"
             f"   - Heavy atoms: {validation_failures['heavy_atoms']}\n"
             f"   - Banned atoms: {validation_failures['banned_atoms']}\n"
             f"   - Rotatable bonds: {validation_failures['rotatable_bonds']}\n"
@@ -1435,6 +1746,7 @@ async def generate_molecules_adaptive(
         f"({total_stats['mutations_successful']/max(total_stats['mutations_attempted'],1)*100:.1f}%)\n"
         f"  Local searches: {total_stats['local_searches_successful']}/{total_stats['local_searches_attempted']} "
         f"({total_stats['local_searches_successful']/max(total_stats['local_searches_attempted'],1)*100:.1f}%)\n"
+        f"  Random molecules: {total_stats['random_generated']}\n"
         f"{'='*70}"
     )
     
@@ -2144,6 +2456,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             f"\n   - min_rotatable_bonds: {config.get('min_rotatable_bonds', 1)}"
             f"\n   - max_rotatable_bonds: {config.get('max_rotatable_bonds', 10)}"
             f"\n   - banned_atom_types: {config.get('banned_atom_types', [])}"
+            f"\n   - Pre-filtering: ENABLED (feature-based)"
         )
         
         # Import BoltzWrapper
@@ -2208,7 +2521,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
 async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
     """
     Continuous genetic algorithm loop with ADVANCED generation:
-    1. Generate 100 unique molecules using adaptive strategy
+    1. Generate 1000 unique molecules using adaptive strategy (INCREASED FROM 100)
     2. Score them in batches of 10
     3. Save best molecule
     4. Update top pool
@@ -2216,7 +2529,7 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
     """
     print("🚀 Starting CONTINUOUS ADVANCED genetic algorithm loop...")
     
-    desired_unique_count = 100
+    desired_unique_count = 1000  # INCREASED FROM 100
     batch_size = 10
     round_number = 0
     
@@ -2243,7 +2556,8 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                 state=state,
                 top_200_df=top_200_df,
                 desired_count=desired_unique_count,
-                max_rounds=10
+                max_rounds=10,
+                min_valid_molecules=50  # Minimum before adding random molecules
             )
             
             if not unique_molecules:
@@ -2328,7 +2642,7 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
 
 async def run_generator() -> None:
     """Main generation loop."""
-    print("🚀 Starting ADVANCED molecule generator...")
+    print("🚀 Starting ADVANCED molecule generator with PRE-FILTERING...")
     
     # Load config from config.yaml
     config_dict = load_config()
@@ -2341,6 +2655,9 @@ async def run_generator() -> None:
     print(f"  Reaction ID: {HARDCODED_RXN_ID}")
     print(f"  Database: {DB_PATH}")
     print(f"  Score DB: {SCORE_RESULTS_DB}")
+    print(f"  Generation per round: 1000 molecules")
+    print(f"  Batch size: 10 molecules")
+    print(f"  Pre-filtering: ENABLED")
     
     state: Dict[str, Any] = {
         'config': config_dict,
@@ -2382,3 +2699,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

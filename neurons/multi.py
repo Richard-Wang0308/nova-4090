@@ -16,8 +16,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 5
-STARTING_EPOCH = 21213
+HARDCODED_RXN_ID = 2
+STARTING_EPOCH = 21075
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
@@ -1052,29 +1052,50 @@ def _import_boltz_wrapper():
         return False
 
 
-async def generate_unique_molecules_from_top200(
+async def generate_unique_molecules_from_pool(
     state: Dict[str, Any],
-    top_200_df: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    pool_start_idx: int,
+    pool_end_idx: int,
     desired_count: int = 100
-) -> List[Dict[str, Any]]:
-    """Generate unique molecules using genetic algorithm from top 200 molecules."""
-    if top_200_df.empty:
-        logger.warning("Top 200 DataFrame is empty")
-        return []
+) -> Tuple[List[Dict[str, Any]], float]:
+    """
+    Generate unique molecules using genetic algorithm from a specific pool range.
+    
+    Args:
+        state: State dictionary
+        pool_df: Full DataFrame of molecules
+        pool_start_idx: Start index of pool (inclusive)
+        pool_end_idx: End index of pool (exclusive)
+        desired_count: Number of molecules to generate
+        
+    Returns:
+        Tuple of (list of generated molecules, duplication ratio)
+    """
+    if pool_df.empty:
+        logger.warning("Pool DataFrame is empty")
+        return [], 1.0
+    
+    # Get the pool slice
+    pool_slice = pool_df.iloc[pool_start_idx:pool_end_idx]
+    
+    if pool_slice.empty:
+        logger.warning(f"Pool slice [{pool_start_idx}:{pool_end_idx}] is empty")
+        return [], 1.0
     
     ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    all_names = top_200_df['name'].tolist()
+    all_names = pool_slice['name'].tolist()
     
-    pool_sizes = [30, 50, 100, 150, 200]
-    current_pool_size_idx = 0
-    current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-    
-    logger.info(f"🧬 Generating {desired_count} unique molecules with validation (starting with top {current_pool_size})...")
+    logger.info(
+        f"🧬 Generating {desired_count} unique molecules from pool "
+        f"[{pool_start_idx}:{pool_end_idx}] (size: {len(all_names)})..."
+    )
     
     unique_molecules = []
     attempts = 0
     max_attempts = 500
-    last_successful_attempt = 0
+    duplications = 0
+    total_generated = 0
     
     generated_molecules = state.get('generated_molecules', set())
     generated_inchikeys = state.get('generated_inchikeys', set())
@@ -1088,21 +1109,13 @@ async def generate_unique_molecules_from_top200(
         'failed_rotatable_bonds': 0,
         'failed_hf_unique': 0,
         'failed_other': 0,
+        'duplications': 0,
     }
     
     while len(unique_molecules) < desired_count and attempts < max_attempts:
         attempts += 1
         
-        if attempts - last_successful_attempt >= 100 and current_pool_size_idx < len(pool_sizes) - 1:
-            current_pool_size_idx += 1
-            new_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-            if new_pool_size > current_pool_size:
-                current_pool_size = new_pool_size
-                logger.info(f"📈 Increasing pool size to top {current_pool_size}")
-                last_successful_attempt = attempts
-        
-        current_pool_names = all_names[:current_pool_size]
-        new_molecules = ga_operator.apply_genetic_operations(current_pool_names, num_crossovers=10)
+        new_molecules = ga_operator.apply_genetic_operations(all_names, num_crossovers=10)
         
         for mol in new_molecules:
             if len(unique_molecules) >= desired_count:
@@ -1112,12 +1125,17 @@ async def generate_unique_molecules_from_top200(
             smiles = mol.get('smiles')
             
             validation_stats['total_generated'] += 1
+            total_generated += 1
             
             if molecule_name in [m['name'] for m in unique_molecules]:
+                duplications += 1
+                validation_stats['duplications'] += 1
                 continue
             
             if molecule_name in generated_molecules:
                 logger.debug(f"   ⏭️  Molecule {molecule_name} already generated")
+                duplications += 1
+                validation_stats['duplications'] += 1
                 continue
             
             inchikey = None
@@ -1125,6 +1143,8 @@ async def generate_unique_molecules_from_top200(
                 inchikey = generate_inchikey(smiles) if smiles else None
                 if inchikey and inchikey in generated_inchikeys:
                     logger.debug(f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated")
+                    duplications += 1
+                    validation_stats['duplications'] += 1
                     continue
             except Exception as e:
                 logger.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
@@ -1153,7 +1173,6 @@ async def generate_unique_molecules_from_top200(
             generated_molecules.add(molecule_name)
             if inchikey:
                 generated_inchikeys.add(inchikey)
-            last_successful_attempt = attempts
             validation_stats['passed_validation'] += 1
             
             logger.info(
@@ -1169,11 +1188,17 @@ async def generate_unique_molecules_from_top200(
     state['generated_molecules'] = generated_molecules
     state['generated_inchikeys'] = generated_inchikeys
     
+    # Calculate duplication ratio
+    duplication_ratio = duplications / total_generated if total_generated > 0 else 0.0
+    
     logger.info(
-        f"✅ Generated {len(unique_molecules)} valid molecules (attempts: {attempts})"
+        f"✅ Generated {len(unique_molecules)} valid molecules from pool "
+        f"[{pool_start_idx}:{pool_end_idx}] (attempts: {attempts})"
+        f"\n   Duplication ratio: {duplication_ratio:.2%} ({duplications}/{total_generated})"
         f"\n   Validation stats:"
         f"\n   - Total generated: {validation_stats['total_generated']}"
         f"\n   - Passed validation: {validation_stats['passed_validation']}"
+        f"\n   - Duplications: {validation_stats['duplications']}"
         f"\n   - Failed SMILES: {validation_stats['failed_smiles']}"
         f"\n   - Failed heavy atoms: {validation_stats['failed_heavy_atoms']}"
         f"\n   - Failed banned atoms: {validation_stats['failed_banned_atoms']}"
@@ -1182,12 +1207,13 @@ async def generate_unique_molecules_from_top200(
         f"\n   - Failed other: {validation_stats['failed_other']}"
     )
     
-    return unique_molecules
+    return unique_molecules, duplication_ratio
 
 
 async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
     """
     Main loop that continuously generates and scores molecules until interrupted.
+    Adaptively expands the molecule pool when duplication ratio is high.
     """
     logger.info("🚀 Starting generation and scoring loop...")
     logger.info("Press Ctrl+C to stop")
@@ -1195,6 +1221,12 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
     desired_unique_count = 100
     batch_size = 10
     round_number = 0
+    
+    # Pool management
+    pool_size = 100  # Start with top 100
+    pool_start_idx = 0
+    pool_expansion_step = 100
+    duplication_threshold = 0.7  # If duplication ratio > 70%, expand pool
     
     try:
         while True:
@@ -1220,21 +1252,25 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 await asyncio.sleep(10)
                 continue
             
-            # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(30)
-            # top_200_df = molecules_df[100:200]
-            
             # Update state with new molecules
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-            state['top_200_df'] = top_200_df
             
-            logger.info(f"✅ Reloaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
+            # Determine pool range
+            pool_end_idx = min(pool_start_idx + pool_size, len(molecules_df))
             
-            # Generate unique molecules
-            logger.info(f"🧬 Generating {desired_unique_count} unique molecules with validation...")
-            unique_molecules = await generate_unique_molecules_from_top200(
-                state, top_200_df, desired_unique_count
+            logger.info(
+                f"✅ Reloaded {len(molecules_df)} molecules from CSV and database"
+                f"\n   Using pool [{pool_start_idx}:{pool_end_idx}] (size: {pool_end_idx - pool_start_idx})"
+            )
+            
+            # Generate unique molecules from current pool
+            unique_molecules, duplication_ratio = await generate_unique_molecules_from_pool(
+                state,
+                molecules_df,
+                pool_start_idx,
+                pool_end_idx,
+                desired_unique_count
             )
             
             if not unique_molecules:
@@ -1242,7 +1278,38 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 await asyncio.sleep(10)
                 continue
             
-            logger.info(f"✅ Generated {len(unique_molecules)} valid unique molecules")
+            logger.info(
+                f"✅ Generated {len(unique_molecules)} valid unique molecules "
+                f"(duplication ratio: {duplication_ratio:.2%})"
+            )
+            
+            # Check if we need to expand the pool
+            if duplication_ratio > duplication_threshold:
+                new_pool_start = pool_start_idx + pool_size
+                new_pool_end = new_pool_start + pool_expansion_step
+                
+                if new_pool_end <= len(molecules_df):
+                    logger.info(
+                        f"📈 Duplication ratio {duplication_ratio:.2%} > {duplication_threshold:.2%}, "
+                        f"expanding pool to [{new_pool_start}:{new_pool_end}]"
+                    )
+                    pool_start_idx = new_pool_start
+                    pool_size = pool_expansion_step
+                else:
+                    logger.warning(
+                        f"⚠️  Duplication ratio {duplication_ratio:.2%} > {duplication_threshold:.2%}, "
+                        f"but reached end of molecule pool (size: {len(molecules_df)})"
+                    )
+                    # Reset to beginning if we've exhausted the pool
+                    if pool_start_idx > 0:
+                        logger.info("🔄 Resetting pool to start from beginning")
+                        pool_start_idx = 0
+                        pool_size = 100
+            else:
+                logger.info(
+                    f"✅ Duplication ratio {duplication_ratio:.2%} <= {duplication_threshold:.2%}, "
+                    f"keeping current pool"
+                )
             
             # Score this batch of molecules in batches of 10
             total_batches = (len(unique_molecules) + batch_size - 1) // batch_size
@@ -1290,6 +1357,8 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 f"\n   - Scored: {len(all_scored_molecules)} molecules"
                 f"\n   - Best molecule: {best_molecule_so_far['name'] if best_molecule_so_far else 'None'}"
                 f"\n   - Best score: {best_score_str}"
+                f"\n   - Current pool: [{pool_start_idx}:{pool_start_idx + pool_size}]"
+                f"\n   - Duplication ratio: {duplication_ratio:.2%}"
             )
             
             # Wait a bit before next round
@@ -1324,7 +1393,6 @@ async def main():
         'generated_molecules': set(),
         'generated_inchikeys': set(),
         'boltz_wrapper': None,
-        'top_200_df': pd.DataFrame(),
     }
     
     # Get target proteins from config

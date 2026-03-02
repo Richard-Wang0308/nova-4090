@@ -4,7 +4,6 @@ pm2 start "python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-
 
 
 #crossover
-python3 neurons/miner_ban_mini.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #crossover with db
 python3 neurons/miner_ban_mini_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
@@ -19,7 +18,8 @@ python3 neurons/miner_ban_neighbour_mutate.py --wallet.name multisig-jjpes-shib 
 python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #simple submit
-python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
+python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotg --logging.debug
+python3 neurons/simple_submit.py --wallet.name xova --wallet.hotkey xotc --logging.debug
 
 #top submit
 python3 neurons/top_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
