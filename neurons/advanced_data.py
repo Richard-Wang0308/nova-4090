@@ -2182,7 +2182,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             return
         
         # Get top 500 molecules
-        top_500_df = molecules_df.head(400)
+        top_500_df = molecules_df.head(200)
         
         # Store in state
         state['top_pool'] = molecules_df.copy()
