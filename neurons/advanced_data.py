@@ -1804,7 +1804,8 @@ def load_molecules_combined(
     csv_df['source'] = 'csv'
     db_df['source'] = 'database'
     
-    combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    combined_df = csv_df
+    # combined_df = pd.concat([csv_df, db_df], ignore_index=True)
     
     # Deduplicate by InChIKey, keeping the one with the highest score
     combined_df = combined_df.sort_values(
@@ -2181,7 +2182,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             return
         
         # Get top 500 molecules
-        top_500_df = molecules_df.head(1000)
+        top_500_df = molecules_df.head(400)
         
         # Store in state
         state['top_pool'] = molecules_df.copy()

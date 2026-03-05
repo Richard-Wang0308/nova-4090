@@ -723,7 +723,8 @@ def load_molecules_combined(
     db_df['source'] = 'database'
     
     # Combine dataframes
-    combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    # combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    combined_df = csv_df
     
     # Deduplicate by InChIKey, keeping the one with the highest score
     # If scores are equal, prefer database (more recent scoring)
@@ -1221,8 +1222,8 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(30)
-            # top_200_df = molecules_df[100:200]
+            # top_200_df = molecules_df.head(100)
+            top_200_df = molecules_df[100:200]
             
             # Update state with new molecules
             state['top_pool'] = molecules_df.copy()

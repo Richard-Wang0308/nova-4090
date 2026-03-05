@@ -30,7 +30,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--start_epoch', type=int, default=21213, help='Starting epoch number to collect from')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
     parser.add_argument('--output', type=str, default='data/mols.csv', help='Output CSV file')
-    parser.add_argument('--time', type=int, default=10, 
+    parser.add_argument('--time', type=int, default=1200, 
                        help='Remaining time in seconds until first collection. If None, collect immediately.')
     
     args = parser.parse_args()
