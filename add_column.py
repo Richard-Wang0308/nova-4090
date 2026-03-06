@@ -176,7 +176,7 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
             cursor.execute("SELECT molecule_name FROM scored_molecules")
         else:
             bt.logging.info("Incremental mode: Processing only molecules with NULL available values...")
-            cursor.execute("SELECT molecule_name FROM scored_molecules WHERE available IS NULL")
+            cursor.execute("SELECT molecule_name FROM scored_molecules WHERE available IS true")
         
         molecules = cursor.fetchall()
         

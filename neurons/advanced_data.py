@@ -1033,7 +1033,7 @@ class AdaptiveStrategyManager:
                 crossover_ratio=0.2,
                 mutation_ratio=0.8,
                 local_search_ratio=0.0,
-                pool_size=100,
+                pool_size=200,
                 use_guided_ops=False,
                 phase='exploration'
             )
@@ -1072,7 +1072,7 @@ class AdaptiveStrategyManager:
                 crossover_ratio=0.4,
                 mutation_ratio=0.6,
                 local_search_ratio=0.0,
-                pool_size=100,
+                pool_size=200,
                 use_guided_ops=False,
                 phase='exploration'
             )
@@ -1086,7 +1086,7 @@ class AdaptiveStrategyManager:
                 crossover_ratio=0.6,
                 mutation_ratio=0.3,
                 local_search_ratio=0.1,
-                pool_size=50,
+                pool_size=100,
                 use_guided_ops=True,
                 phase='exploitation'
             )
@@ -1100,7 +1100,7 @@ class AdaptiveStrategyManager:
                 crossover_ratio=0.5,
                 mutation_ratio=0.2,
                 local_search_ratio=0.3,
-                pool_size=30,
+                pool_size=50,
                 use_guided_ops=True,
                 phase='refinement'
             )
@@ -2182,7 +2182,7 @@ async def startup_phase(state: Dict[str, Any]) -> None:
             return
         
         # Get top 500 molecules
-        top_500_df = molecules_df.head(200)
+        top_500_df = molecules_df.head(500)
         
         # Store in state
         state['top_pool'] = molecules_df.copy()
@@ -2217,7 +2217,7 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
     """
     print("🚀 Starting CONTINUOUS ADVANCED genetic algorithm loop...")
     
-    desired_unique_count = 100
+    desired_unique_count = 1000
     batch_size = 10
     round_number = 0
     
