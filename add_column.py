@@ -30,10 +30,10 @@ async def check_molecule_unique(target_protein: str, molecule_name: str, smiles:
         is_unique_hf = molecule_unique_for_protein_hf(target_protein, smiles)
         
         if not is_unique_hf:
-            bt.logging.debug(f"❌ Molecule {molecule_name} already in HuggingFace dataset")
+            # bt.logging.debug(f"❌ Molecule {molecule_name} already in HuggingFace dataset")
             return False
         
-        bt.logging.info(f"✅ Molecule {molecule_name} is NOT in HuggingFace (unique!)")
+        # bt.logging.info(f"✅ Molecule {molecule_name} is NOT in HuggingFace (unique!)")
         return True
     except Exception as e:
         bt.logging.error(f"Error checking uniqueness: {e}")
@@ -159,12 +159,12 @@ def fix_available_column_simple(db_path: str):
 async def update_available_values(db_path: str, target_protein: str, force_recalculate: bool = False):
     """
     Update available values for molecules in scored_molecules table.
-    Only processes molecules where available is NULL (not yet calculated).
+    ONLY processes molecules where available is TRUE (skips FALSE and NULL).
     
     Args:
         db_path: Path to the SQLite database
         target_protein: The target protein name to check against
-        force_recalculate: If True, recalculate all molecules. If False, only process NULL values.
+        force_recalculate: If True, recalculate all molecules. If False, only process TRUE values.
     """
     try:
         conn = sqlite3.connect(db_path)
@@ -175,15 +175,16 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
             bt.logging.info("Force recalculate mode: Processing ALL molecules...")
             cursor.execute("SELECT molecule_name FROM scored_molecules")
         else:
-            bt.logging.info("Incremental mode: Processing only molecules with NULL available values...")
-            cursor.execute("SELECT molecule_name FROM scored_molecules WHERE available IS true")
+            # FIXED: Only process rows where available is TRUE
+            bt.logging.info("Incremental mode: Processing only molecules with available = TRUE...")
+            cursor.execute("SELECT molecule_name FROM scored_molecules WHERE available = TRUE")
         
         molecules = cursor.fetchall()
         
         total = len(molecules)
         
         if total == 0:
-            bt.logging.info("✅ No molecules to process. All molecules already have available values!")
+            bt.logging.info("✅ No molecules to process. All molecules already have been processed or have FALSE values!")
             conn.close()
             return
         
@@ -191,6 +192,8 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         
         success_count = 0
         error_count = 0
+        updated_to_false = 0
+        updated_to_true = 0
         
         for idx, (molecule_name,) in enumerate(molecules, 1):
             try:
@@ -200,10 +203,17 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                 if smiles is None:
                     bt.logging.warning(f"Could not generate SMILES for {molecule_name}")
                     available = False
+                    updated_to_false += 1
                     error_count += 1
                 else:
                     # Check if molecule is unique
                     available = await check_molecule_unique(target_protein, molecule_name, smiles)
+                    
+                    if available:
+                        updated_to_true += 1
+                    else:
+                        updated_to_false += 1
+                    
                     success_count += 1
                 
                 # Update database with TRUE/FALSE
@@ -214,19 +224,30 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                 
                 if idx % 100 == 0:
                     conn.commit()
-                    bt.logging.info(f"Progress: {idx}/{total} molecules processed ({success_count} success, {error_count} errors)")
+                    bt.logging.info(
+                        f"Progress: {idx}/{total} | Success: {success_count} | "
+                        f"Errors: {error_count} | Updated to TRUE: {updated_to_true} | "
+                        f"Updated to FALSE: {updated_to_false}"
+                    )
                 
             except Exception as e:
                 bt.logging.error(f"Error processing molecule {molecule_name}: {e}")
                 error_count += 1
+                # Set to FALSE on error
                 cursor.execute(
                     "UPDATE scored_molecules SET available = ? WHERE molecule_name = ?",
                     (False, molecule_name)
                 )
+                updated_to_false += 1
         
         conn.commit()
         conn.close()
-        bt.logging.info(f"✅ Successfully processed {total} molecules ({success_count} success, {error_count} errors)")
+        
+        bt.logging.info("=" * 70)
+        bt.logging.info(f"✅ Successfully processed {total} molecules")
+        bt.logging.info(f"   Success: {success_count} | Errors: {error_count}")
+        bt.logging.info(f"   Updated to TRUE: {updated_to_true} | Updated to FALSE: {updated_to_false}")
+        bt.logging.info("=" * 70)
         
     except Exception as e:
         bt.logging.error(f"Error updating available values: {e}")
@@ -309,7 +330,7 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
     Main function to fix column type and update values.
     
     Args:
-        force_recalculate: If True, recalculate all molecules. If False, only process new ones.
+        force_recalculate: If True, recalculate all molecules. If False, only process TRUE values.
         skip_column_fix: If True, skip the column type fix (useful for subsequent runs)
     """
     # Set database path
@@ -331,7 +352,7 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
     bt.logging.info("\nChecking current database state...")
     get_statistics(db_path)
     
-    # Update available values (only NULL values by default)
+    # Update available values (only TRUE values by default)
     bt.logging.info("\nUpdating available values...")
     await update_available_values(db_path, TARGET_PROTEIN, force_recalculate=force_recalculate)
     
