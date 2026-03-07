@@ -30,6 +30,11 @@ from utils import (
 )
 from molecules_base import generate_inchikey
 from combinatorial_db.reactions import get_smiles_from_reaction
+from enhanced_generation_dpex import (
+    EnhancedMoleculeGenerator,
+    SynthonLibraryEnhanced,
+    MoleculeCandidate
+)
 
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
@@ -65,7 +70,6 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = config.get('min_heavy_atoms', 10)
         min_atoms = 21
         max_atoms = 26
 
@@ -184,120 +188,41 @@ async def validate_molecule_complete(
     return len(errors) == 0, errors
 
 
-class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
+def load_components_from_db(role: str, rxn_id: int) -> List[Tuple[int, str, int]]:
+    """
+    Load component molecules from database.
     
-    def __init__(self, rxn_id: int, db_path: str):
-        """Initialize GA operator."""
-        self.rxn_id = rxn_id
-        self.db_path = db_path
-        self.generated_molecule_names: Set[str] = set()
+    Args:
+        role: 'A', 'B', or 'C'
+        rxn_id: Reaction ID
     
-    def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
-        """Crossover two molecules by swapping random components."""
-        try:
-            parts1 = mol_name_1.split(':')
-            parts2 = mol_name_2.split(':')
-            
-            # logger.debug(f"Crossover: {mol_name_1} x {mol_name_2}")
-            
-            if (parts1[0] != 'rxn' or parts2[0] != 'rxn'):
-                logger.debug(f"Invalid format: must start with 'rxn'")
-                return None
-            
-            if len(parts1) != len(parts2):
-                logger.debug(f"Invalid format: different number of components")
-                return None
-            
-            if len(parts1) not in [4, 5]:
-                logger.debug(f"Invalid format: expected 4 or 5 parts, got {len(parts1)}")
-                return None
-            
-            try:
-                rxn_id_1 = int(parts1[1])
-                rxn_id_2 = int(parts2[1])
-                if rxn_id_1 != self.rxn_id or rxn_id_2 != self.rxn_id:
-                    logger.debug(f"Wrong rxn_ids: {rxn_id_1}, {rxn_id_2}")
-                    return None
-            except (ValueError, IndexError) as e:
-                logger.debug(f"Error parsing rxn_ids: {e}")
-                return None
-            
-            num_components = len(parts1) - 2
-            component_indices = list(range(2, 2 + num_components))
-            swap_idx = random.choice(component_indices)
-            
-            offspring_parts = parts1.copy()
-            offspring_parts[swap_idx] = parts2[swap_idx]
-            offspring_name = ':'.join(offspring_parts)
-            
-            if offspring_name in self.generated_molecule_names:
-                # logger.debug(f"⚠️  Offspring {offspring_name} already generated in this batch")
-                return None
-            
-            try:
-                offspring_smiles = get_smiles_from_reaction(offspring_name)
-                if offspring_smiles:
-                    mol = Chem.MolFromSmiles(offspring_smiles)
-                    if mol is not None:
-                        self.generated_molecule_names.add(offspring_name)
-                        # logger.info(f"✅ Crossover successful: {mol_name_1} × {mol_name_2} → {offspring_name}")
-                        return offspring_name
-                    else:
-                        logger.debug(f"Invalid SMILES from RDKit: {offspring_smiles}")
-                else:
-                    logger.debug(f"No SMILES generated for offspring")
-            except Exception as e:
-                logger.debug(f"Error validating crossover: {e}")
-            
-            return None
+    Returns:
+        List of (mol_id, smiles, role_mask) tuples
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
         
-        except Exception as e:
-            logger.debug(f"Error in crossover_molecules: {e}")
-            return None
-    
-    def apply_genetic_operations(
-        self,
-        top_molecules: List[str],
-        num_crossovers: int = 5
-    ) -> List[Dict[str, Any]]:
-        """Apply genetic operations (CROSSOVER ONLY) to top molecules."""
-        new_molecules = []
-        self.generated_molecule_names.clear()
+        # Map role to role_mask
+        role_mask = {'A': 1, 'B': 2, 'C': 4}.get(role, 0)
         
-        # logger.info(f"🧬 Applying CROSSOVER-ONLY genetic operations to top {len(top_molecules)} molecules...")
+        cursor.execute(
+            "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?",
+            (role_mask, role_mask)
+        )
+        results = cursor.fetchall()
+        conn.close()
         
-        crossovers_created = 0
-        
-        for i in range(num_crossovers):
-            parent1 = random.choice(top_molecules)
-            parent2 = random.choice(top_molecules)
-            
-            # logger.info(f"   Attempting crossover {i+1}/{num_crossovers}: {parent1} x {parent2}")
-            
-            if parent1 != parent2:
-                offspring = self.crossover_molecules(parent1, parent2)
-                
-                if offspring:
-                    try:
-                        smiles = get_smiles_from_reaction(offspring)
-                        inchikey = generate_inchikey(smiles)
-                        
-                        if smiles and inchikey:
-                            new_molecules.append({
-                                'name': offspring,
-                                'smiles': smiles,
-                                'InChIKey': inchikey,
-                                'type': 'crossover'
-                            })
-                            crossovers_created += 1
-                            # logger.info(f"   ✅ Crossover #{crossovers_created}: {offspring}")
-                    
-                    except Exception as e:
-                        logger.debug(f"Error processing offspring: {e}")
-        
-        # logger.info(f"   Crossovers: {crossovers_created}/{num_crossovers} successful")
-        return new_molecules
+        logger.info(f"✅ Loaded {len(results)} {role} components from database")
+        return results
+    except Exception as e:
+        logger.error(f"❌ Error loading {role} components: {e}")
+        return []
+
+
+def extract_component_ids(molecules: List[Tuple[int, str, int]]) -> List[int]:
+    """Extract component IDs from molecule tuples."""
+    return [mol[0] for mol in molecules]
 
 
 def init_score_results_db(db_path: str = None) -> None:
@@ -329,9 +254,9 @@ def init_score_results_db(db_path: str = None) -> None:
         
         conn.commit()
         conn.close()
-        print(f"Initialized score_results database at {db_path}")
+        logger.info(f"✅ Initialized score_results database at {db_path}")
     except Exception as e:
-        print(f"Error initializing score_results database: {e}")
+        logger.error(f"❌ Error initializing score_results database: {e}")
 
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
@@ -376,15 +301,15 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         
         if to_insert:
             cursor.executemany(
-                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            logger.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        print(f"Error writing scores to database: {e}")
+        logger.error(f"❌ Error writing scores to database: {e}")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
@@ -478,7 +403,6 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check heavy atom count
-                # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 21
                 max_heavy_atoms = 26
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
@@ -720,29 +644,20 @@ def load_molecules_combined(
         return csv_df
     
     # Merge dataframes
-    # Add source column for tracking
     csv_df['source'] = 'csv'
     db_df['source'] = 'database'
     
-    # Combine dataframes
-    # combined_df = pd.concat([csv_df, db_df], ignore_index=True)
     combined_df = csv_df
     
     # Deduplicate by InChIKey, keeping the one with the highest score
-    # If scores are equal, prefer database (more recent scoring)
     combined_df = combined_df.sort_values(
         by=['score', 'source'],
-        ascending=[False, True],  # Higher score first, then 'database' before 'csv'
+        ascending=[False, True],
         na_position='last'
     )
     
-    # Keep first occurrence (highest score, or database if scores equal)
     combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
-    
-    # Remove source column
     combined_df = combined_df.drop(columns=['source'])
-    
-    # Sort by score
     combined_df = combined_df.sort_values(by='score', ascending=False, na_position='last')
     
     csv_count = len(csv_df)
@@ -1055,32 +970,88 @@ def _import_boltz_wrapper():
         return False
 
 
-async def generate_unique_molecules_from_top200(
+async def generate_unique_molecules_enhanced(
     state: Dict[str, Any],
-    top_200_df: pd.DataFrame,
-    desired_count: int = 100
+    top_molecules_df: pd.DataFrame,
+    desired_count: int = 1000,
+    strategy: str = "hybrid"
 ) -> List[Dict[str, Any]]:
-    """Generate unique molecules using genetic algorithm from top 200 molecules."""
-    if top_200_df.empty:
-        logger.warning("Top 200 DataFrame is empty")
+    """
+    Generate unique molecules using enhanced DPEX-DJA strategy.
+    
+    Args:
+        state: State dictionary with synthon library and component pool
+        top_molecules_df: DataFrame of top molecules to use as seed
+        desired_count: Number of molecules to generate
+        strategy: "hybrid" (default), "dja", "tabu", "exploit", "crossover"
+    
+    Returns:
+        List of generated molecules with SMILES and metadata
+    """
+    
+    if top_molecules_df.empty:
+        logger.warning("Top molecules DataFrame is empty")
         return []
     
-    ga_operator = GeneticAlgorithmOperator(HARDCODED_RXN_ID, DB_PATH)
-    all_names = top_200_df['name'].tolist()
+    # Initialize enhanced generator if not already done
+    if 'enhanced_generator' not in state:
+        logger.info("🧬 Initializing EnhancedMoleculeGenerator...")
+        
+        # Load component pool from database
+        component_pool_A = load_components_from_db('A', HARDCODED_RXN_ID)
+        component_pool_B = load_components_from_db('B', HARDCODED_RXN_ID)
+        component_pool_C = load_components_from_db('C', HARDCODED_RXN_ID)
+        
+        if not component_pool_A or not component_pool_B:
+            logger.error("❌ Failed to load component pools from database")
+            return []
+        
+        # Initialize synthon library
+        synthon_lib = SynthonLibraryEnhanced(
+            molecules_A=component_pool_A,
+            molecules_B=component_pool_B,
+            molecules_C=component_pool_C if component_pool_C else None
+        )
+        
+        # Extract component IDs
+        component_ids_A = extract_component_ids(component_pool_A)
+        component_ids_B = extract_component_ids(component_pool_B)
+        component_ids_C = extract_component_ids(component_pool_C) if component_pool_C else []
+        
+        # Initialize generator
+        generator = EnhancedMoleculeGenerator(
+            rxn_id=HARDCODED_RXN_ID,
+            synthon_library=synthon_lib,
+            component_ids_A=component_ids_A,
+            component_ids_B=component_ids_B,
+            component_ids_C=component_ids_C
+        )
+        
+        state['enhanced_generator'] = generator
+        state['synthon_library'] = synthon_lib
+        state['component_ids_A'] = component_ids_A
+        state['component_ids_B'] = component_ids_B
+        state['component_ids_C'] = component_ids_C
+        
+        logger.info(f"✅ EnhancedMoleculeGenerator initialized")
     
-    pool_sizes = [30, 50, 100, 150, 200]
-    current_pool_size_idx = 0
-    current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
+    generator = state['enhanced_generator']
     
-    logger.info(f"🧬 Generating {desired_count} unique molecules with validation (starting with top {current_pool_size})...")
+    # Convert DataFrame to list of dicts for generation
+    top_molecules = top_molecules_df.head(500).to_dict('records')
+    
+    logger.info(
+        f"🧬 Generating {desired_count} molecules using '{strategy}' strategy "
+        f"from {len(top_molecules)} seed molecules..."
+    )
     
     unique_molecules = []
-    attempts = 0
-    max_attempts = 500
-    last_successful_attempt = 0
-    
-    generated_molecules = state.get('generated_molecules', set())
+    generated_names = state.get('generated_molecules', set())
     generated_inchikeys = state.get('generated_inchikeys', set())
+    
+    attempts = 0
+    max_attempts = 1000
+    batch_size = 50
     
     validation_stats = {
         'total_generated': 0,
@@ -1090,57 +1061,45 @@ async def generate_unique_molecules_from_top200(
         'failed_banned_atoms': 0,
         'failed_rotatable_bonds': 0,
         'failed_hf_unique': 0,
-        'failed_other': 0,
     }
     
     while len(unique_molecules) < desired_count and attempts < max_attempts:
         attempts += 1
         
-        if attempts - last_successful_attempt >= 100 and current_pool_size_idx < len(pool_sizes) - 1:
-            current_pool_size_idx += 1
-            new_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
-            if new_pool_size > current_pool_size:
-                current_pool_size = new_pool_size
-                logger.info(f"📈 Increasing pool size to top {current_pool_size}")
-                last_successful_attempt = attempts
+        # Generate batch
+        candidates = generator.generate_batch(
+            top_molecules,
+            strategy=strategy,
+            batch_size=batch_size
+        )
         
-        current_pool_names = all_names[:current_pool_size]
-        new_molecules = ga_operator.apply_genetic_operations(current_pool_names, num_crossovers=10)
-        
-        for mol in new_molecules:
+        for candidate in candidates:
             if len(unique_molecules) >= desired_count:
                 break
             
-            molecule_name = mol['name']
-            smiles = mol.get('smiles')
-            
-            validation_stats['total_generated'] += 1
-            
-            if molecule_name in [m['name'] for m in unique_molecules]:
+            # Skip if already generated
+            if candidate.name in generated_names:
                 continue
             
-            if molecule_name in generated_molecules:
-                logger.debug(f"   ⏭️  Molecule {molecule_name} already generated")
-                continue
-            
-            inchikey = None
+            # Get SMILES from reaction
             try:
-                inchikey = generate_inchikey(smiles) if smiles else None
-                if inchikey and inchikey in generated_inchikeys:
-                    logger.debug(f"   ⏭️  Molecule {molecule_name} (InChIKey: {inchikey}) already generated")
+                smiles = get_smiles_from_reaction(candidate.name)
+                if not smiles:
+                    validation_stats['failed_smiles'] += 1
                     continue
             except Exception as e:
-                logger.debug(f"   Could not generate InChIKey for {molecule_name}: {e}")
+                logger.debug(f"Error getting SMILES for {candidate.name}: {e}")
+                validation_stats['failed_smiles'] += 1
+                continue
             
-            # Validate with config.yaml settings
-            is_valid, errors = await validate_molecule_complete(state, molecule_name, smiles, state['config'])
+            # Validate molecule
+            is_valid, errors = await validate_molecule_complete(
+                state, candidate.name, smiles, state['config']
+            )
             
             if not is_valid:
                 for error in errors:
-                    logger.debug(f"   ❌ {molecule_name}: {error}")
-                    if "[SMILES]" in error:
-                        validation_stats['failed_smiles'] += 1
-                    elif "[HEAVY_ATOMS]" in error:
+                    if "[HEAVY_ATOMS]" in error:
                         validation_stats['failed_heavy_atoms'] += 1
                     elif "[BANNED_ATOMS]" in error:
                         validation_stats['failed_banned_atoms'] += 1
@@ -1148,165 +1107,178 @@ async def generate_unique_molecules_from_top200(
                         validation_stats['failed_rotatable_bonds'] += 1
                     elif "[HF_UNIQUE]" in error:
                         validation_stats['failed_hf_unique'] += 1
-                    else:
-                        validation_stats['failed_other'] += 1
                 continue
             
-            unique_molecules.append(mol)
-            generated_molecules.add(molecule_name)
-            if inchikey:
-                generated_inchikeys.add(inchikey)
-            last_successful_attempt = attempts
-            validation_stats['passed_validation'] += 1
+            # Generate InChIKey
+            try:
+                inchikey = generate_inchikey(smiles)
+                if inchikey in generated_inchikeys:
+                    continue
+            except Exception as e:
+                logger.debug(f"Error generating InChIKey: {e}")
+                continue
             
-            # logger.info(
-            #     f"   ✅ Added valid molecule {molecule_name} "
-            #     f"({len(unique_molecules)}/{desired_count})"
-            # )
+            # Add to results
+            unique_molecules.append({
+                'name': candidate.name,
+                'smiles': smiles,
+                'InChIKey': inchikey,
+                'type': candidate.generation_method
+            })
+            
+            generated_names.add(candidate.name)
+            generated_inchikeys.add(inchikey)
+            validation_stats['passed_validation'] += 1
+            validation_stats['total_generated'] += 1
         
-        if len(unique_molecules) >= desired_count:
-            break
+        # Update stagnation tracking
+        if top_molecules and 'score' in top_molecules[0]:
+            generator.update_stagnation(top_molecules[0]['score'])
         
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.01)
     
-    state['generated_molecules'] = generated_molecules
+    state['generated_molecules'] = generated_names
     state['generated_inchikeys'] = generated_inchikeys
     
+    # Log statistics
+    gen_stats = generator.get_statistics()
     logger.info(
-        f"✅ Generated {len(unique_molecules)} valid molecules (attempts: {attempts})"
-        f"\n   Validation stats:"
-        f"\n   - Total generated: {validation_stats['total_generated']}"
-        f"\n   - Passed validation: {validation_stats['passed_validation']}"
-        f"\n   - Failed SMILES: {validation_stats['failed_smiles']}"
-        f"\n   - Failed heavy atoms: {validation_stats['failed_heavy_atoms']}"
-        f"\n   - Failed banned atoms: {validation_stats['failed_banned_atoms']}"
-        f"\n   - Failed rotatable bonds: {validation_stats['failed_rotatable_bonds']}"
-        f"\n   - Failed HF uniqueness: {validation_stats['failed_hf_unique']}"
-        f"\n   - Failed other: {validation_stats['failed_other']}"
+        f"✅ Generated {len(unique_molecules)} valid molecules "
+        f"(attempts: {attempts}, strategy: {strategy})"
+        f"\n   Validation: {validation_stats['passed_validation']}/{validation_stats['total_generated']}"
+        f"\n   Generator stats:"
+        f"\n   - Total generated: {gen_stats['total_generated']}"
+        f"\n   - Pop A size: {gen_stats['pop_a_size']}"
+        f"\n   - Pop B size: {gen_stats['pop_b_size']}"
+        f"\n   - Stagnation counter: {gen_stats['stagnation_counter']}"
+        f"\n   - Best score: {gen_stats['last_best_score']:.6f}"
     )
     
     return unique_molecules
 
 
-async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
+async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> None:
     """
-    Main loop that continuously generates and scores molecules until interrupted.
+    Enhanced generation and scoring loop with DPEX-DJA strategy rotation.
     """
-    logger.info("🚀 Starting generation and scoring loop...")
+    logger.info("🚀 Starting enhanced generation and scoring loop...")
     logger.info("Press Ctrl+C to stop")
     
     desired_unique_count = 1000
     batch_size = 10
     round_number = 0
+    strategy_rotation = ["hybrid", "dja", "tabu", "exploit"]
+    strategy_idx = 0
     
     try:
         while True:
             round_number += 1
+            current_strategy = strategy_rotation[strategy_idx % len(strategy_rotation)]
+            strategy_idx += 1
+            
             logger.info(f"\n{'='*70}")
-            logger.info(f"🔄 Round {round_number}")
+            logger.info(f"🔄 Round {round_number} (Strategy: {current_strategy})")
             logger.info(f"{'='*70}")
             
-            # Reload molecules from CSV and database
-            logger.info("📂 Reloading molecules from CSV and database...")
-            config = state['config']
+            # Reload molecules
             molecules_df = load_molecules_combined(
                 REACTION_TRAIN_CSV,
                 SCORE_RESULTS_DB,
                 state['current_challenge_targets'],
                 STARTING_EPOCH,
                 HARDCODED_RXN_ID,
-                config
+                state['config']
             )
             
             if molecules_df.empty:
-                logger.warning("⚠️  No valid molecules loaded from CSV or database, waiting...")
+                logger.warning("⚠️  No molecules loaded, waiting...")
                 await asyncio.sleep(10)
                 continue
             
-            # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(700)
-            # top_200_df = molecules_df.head(200)
-            # top_200_df = molecules_df[0:250]
-            
-            # Update state with new molecules
+            top_molecules_df = molecules_df.head(700)
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
-            state['top_200_df'] = top_200_df
             
-            logger.info(f"✅ Reloaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
+            logger.info(f"✅ Loaded {len(molecules_df)} molecules (top 700 for generation)")
             
-            # Generate unique molecules
-            logger.info(f"🧬 Generating {desired_unique_count} unique molecules with validation...")
-            unique_molecules = await generate_unique_molecules_from_top200(
-                state, top_200_df, desired_unique_count
+            # Generate with enhanced strategy
+            unique_molecules = await generate_unique_molecules_enhanced(
+                state,
+                top_molecules_df,
+                desired_count=desired_unique_count,
+                strategy=current_strategy
             )
             
             if not unique_molecules:
-                logger.warning("Failed to generate unique molecules, waiting before retry...")
+                logger.warning("⚠️  Failed to generate molecules, waiting...")
                 await asyncio.sleep(10)
                 continue
             
-            logger.info(f"✅ Generated {len(unique_molecules)} valid unique molecules")
+            logger.info(f"✅ Generated {len(unique_molecules)} valid molecules")
             
-            # Score this batch of molecules in batches of 10
-            total_batches = (len(unique_molecules) + batch_size - 1) // batch_size
-            logger.info(f"🔬 Round {round_number}: Scoring {len(unique_molecules)} molecules in {total_batches} batches of {batch_size}...")
-            
-            all_scored_molecules = []
-            best_molecule_so_far = None
-            best_score_so_far = float('-inf')
-            
-            for batch_idx in range(total_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, len(unique_molecules))
-                batch = unique_molecules[start_idx:end_idx]
-                
-                logger.info(
-                    f"   📦 Round {round_number}, Batch {batch_idx + 1}/{total_batches}: "
-                    f"Scoring {len(batch)} molecules"
-                )
-                
-                scored_batch = await score_molecules_with_boltz_batched(
-                    state, batch, batch_size=len(batch)
-                )
-                
-                # Filter molecules with valid scores
-                batch_with_scores = [m for m in scored_batch if m.get('boltz_score') is not None]
-                all_scored_molecules.extend(batch_with_scores)
-                
-                # Update best molecule so far
-                for mol in batch_with_scores:
-                    score = mol.get('boltz_score')
-                    if score is not None and score > best_score_so_far:
-                        best_score_so_far = score
-                        best_molecule_so_far = mol
-                        source = mol.get('boltz_score_source', 'unknown')
-                        logger.info(
-                            f"   🏆 New best in round {round_number}, batch {batch_idx + 1}: "
-                            f"{mol['name']} (score: {score:.6f}, source: {source})"
-                        )
-            
-            # Summary for this round
-            best_score_str = f"{best_score_so_far:.6f}" if best_molecule_so_far else 'N/A'
-            logger.info(
-                f"\n✅ Round {round_number} complete:"
-                f"\n   - Generated: {len(unique_molecules)} molecules"
-                f"\n   - Scored: {len(all_scored_molecules)} molecules"
-                f"\n   - Best molecule: {best_molecule_so_far['name'] if best_molecule_so_far else 'None'}"
-                f"\n   - Best score: {best_score_str}"
+            # Score molecules
+            logger.info(f"🔬 Scoring {len(unique_molecules)} molecules...")
+            scored_molecules = await score_molecules_with_boltz_batched(
+                state, unique_molecules, batch_size=batch_size
             )
             
-            # Wait a bit before next round
+            # Update generator with scores
+            if 'enhanced_generator' in state:
+                scored_dict = {
+                    m['name']: m.get('boltz_score')
+                    for m in scored_molecules
+                    if m.get('boltz_score') is not None
+                }
+                
+                # Convert to MoleculeCandidate objects
+                candidates = [
+                    MoleculeCandidate(
+                        name=m['name'],
+                        smiles=m.get('smiles', ''),
+                        score=m.get('boltz_score'),
+                        generation_method=m.get('type', 'unknown')
+                    )
+                    for m in scored_molecules
+                    if m.get('boltz_score') is not None
+                ]
+                
+                if candidates:
+                    state['enhanced_generator'].dja_manager.update_populations(
+                        candidates, scored_dict
+                    )
+                    logger.info(
+                        f"✅ Updated populations with {len(candidates)} scored molecules"
+                    )
+            
+            # Find best molecule in this round
+            best_in_round = None
+            best_score_in_round = float('-inf')
+            for mol in scored_molecules:
+                score = mol.get('boltz_score')
+                if score is not None and score > best_score_in_round:
+                    best_score_in_round = score
+                    best_in_round = mol
+            
+            logger.info(
+                f"\n✅ Round {round_number} complete:"
+                f"\n   - Strategy: {current_strategy}"
+                f"\n   - Generated: {len(unique_molecules)} molecules"
+                f"\n   - Scored: {len(scored_molecules)} molecules"
+                f"\n   - Best in round: {best_in_round['name'] if best_in_round else 'None'} "
+                f"(score: {best_score_in_round:.6f})"
+            )
+            
+            # Wait before next round
             await asyncio.sleep(5)
     
     except KeyboardInterrupt:
-        logger.info("\n🛑 Stopping generation and scoring loop...")
+        logger.info("\n🛑 Stopping enhanced generation loop...")
         raise
 
 
 async def main():
     """Main entry point."""
-    logger.info("🚀 Starting mini_data.py - Generation and Scoring Tool")
+    logger.info("🚀 Starting mini_data.py - DPEX-DJA Enhanced Generation and Scoring Tool")
     
     # Load config
     try:
@@ -1328,7 +1300,11 @@ async def main():
         'generated_molecules': set(),
         'generated_inchikeys': set(),
         'boltz_wrapper': None,
-        'top_200_df': pd.DataFrame(),
+        'enhanced_generator': None,
+        'synthon_library': None,
+        'component_ids_A': [],
+        'component_ids_B': [],
+        'component_ids_C': [],
     }
     
     # Get target proteins from config
@@ -1338,23 +1314,14 @@ async def main():
         state['current_challenge_targets'] = [config['weekly_target']]
     else:
         logger.warning("No weekly_target found in config, using default")
-        state['current_challenge_targets'] = ['P31652']  # Default target
+        state['current_challenge_targets'] = ['P31652']
     
-    logger.info(f"Target protein: {state['current_challenge_targets'][0]}")
+    logger.info(f"🎯 Target protein: {state['current_challenge_targets'][0]}")
     
     # Initialize score_results database
     logger.info("💾 Initializing score_results database...")
     init_score_results_db()
     logger.info(f"✅ Score results database initialized")
-    
-    # Log validation config
-    logger.info(
-        f"✅ Loaded validation config:"
-        f"\n   - min_heavy_atoms: {config.get('min_heavy_atoms', 10) if isinstance(config, dict) else getattr(config, 'min_heavy_atoms', 10)}"
-        f"\n   - min_rotatable_bonds: {config.get('min_rotatable_bonds', 1) if isinstance(config, dict) else getattr(config, 'min_rotatable_bonds', 1)}"
-        f"\n   - max_rotatable_bonds: {config.get('max_rotatable_bonds', 10) if isinstance(config, dict) else getattr(config, 'max_rotatable_bonds', 10)}"
-        f"\n   - banned_atom_types: {config.get('banned_atom_types', []) if isinstance(config, dict) else getattr(config, 'banned_atom_types', [])}"
-    )
     
     # Import BoltzWrapper
     logger.info("🔬 Importing BoltzWrapper...")
@@ -1375,9 +1342,9 @@ async def main():
         logger.warning("⚠️  BoltzWrapper not available, scoring will be skipped")
         state['boltz_wrapper'] = None
     
-    # Run the main loop
+    # Run the enhanced main loop
     try:
-        await run_generation_and_scoring_loop(state)
+        await run_generation_and_scoring_loop_enhanced(state)
     except KeyboardInterrupt:
         logger.info("✅ Program stopped by user")
     except Exception as e:
