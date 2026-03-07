@@ -217,6 +217,8 @@ def load_components_from_db(role: str, rxn_id: int) -> List[Tuple[int, str, int]
         return results
     except Exception as e:
         logger.error(f"❌ Error loading {role} components: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 
@@ -990,52 +992,75 @@ async def generate_unique_molecules_enhanced(
     """
     
     if top_molecules_df.empty:
-        logger.warning("Top molecules DataFrame is empty")
+        logger.warning("❌ Top molecules DataFrame is empty")
         return []
     
     # Initialize enhanced generator if not already done
-    if 'enhanced_generator' not in state:
+    if 'enhanced_generator' not in state or state['enhanced_generator'] is None:
         logger.info("🧬 Initializing EnhancedMoleculeGenerator...")
         
-        # Load component pool from database
-        component_pool_A = load_components_from_db('A', HARDCODED_RXN_ID)
-        component_pool_B = load_components_from_db('B', HARDCODED_RXN_ID)
-        component_pool_C = load_components_from_db('C', HARDCODED_RXN_ID)
+        try:
+            # Load component pool from database
+            logger.info("📂 Loading component pools from database...")
+            component_pool_A = load_components_from_db('A', HARDCODED_RXN_ID)
+            component_pool_B = load_components_from_db('B', HARDCODED_RXN_ID)
+            component_pool_C = load_components_from_db('C', HARDCODED_RXN_ID)
+            
+            if not component_pool_A or not component_pool_B:
+                logger.error("❌ Failed to load component pools from database")
+                logger.error(f"   A components: {len(component_pool_A)}, B components: {len(component_pool_B)}, C components: {len(component_pool_C)}")
+                return []
+            
+            logger.info(f"✅ Loaded component pools: A={len(component_pool_A)}, B={len(component_pool_B)}, C={len(component_pool_C)}")
+            
+            # Initialize synthon library
+            logger.info("🧪 Initializing SynthonLibrary...")
+            synthon_lib = SynthonLibraryEnhanced(
+                molecules_A=component_pool_A,
+                molecules_B=component_pool_B,
+                molecules_C=component_pool_C if component_pool_C else None
+            )
+            
+            # Extract component IDs
+            component_ids_A = extract_component_ids(component_pool_A)
+            component_ids_B = extract_component_ids(component_pool_B)
+            component_ids_C = extract_component_ids(component_pool_C) if component_pool_C else []
+            
+            logger.info(f"✅ Extracted component IDs: A={len(component_ids_A)}, B={len(component_ids_B)}, C={len(component_ids_C)}")
+            
+            # Initialize generator
+            logger.info("🔧 Initializing EnhancedMoleculeGenerator...")
+            generator = EnhancedMoleculeGenerator(
+                rxn_id=HARDCODED_RXN_ID,
+                synthon_library=synthon_lib,
+                component_ids_A=component_ids_A,
+                component_ids_B=component_ids_B,
+                component_ids_C=component_ids_C
+            )
+            
+            if generator is None:
+                logger.error("❌ EnhancedMoleculeGenerator initialization returned None")
+                return []
+            
+            state['enhanced_generator'] = generator
+            state['synthon_library'] = synthon_lib
+            state['component_ids_A'] = component_ids_A
+            state['component_ids_B'] = component_ids_B
+            state['component_ids_C'] = component_ids_C
+            
+            logger.info(f"✅ EnhancedMoleculeGenerator initialized successfully")
         
-        if not component_pool_A or not component_pool_B:
-            logger.error("❌ Failed to load component pools from database")
+        except Exception as e:
+            logger.error(f"❌ Error initializing EnhancedMoleculeGenerator: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
-        
-        # Initialize synthon library
-        synthon_lib = SynthonLibraryEnhanced(
-            molecules_A=component_pool_A,
-            molecules_B=component_pool_B,
-            molecules_C=component_pool_C if component_pool_C else None
-        )
-        
-        # Extract component IDs
-        component_ids_A = extract_component_ids(component_pool_A)
-        component_ids_B = extract_component_ids(component_pool_B)
-        component_ids_C = extract_component_ids(component_pool_C) if component_pool_C else []
-        
-        # Initialize generator
-        generator = EnhancedMoleculeGenerator(
-            rxn_id=HARDCODED_RXN_ID,
-            synthon_library=synthon_lib,
-            component_ids_A=component_ids_A,
-            component_ids_B=component_ids_B,
-            component_ids_C=component_ids_C
-        )
-        
-        state['enhanced_generator'] = generator
-        state['synthon_library'] = synthon_lib
-        state['component_ids_A'] = component_ids_A
-        state['component_ids_B'] = component_ids_B
-        state['component_ids_C'] = component_ids_C
-        
-        logger.info(f"✅ EnhancedMoleculeGenerator initialized")
     
     generator = state['enhanced_generator']
+    
+    if generator is None:
+        logger.error("❌ Generator is still None after initialization")
+        return []
     
     # Convert DataFrame to list of dicts for generation
     top_molecules = top_molecules_df.head(500).to_dict('records')
@@ -1067,11 +1092,17 @@ async def generate_unique_molecules_enhanced(
         attempts += 1
         
         # Generate batch
-        candidates = generator.generate_batch(
-            top_molecules,
-            strategy=strategy,
-            batch_size=batch_size
-        )
+        try:
+            candidates = generator.generate_batch(
+                top_molecules,
+                strategy=strategy,
+                batch_size=batch_size
+            )
+        except Exception as e:
+            logger.error(f"❌ Error generating batch: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            break
         
         for candidate in candidates:
             if len(unique_molecules) >= desired_count:
@@ -1223,7 +1254,7 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
             )
             
             # Update generator with scores
-            if 'enhanced_generator' in state:
+            if 'enhanced_generator' in state and state['enhanced_generator'] is not None:
                 scored_dict = {
                     m['name']: m.get('boltz_score')
                     for m in scored_molecules
