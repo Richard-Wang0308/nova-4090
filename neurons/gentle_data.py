@@ -1195,7 +1195,7 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
     logger.info("🚀 Starting enhanced generation and scoring loop...")
     logger.info("Press Ctrl+C to stop")
     
-    desired_unique_count = 1000
+    desired_unique_count = 200
     batch_size = 10
     round_number = 0
     strategy_rotation = ["hybrid", "dja", "tabu", "exploit"]
