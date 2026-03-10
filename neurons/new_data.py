@@ -96,7 +96,7 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         min_atoms = 21
-        max_atoms = 26
+        max_atoms = 28
 
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -1085,7 +1085,7 @@ async def run_generation_and_scoring_loop_dpex(state: Dict[str, Any]) -> None:
                 f"\n   Candidates generated: {len(all_raw_candidates)}"
                 f"\n   Candidates filtered: {len(filtered_candidates)}"
                 f"\n   Candidates scored: {len(all_scored)}"
-                f"\n   Best this round: {best_score_this_round:.6f if best_mol_this_round else 'N/A'}"
+                f"\n   Best this round: {(f'{best_score_this_round:.6f}' if best_mol_this_round else 'N/A')}"
                 f"\n   Global best: {dpex_state.best_score:.6f}"
                 f"\n   Stagnation counter: {dpex_state.no_improvement_counter}"
                 f"\n   Exploit mode: {'ACTIVE' if dpex_state.use_exploit_mode else 'inactive'}"
