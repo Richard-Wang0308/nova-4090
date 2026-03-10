@@ -71,7 +71,7 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         min_atoms = 19
-        max_atoms = 24
+        max_atoms = 26
 
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -406,7 +406,7 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 min_heavy_atoms = 19
-                max_heavy_atoms = 24
+                max_heavy_atoms = 26
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
@@ -543,7 +543,7 @@ def load_molecules_from_csv_with_validation(
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 19
-                max_heavy_atoms = 24
+                max_heavy_atoms = 26
 
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
