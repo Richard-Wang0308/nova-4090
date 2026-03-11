@@ -346,8 +346,11 @@ async def generate_candidates_hybrid(
         scale = raw_target / max(num_candidates_total, 1)
         num_dja_raw = int(num_dja * scale)
         num_tabu_raw = int(num_tabu * scale)
-        num_exploit_raw = max(20, int(raw_target * 0.10))
-        num_crossover_raw = raw_target - num_dja_raw - num_tabu_raw - num_exploit_raw
+        # Only reserve exploit budget when exploit mode is actually active;
+        # otherwise that budget goes to crossover diversification
+        num_exploit_raw = max(20, int(raw_target * 0.10)) if dpex_state.use_exploit_mode else 0
+        # Crossover fills whatever DJA+Tabu don't cover (always ≥ 0)
+        num_crossover_raw = max(0, raw_target - num_dja_raw - num_tabu_raw - num_exploit_raw)
 
         # DJA candidates
         dja_cands = dja_gen.generate_candidates(dpex_state.pop_A, num_dja_raw, dpex_state)
@@ -398,6 +401,39 @@ async def generate_candidates_hybrid(
             m['type'] = 'crossover'
         raw_candidates.extend(xover_mols)
         logger.info(f"[Hybrid] Bootstrap (crossover-only): {len(raw_candidates)} raw candidates")
+
+    # ── Phase 1b: fast heavy-atom pre-filter (cheap, before quality filter) ──
+    # Eliminates candidates that will definitely fail HA validation,
+    # so the quality filter sees only structurally plausible molecules.
+    config = state.get('config', {})
+    min_ha = config.get('min_heavy_atoms', 10)
+    max_ha = config.get('max_heavy_atoms', 50)
+    ha_passed: List[Dict[str, Any]] = []
+    ha_rejected = 0
+    for _cand in raw_candidates:
+        _smi = _cand.get('smiles', '')
+        if not _smi:
+            ha_rejected += 1
+            continue
+        try:
+            _mol = Chem.MolFromSmiles(_smi)
+            if _mol is None:
+                ha_rejected += 1
+                continue
+            _ha = _mol.GetNumHeavyAtoms()
+            if _ha < min_ha or _ha > max_ha:
+                ha_rejected += 1
+                continue
+        except Exception:
+            ha_rejected += 1
+            continue
+        ha_passed.append(_cand)
+    if ha_rejected:
+        logger.info(
+            f"[Hybrid] HA pre-filter: {len(raw_candidates)} → {len(ha_passed)} "
+            f"(rejected {ha_rejected} outside {min_ha}-{max_ha} heavy atoms)"
+        )
+    raw_candidates = ha_passed
 
     # ── Phase 2: quality filter  ────────────────────────────────────────────
     # Ask for 3× desired so Phase 3 validation has room to reject some
@@ -1685,15 +1721,40 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
             if machinery:
                 dpex_state: DPEXDJABoltzState = machinery['dpex_state']
                 scored_rows = molecules_df[molecules_df['score'].notna()]
+
+                # Update global best FIRST so the pop_B threshold is correct
+                if not scored_rows.empty:
+                    best_row = scored_rows.iloc[0]
+                    if float(best_row['score']) > dpex_state.best_score:
+                        dpex_state.best_score = float(best_row['score'])
+                        dpex_state.best_molecule = {
+                            'name': best_row['name'],
+                            'smiles': best_row['smiles'],
+                            'score': float(best_row['score']),
+                        }
+
+                # Compute 80th-percentile threshold for pop_B (elite only)
+                all_scores = scored_rows['score'].dropna().tolist()
+                if all_scores:
+                    all_scores_sorted = sorted(all_scores)
+                    pct80_idx = max(0, int(len(all_scores_sorted) * 0.80) - 1)
+                    pop_b_threshold = all_scores_sorted[pct80_idx]
+                else:
+                    pop_b_threshold = dpex_state.best_score * 0.90
+
+                existing_names_A = {e['name'] for e in dpex_state.pop_A}
                 for _, row in scored_rows.iterrows():
                     entry = {
                         'name': row['name'],
                         'smiles': row['smiles'],
                         'score': float(row['score']),
                     }
-                    if entry not in dpex_state.pop_A:
+                    if entry['name'] not in existing_names_A:
                         dpex_state.pop_A.append(entry)
-                        if float(row['score']) > dpex_state.best_score * 0.95:
+                    # Pop_B: only top-20% of the loaded pool (true elite)
+                    if float(row['score']) >= pop_b_threshold:
+                        existing_names_B = {e['name'] for e in dpex_state.pop_B}
+                        if entry['name'] not in existing_names_B:
                             dpex_state.pop_B.append(entry)
 
                 # Trim to configured max sizes
@@ -1704,18 +1765,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 dpex_state.pop_B.sort(
                     key=lambda x: x.get('score', float('-inf')), reverse=True
                 )
-                dpex_state.pop_B = dpex_state.pop_B[:1000]
-
-                # Update global best from loaded pool
-                if not scored_rows.empty:
-                    best_row = scored_rows.iloc[0]
-                    if float(best_row['score']) > dpex_state.best_score:
-                        dpex_state.best_score = float(best_row['score'])
-                        dpex_state.best_molecule = {
-                            'name': best_row['name'],
-                            'smiles': best_row['smiles'],
-                            'score': float(best_row['score']),
-                        }
+                dpex_state.pop_B = dpex_state.pop_B[:200]
 
                 logger.info(
                     f"📊 DPEX pools: A={len(dpex_state.pop_A)}, "
