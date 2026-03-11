@@ -22,7 +22,7 @@ sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 HARDCODED_RXN_ID = 5
-STARTING_EPOCH = 21213
+STARTING_EPOCH = 21353
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
@@ -66,8 +66,8 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         # min_atoms = config.get('min_heavy_atoms', 10)
-        min_atoms = 15
-        max_atoms = 30
+        min_atoms = 20
+        max_atoms = 24
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -769,8 +769,8 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 15
-                max_heavy_atoms = 30
+                min_heavy_atoms = 20
+                max_heavy_atoms = 24
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     heavy_atom_count += 1
@@ -1075,7 +1075,7 @@ async def load_submissions_from_csv(
             print("⚠️  No valid molecules loaded from CSV or database")
             return pd.DataFrame()
         
-        top_200 = molecules_df.head(200)
+        top_200 = molecules_df.head(500)
         
         print(f"✅ Selected top 200 molecules from combined CSV and database")
         
