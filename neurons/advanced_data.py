@@ -103,8 +103,8 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = 18
-        max_atoms = 30
+        min_atoms = 20
+        max_atoms = 25
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -1606,8 +1606,8 @@ def load_molecules_from_db_with_validation(
                     banned_atom_count += 1
                     continue
                 
-                min_heavy_atoms = 18
-                max_heavy_atoms = 30
+                min_heavy_atoms = 20
+                max_heavy_atoms = 25
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms or heavy_atom_count_val > max_heavy_atoms:
                     heavy_atom_count += 1
@@ -1712,8 +1712,8 @@ def load_molecules_from_csv_with_validation(
                     continue
                 
                 # Check heavy atom count
-                min_heavy_atoms = 18
-                max_heavy_atoms = 30
+                min_heavy_atoms = 20
+                max_heavy_atoms = 25
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms or heavy_atom_count_val > max_heavy_atoms:
                     failed_count += 1

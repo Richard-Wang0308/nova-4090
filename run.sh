@@ -20,6 +20,7 @@ python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-jjpes-shib 
 #simple submit
 python3 neurons/simple_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotg --logging.debug
 python3 neurons/simple_submit.py --wallet.name nova --wallet.hotkey nota --logging.debug
+python3 neurons/simple_submit.py --wallet.name xova --wallet.hotkey xota --logging.debug
 
 #top submit
 python3 neurons/top_submit.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug

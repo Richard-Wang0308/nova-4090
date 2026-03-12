@@ -1071,7 +1071,7 @@ async def generate_unique_molecules_enhanced(
         return []
     
     # Convert DataFrame to list of dicts for generation
-    top_molecules = top_molecules_df.head(500).to_dict('records')
+    top_molecules = top_molecules_df.head(1000).to_dict('records')
     
     logger.info(
         f"🧬 Generating {desired_count} molecules using '{strategy}' strategy "
@@ -1234,7 +1234,7 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                 await asyncio.sleep(10)
                 continue
             
-            top_molecules_df = molecules_df.head(700)
+            top_molecules_df = molecules_df.head(1000)
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
             
