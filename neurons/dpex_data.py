@@ -16,7 +16,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 5
+HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 21492
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
@@ -406,8 +406,10 @@ async def generate_candidates_hybrid(
     # Eliminates candidates that will definitely fail HA validation,
     # so the quality filter sees only structurally plausible molecules.
     config = state.get('config', {})
-    min_ha = config.get('min_heavy_atoms', 10)
-    max_ha = config.get('max_heavy_atoms', 50)
+    # min_ha = config.get('min_heavy_atoms', 10)
+    min_ha = 10
+    # max_ha = config.get('max_heavy_atoms', 50)
+    max_ha = 20
     ha_passed: List[Dict[str, Any]] = []
     ha_rejected = 0
     for _cand in raw_candidates:
@@ -539,8 +541,8 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         min_atoms = config.get('min_heavy_atoms', 10)
-        min_atoms = 20
-        max_atoms = 24
+        min_atoms = 10
+        max_atoms = 20
 
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -952,8 +954,8 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 20
-                max_heavy_atoms = 24
+                min_heavy_atoms = 10
+                max_heavy_atoms = 20
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
@@ -1092,6 +1094,12 @@ def load_molecules_from_csv_with_validation(
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
+                    heavy_atom_count += 1
+                    continue
+
+                max_heavy_atoms = 20
+                if heavy_atom_count_val > max_heavy_atoms:
+                    logger.debug(f"Molecule {molecule_name} has too many heavy atoms ({heavy_atom_count_val} > {max_heavy_atoms}), skipping")
                     heavy_atom_count += 1
                     continue
                 
