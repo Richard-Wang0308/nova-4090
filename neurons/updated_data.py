@@ -9,6 +9,7 @@ import sqlite3
 import traceback
 import pickle
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import numpy as np
@@ -18,7 +19,7 @@ from rdkit.Chem import Descriptors, QED, rdFingerprintGenerator
 from rdkit.Chem.rdMolDescriptors import CalcTPSA
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
-# ── Path setup ──────────────────────────────────────────────────────────────
+# ── Path setup ───────────────────────────────────────────────────────────────
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
@@ -28,7 +29,7 @@ SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results.sqlite")
 SURROGATE_PATH     = os.path.join(BASE_DIR, "surrogate_model.pkl")
 
 from config.config_loader import load_config
-from utils import get_heavy_atom_count, contains_atom_type
+from utils import get_heavy_atom_count, contains_atom_type, molecule_unique_for_protein_hf
 from molecules_base import generate_inchikey
 from combinatorial_db.reactions import get_smiles_from_reaction
 
@@ -42,18 +43,18 @@ SEED_SCORE_THRESHOLD  = 0.15
 TOP_SEED_THRESHOLD    = 0.18
 
 RXN_ROLE_MAP: Dict[int, Dict[str, Any]] = {
-    1: {"name": "triazole",                    "roleA": 1,   "roleB": 2,    "roleC": None},
-    2: {"name": "reductive_amination",          "roleA": 4,   "roleB": 8,    "roleC": None},
-    3: {"name": "click_amide_cascade",          "roleA": 16,  "roleB": 32,   "roleC": 64},
-    4: {"name": "suzuki_bromide",               "roleA": 128, "roleB": 512,  "roleC": None},
-    5: {"name": "suzuki_bromide_then_chloride", "roleA": 384, "roleB": 1024, "roleC": 1024},
+    1: {"name": "triazole",                     "roleA": 1,   "roleB": 2,    "roleC": None},
+    2: {"name": "reductive_amination",           "roleA": 4,   "roleB": 8,    "roleC": None},
+    3: {"name": "click_amide_cascade",           "roleA": 16,  "roleB": 32,   "roleC": 64},
+    4: {"name": "suzuki_bromide",                "roleA": 128, "roleB": 512,  "roleC": None},
+    5: {"name": "suzuki_bromide_then_chloride",  "roleA": 384, "roleB": 1024, "roleC": 1024},
 }
 
-# ── GPU / scoring ───────────────────────────────────────────────────────────
-BOLTZ_BATCH_SIZE       = 10    # molecules per Boltz batch (fits 1 GPU)
+# ── GPU / scoring ────────────────────────────────────────────────────────────
+BOLTZ_BATCH_SIZE       = 10    # molecules per Boltz batch
 BOLTZ_BUDGET_PER_ROUND = 500   # max molecules scored per round
 
-# ── Candidate generation ────────────────────────────────────────────────────
+# ── Candidate generation ─────────────────────────────────────────────────────
 TIER1_NEIGHBOURS_PER_SEED = 60
 TIER1_SIM_TOP_K           = 50
 TIER1_SIM_MIN             = 0.15
@@ -69,7 +70,7 @@ TIER1_GPU_FRACTION = 0.60
 TIER2_GPU_FRACTION = 0.30
 TIER3_GPU_FRACTION = 0.10
 
-# ── Physchem thresholds ─────────────────────────────────────────────────────
+# ── Physchem thresholds ──────────────────────────────────────────────────────
 HA_MIN = 13;  HA_MAX = 28
 MW_MIN = 150; MW_MAX = 600
 LOGP_MIN = -2.0; LOGP_MAX = 5.5
@@ -77,7 +78,7 @@ HBD_MAX = 5;  HBA_MAX = 10
 TPSA_MAX = 140; ROTB_MAX = 10
 QED_MIN = 0.35
 
-# ── Diversity / output ──────────────────────────────────────────────────────
+# ── Diversity / output ───────────────────────────────────────────────────────
 TANIMOTO_THRESHOLD   = 0.70
 FINAL_DIVERSE_TOPK   = 50
 GOOD_SCORE_THRESHOLD = 0.15
@@ -90,6 +91,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # UTILITIES
@@ -149,7 +151,7 @@ def build_mol_name(rxn_id: int, a_id: int, b_id: int,
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_components_for_reaction(rxn_id: int
-    ) -> Tuple[List[Tuple[int,str]], List[Tuple[int,str]], List[Tuple[int,str]]]:
+    ) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], List[Tuple[int, str]]]:
     """Load building blocks using correct per-reaction role_mask bitmasks."""
     info = RXN_ROLE_MAP[rxn_id]
 
@@ -176,19 +178,32 @@ def load_components_for_reaction(rxn_id: int
 
 def init_score_results_db() -> None:
     """
-    Create score_results DB with clean minimal schema.
-    Columns: molecule_name, smiles, score, scored_at
+    Create score_results DB.
+
+    Schema:
+        molecule_name  TEXT PRIMARY KEY
+        smiles         TEXT
+        score          REAL
+        scored_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        available      BOOLEAN DEFAULT TRUE
+
+    Safe to call on an existing DB — ALTER TABLE migration guards ensure
+    any missing columns are added without destroying existing data.
     """
     conn = sqlite3.connect(SCORE_RESULTS_DB)
     cur  = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS scored_molecules (
             molecule_name TEXT PRIMARY KEY,
             smiles        TEXT,
             score         REAL,
-            scored_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            scored_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            available     BOOLEAN DEFAULT TRUE
         )
     """)
+
+    # Migration: add any columns missing in older DBs
     existing = {row[1] for row in cur.execute("PRAGMA table_info(scored_molecules)")}
     if "score" not in existing:
         cur.execute("ALTER TABLE scored_molecules ADD COLUMN score REAL")
@@ -196,6 +211,19 @@ def init_score_results_db() -> None:
     if "smiles" not in existing:
         cur.execute("ALTER TABLE scored_molecules ADD COLUMN smiles TEXT")
         logger.info("DB migrated: added column 'smiles'")
+    if "scored_at" not in existing:
+        cur.execute(
+            "ALTER TABLE scored_molecules "
+            "ADD COLUMN scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
+        logger.info("DB migrated: added column 'scored_at'")
+    if "available" not in existing:
+        cur.execute(
+            "ALTER TABLE scored_molecules "
+            "ADD COLUMN available BOOLEAN DEFAULT TRUE"
+        )
+        logger.info("DB migrated: added column 'available'")
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)")
     conn.commit()
     conn.close()
@@ -204,11 +232,16 @@ def init_score_results_db() -> None:
 def write_scores_to_db(molecules: List[Dict[str, Any]]) -> None:
     """
     Persist scored molecules to SQLite.
-    Stores: molecule_name, smiles, score.
-    Always writes smiles so surrogate can pre-fit from DB on next run.
+
+    Writes: molecule_name, smiles, score, scored_at (explicit UTC now), available=TRUE.
+    scored_at is always set explicitly so INSERT OR REPLACE never leaves it NULL.
+    Score key: mol["score"]  (pipeline convention for this file)
     """
     if not molecules:
         return
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     conn = sqlite3.connect(SCORE_RESULTS_DB)
     cur  = conn.cursor()
     rows = []
@@ -218,12 +251,13 @@ def write_scores_to_db(molecules: List[Dict[str, Any]]) -> None:
         smiles = m.get("smiles", "")
         if name is None or score is None:
             continue
-        rows.append((name, smiles, float(score)))
+        rows.append((name, smiles, float(score), now, True))
+
     if rows:
         cur.executemany(
             """INSERT OR REPLACE INTO scored_molecules
-               (molecule_name, smiles, score)
-               VALUES (?, ?, ?)""",
+               (molecule_name, smiles, score, scored_at, available)
+               VALUES (?, ?, ?, ?, ?)""",
             rows,
         )
         conn.commit()
@@ -321,14 +355,15 @@ def load_seed_molecules(rxn_id: int, config: Any) -> pd.DataFrame:
             "c_id":     c_id,
         })
 
-    # ── Source 1: mols.csv ─────────────────────────────────────────────
+    # ── Source 1: mols.csv ──────────────────────────────────────────
     if os.path.exists(REACTION_TRAIN_CSV):
         try:
             df = pd.read_csv(REACTION_TRAIN_CSV)
             if "epoch" in df.columns:
                 df = df[df["epoch"] >= STARTING_EPOCH]
-            df = df[df.get("molecule_name", pd.Series(dtype=str))
-                      .str.startswith(f"rxn:{rxn_id}:", na=False)]
+            # FIX: was df.get(...) which is wrong for pandas DataFrame
+            if "molecule_name" in df.columns:
+                df = df[df["molecule_name"].str.startswith(f"rxn:{rxn_id}:", na=False)]
             if "final_score" in df.columns:
                 df = df[df["final_score"] >= SEED_SCORE_THRESHOLD]
             for _, row in df.iterrows():
@@ -339,7 +374,7 @@ def load_seed_molecules(rxn_id: int, config: Any) -> pd.DataFrame:
 
     csv_count = len(records)
 
-    # ── Source 2: score_results DB ─────────────────────────────────────
+    # ── Source 2: score_results DB ──────────────────────────────────
     if os.path.exists(SCORE_RESULTS_DB):
         try:
             conn = sqlite3.connect(SCORE_RESULTS_DB)
@@ -366,7 +401,11 @@ def load_seed_molecules(rxn_id: int, config: Any) -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    df = pd.DataFrame(records).sort_values("score", ascending=False).reset_index(drop=True)
+    df = (
+        pd.DataFrame(records)
+        .sort_values("score", ascending=False)
+        .reset_index(drop=True)
+    )
     top_seeds = (df["score"] >= TOP_SEED_THRESHOLD).sum()
     logger.info(
         f"Seeds loaded: {len(df)} total | "
@@ -485,10 +524,14 @@ def _try_build_candidate(
     seen_names:  Set[str],
     seen_smiles: Set[str],
     banned:      List[str],
+    target_seq:  Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build one candidate molecule. Returns dict or None if invalid/duplicate.
     Adds name to seen_names regardless (so we never retry the same combo).
+
+    HuggingFace check: if target_seq is provided, molecules already in the
+    HF dataset are rejected here — they will never reach the Boltz scorer.
     """
     name = build_mol_name(rxn_id, a_id, b_id, c_id)
     if name in seen_names:
@@ -510,6 +553,17 @@ def _try_build_candidate(
     if not ik:
         return None
 
+    # ── HuggingFace uniqueness check ─────────────────────────────────
+    # Reject molecules already known to the HF dataset so we never waste
+    # GPU time scoring them.
+    if target_seq:
+        try:
+            if not molecule_unique_for_protein_hf(target_seq, canon):
+                logger.debug(f"HF duplicate skipped: {name}")
+                return None
+        except Exception as e:
+            logger.debug(f"HF check error for {name}: {e} — allowing through")
+
     seen_smiles.add(canon)
     return {"name": name, "smiles": canon, "InChIKey": ik}
 
@@ -522,6 +576,7 @@ def generate_tiered_candidates(
     rxn_id:     int,
     seen_names: Set[str],
     config:     Any,
+    target_seq: Optional[str] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Generate candidates in three tiers.
@@ -529,6 +584,8 @@ def generate_tiered_candidates(
     Tier 1 — Deep exploitation of top seeds (score >= TOP_SEED_THRESHOLD)
     Tier 2 — Broad exploration of mid seeds
     Tier 3 — Champion cross-product + champion × similar
+
+    target_seq is passed to _try_build_candidate for HF uniqueness filtering.
     """
     banned      = getattr(config, "banned_atom_types", []) or []
     seen_smiles: Set[str] = set()
@@ -539,21 +596,31 @@ def generate_tiered_candidates(
     tier3: List[Dict] = []
 
     def _add(lst, a, b, c=None):
-        r = _try_build_candidate(rxn_id, a, b, c, seen_names, seen_smiles, banned)
+        r = _try_build_candidate(
+            rxn_id, a, b, c,
+            seen_names, seen_smiles, banned,
+            target_seq=target_seq,
+        )
         if r:
             lst.append(r)
 
-    # ── Tier 1: top seeds ─────────────────────────────────────────────
+    # ── Tier 1: top seeds ────────────────────────────────────────────
     top_seeds = seeds_df[seeds_df["score"] >= TOP_SEED_THRESHOLD]
-    logger.info(f"Tier 1: {len(top_seeds)} top seeds × {TIER1_NEIGHBOURS_PER_SEED} neighbours")
+    logger.info(
+        f"Tier 1: {len(top_seeds)} top seeds × {TIER1_NEIGHBOURS_PER_SEED} neighbours"
+    )
 
     for _, seed in top_seeds.iterrows():
         a_id  = int(seed["a_id"])
         b_id  = int(seed["b_id"])
-        sim_B = (index.similar_B(index.smiles(b_id) or "", TIER1_SIM_TOP_K, TIER1_SIM_MIN)
-                 or index.random_B(TIER1_SIM_TOP_K))
-        sim_A = (index.similar_A(index.smiles(a_id) or "", TIER1_SIM_TOP_K, TIER1_SIM_MIN)
-                 or index.random_A(TIER1_SIM_TOP_K))
+        sim_B = (
+            index.similar_B(index.smiles(b_id) or "", TIER1_SIM_TOP_K, TIER1_SIM_MIN)
+            or index.random_B(TIER1_SIM_TOP_K)
+        )
+        sim_A = (
+            index.similar_A(index.smiles(a_id) or "", TIER1_SIM_TOP_K, TIER1_SIM_MIN)
+            or index.random_A(TIER1_SIM_TOP_K)
+        )
         sim_C = index.random_C(10) if is_3comp else []
         half  = TIER1_NEIGHBOURS_PER_SEED // 2
 
@@ -564,20 +631,26 @@ def generate_tiered_candidates(
             _add(tier1, random.choice(sim_A), b_id,
                  random.choice(sim_C) if sim_C else None)
 
-    # ── Tier 2: mid seeds ─────────────────────────────────────────────
+    # ── Tier 2: mid seeds ────────────────────────────────────────────
     mid_seeds = seeds_df[
         (seeds_df["score"] >= SEED_SCORE_THRESHOLD) &
         (seeds_df["score"] <  TOP_SEED_THRESHOLD)
     ]
-    logger.info(f"Tier 2: {len(mid_seeds)} mid seeds × {TIER2_NEIGHBOURS_PER_SEED} neighbours")
+    logger.info(
+        f"Tier 2: {len(mid_seeds)} mid seeds × {TIER2_NEIGHBOURS_PER_SEED} neighbours"
+    )
 
     for _, seed in mid_seeds.iterrows():
         a_id  = int(seed["a_id"])
         b_id  = int(seed["b_id"])
-        sim_B = (index.similar_B(index.smiles(b_id) or "", TIER2_SIM_TOP_K, TIER2_SIM_MIN)
-                 or index.random_B(TIER2_SIM_TOP_K))
-        sim_A = (index.similar_A(index.smiles(a_id) or "", TIER2_SIM_TOP_K, TIER2_SIM_MIN)
-                 or index.random_A(TIER2_SIM_TOP_K))
+        sim_B = (
+            index.similar_B(index.smiles(b_id) or "", TIER2_SIM_TOP_K, TIER2_SIM_MIN)
+            or index.random_B(TIER2_SIM_TOP_K)
+        )
+        sim_A = (
+            index.similar_A(index.smiles(a_id) or "", TIER2_SIM_TOP_K, TIER2_SIM_MIN)
+            or index.random_A(TIER2_SIM_TOP_K)
+        )
         sim_C = index.random_C(5) if is_3comp else []
 
         n_A = int(TIER2_NEIGHBOURS_PER_SEED * 0.40)
@@ -594,7 +667,7 @@ def generate_tiered_candidates(
             _add(tier2, random.choice(sim_A), random.choice(sim_B),
                  random.choice(sim_C) if sim_C else None)
 
-    # ── Tier 3: champion cross-product ────────────────────────────────
+    # ── Tier 3: champion cross-product ───────────────────────────────
     logger.info(
         f"Tier 3: {len(champion_a)} champion A × {len(champion_b)} champion B "
         f"+ similar expansions"
@@ -701,7 +774,9 @@ class SurrogateModel:
 
         if len(self._y) > self.max_train:
             top    = np.argsort(self._y)[-(self.max_train // 2):]
-            recent = np.arange(max(0, len(self._y) - self.max_train // 2), len(self._y))
+            recent = np.arange(
+                max(0, len(self._y) - self.max_train // 2), len(self._y)
+            )
             keep   = np.unique(np.concatenate([top, recent]))
             self._X, self._y = self._X[keep], self._y[keep]
 
@@ -722,8 +797,8 @@ class SurrogateModel:
                 use_ucb: bool = False, beta: float = 1.5) -> np.ndarray:
         if not self.is_fitted:
             return np.zeros(len(candidates))
-        fps = [get_fp(r["smiles"]) for r in candidates]
-        scores = np.full(len(candidates), -np.inf)
+        fps       = [get_fp(r["smiles"]) for r in candidates]
+        scores    = np.full(len(candidates), -np.inf)
         valid_idx = [i for i, fp in enumerate(fps) if fp is not None]
         if not valid_idx:
             return scores
@@ -772,28 +847,19 @@ async def score_molecules_with_boltz_batched(
     Flow per batch:
       1. Check DB cache — skip already-scored molecules
       2. Call boltz.score_molecules_target() for the remainder
-      3. Extract per-molecule scores from boltz.per_molecule_metric
-      4. Fall back to target_scores list or batch average if needed
-      5. Write newly scored molecules to DB immediately
+      3. Extract per-molecule scores (per_molecule_metric → target_scores → avg)
+      4. Write newly scored molecules to DB immediately (scored_at + available set)
       6. Return all results (cached + newly scored)
 
-    Args:
-        candidates : list of {"name": str, "smiles": str, ...}
-        boltz      : BoltzWrapper instance
-        target_seq : weekly target protein sequence
-        boltz_cfg  : dict of BoltzWrapper subnet_config overrides
-        batch_size : molecules per GPU call (default BOLTZ_BATCH_SIZE=32)
-
-    Returns:
-        Same list with "score" key filled in where scoring succeeded.
-        Molecules that failed scoring have score=None.
+    Score key written to each result dict: "score"
+    DB write key expected by write_scores_to_db:  mol["score"]
     """
     if not candidates:
         return []
 
-    total          = len(candidates)
-    n_batches      = math.ceil(total / batch_size)
-    dummy_hash     = "0x" + "0" * 64
+    total      = len(candidates)
+    n_batches  = math.ceil(total / batch_size)
+    dummy_hash = "0x" + "0" * 64
     all_results: List[Dict[str, Any]] = []
 
     logger.info(
@@ -801,8 +867,8 @@ async def score_molecules_with_boltz_batched(
         f"{n_batches} batches × {batch_size}"
     )
 
-    # ── Pre-check DB cache for the whole list ──────────────────────────
-    db_scores = batch_get_scores_from_db([c["name"] for c in candidates])
+    # Pre-check DB cache for the whole list
+    db_scores  = batch_get_scores_from_db([c["name"] for c in candidates])
     cache_hits = len(db_scores)
     if cache_hits:
         logger.info(f"  DB cache: {cache_hits}/{total} already scored, skipping GPU")
@@ -810,15 +876,15 @@ async def score_molecules_with_boltz_batched(
     for batch_idx in range(n_batches):
         batch = candidates[batch_idx * batch_size : (batch_idx + 1) * batch_size]
 
-        # ── Split: cached vs needs scoring ────────────────────────────
-        cached_in_batch  = []
+        # ── Split: cached vs needs scoring ───────────────────────────
+        cached_in_batch   = []
         to_score_in_batch = []
 
         for mol in batch:
             if mol["name"] in db_scores:
                 cached_in_batch.append({
                     **mol,
-                    "score": db_scores[mol["name"]],
+                    "score":        db_scores[mol["name"]],
                     "score_source": "db_cache",
                 })
             else:
@@ -850,7 +916,6 @@ async def score_molecules_with_boltz_batched(
                     "boltz_score":       None,
                 }
             }
-
             subnet_config = {
                 "weekly_target":        boltz_cfg.get("weekly_target", target_seq),
                 "binding_pocket":       boltz_cfg.get("binding_pocket", None),
@@ -881,39 +946,35 @@ async def score_molecules_with_boltz_batched(
                 )
                 elapsed = time.time() - t0
 
-                # ── Extract scores ─────────────────────────────────────
-                # Priority 1: per_molecule_metric (SMILES → combined score)
+                # ── Extract scores ────────────────────────────────────
                 pm_metric     = boltz.per_molecule_metric.get(0, {})
                 pm_components = boltz.per_molecule_components.get(0, {})
 
-                # Priority 2: target_scores list (index-aligned)
-                target_scores_raw = score_dict[0].get("target_scores", [[]])
+                target_scores_raw  = score_dict[0].get("target_scores", [[]])
                 target_scores_list: Optional[List[float]] = None
                 if target_scores_raw and len(target_scores_raw[0]) > 0:
                     inner = target_scores_raw[0]
                     target_scores_list = inner if isinstance(inner, list) else [inner]
 
-                # Priority 3: batch average
-                batch_avg = score_dict[0].get("boltz_score")
-
+                batch_avg   = score_dict[0].get("boltz_score")
                 batch_valid = 0
+
                 for mol_idx, mol in enumerate(to_score_in_batch):
-                    smiles = mol["smiles"]
+                    smiles     = mol["smiles"]
                     components = pm_components.get(smiles, {})
 
-                    # Try per-molecule metric first
+                    # Priority 1: per_molecule_metric
                     score = pm_metric.get(smiles)
 
-                    # Fall back to affinity_probability_binary from components
+                    # Priority 2: affinity_probability_binary from components
                     if score is None:
                         score = components.get("affinity_probability_binary")
 
-                    # Fall back to target_scores list (index-aligned)
+                    # Priority 3: target_scores list (index-aligned)
                     if score is None and target_scores_list is not None:
                         if mol_idx < len(target_scores_list):
                             score = target_scores_list[mol_idx]
                         else:
-                            # Try SMILES-index lookup
                             try:
                                 si = smiles_list.index(smiles)
                                 if si < len(target_scores_list):
@@ -921,7 +982,7 @@ async def score_molecules_with_boltz_batched(
                             except ValueError:
                                 pass
 
-                    # Last resort: batch average
+                    # Priority 4: batch average fallback
                     if score is None and batch_avg is not None:
                         score = batch_avg
 
@@ -932,18 +993,26 @@ async def score_molecules_with_boltz_batched(
                     result = {
                         **mol,
                         "score":            final_score,
-                        "affinity_value":   float(components.get("affinity_pred_value"))
-                                            if components.get("affinity_pred_value") is not None
-                                            else None,
-                        "confidence_score": float(components.get("confidence_score"))
-                                            if components.get("confidence_score") is not None
-                                            else None,
-                        "iptm":             float(components.get("iptm"))
-                                            if components.get("iptm") is not None
-                                            else None,
-                        "ligand_iptm":      float(components.get("ligand_iptm"))
-                                            if components.get("ligand_iptm") is not None
-                                            else None,
+                        "affinity_value":   (
+                            float(components["affinity_pred_value"])
+                            if components.get("affinity_pred_value") is not None
+                            else None
+                        ),
+                        "confidence_score": (
+                            float(components["confidence_score"])
+                            if components.get("confidence_score") is not None
+                            else None
+                        ),
+                        "iptm":             (
+                            float(components["iptm"])
+                            if components.get("iptm") is not None
+                            else None
+                        ),
+                        "ligand_iptm":      (
+                            float(components["ligand_iptm"])
+                            if components.get("ligand_iptm") is not None
+                            else None
+                        ),
                         "score_source":     "boltz",
                     }
                     newly_scored.append(result)
@@ -955,26 +1024,28 @@ async def score_molecules_with_boltz_batched(
                     f"({elapsed/max(len(to_score_in_batch),1):.1f}s/mol)"
                 )
 
-                # ── Write newly scored to DB immediately ───────────────
+                # ── Write to DB immediately (scored_at + available set) ─
                 scored_ok = [r for r in newly_scored if r["score"] is not None]
                 if scored_ok:
                     write_scores_to_db(scored_ok)
-                    # Update local cache so later batches benefit
                     for r in scored_ok:
                         db_scores[r["name"]] = r["score"]
 
             except Exception as e:
                 logger.error(f"  Batch {batch_idx+1} GPU scoring failed: {e}")
                 logger.debug(traceback.format_exc())
-                # Mark all as None so they are not retried this round
                 for mol in to_score_in_batch:
-                    newly_scored.append({**mol, "score": None, "score_source": "error"})
+                    newly_scored.append({
+                        **mol,
+                        "score":        None,
+                        "score_source": "error",
+                    })
 
-        # ── Merge batch results ────────────────────────────────────────
+        # ── Merge batch results ──────────────────────────────────────
         all_results.extend(cached_in_batch)
         all_results.extend(newly_scored)
 
-    # ── Final summary ──────────────────────────────────────────────────
+    # ── Final summary ────────────────────────────────────────────────
     valid = [r for r in all_results if r.get("score") is not None]
     if valid:
         arr = np.array([r["score"] for r in valid])
@@ -1042,24 +1113,26 @@ async def run_pipeline(state: Dict[str, Any]) -> None:
       Tier 2 (mid seeds):  30% of BOLTZ_BUDGET_PER_ROUND
       Tier 3 (champion):   10% of BOLTZ_BUDGET_PER_ROUND
     """
-    config          = state["config"]
-    rxn_id          = state["rxn_id"]
-    target_seq      = state["target_seq"]
-    surrogate       = state["surrogate"]
-    index           = state["index"]
-    seen_names      = state["seen_names"]
-    boltz           = state["boltz"]
+    config     = state["config"]
+    rxn_id     = state["rxn_id"]
+    target_seq = state["target_seq"]
+    surrogate  = state["surrogate"]
+    index      = state["index"]
+    seen_names = state["seen_names"]
+    boltz      = state["boltz"]
 
     boltz_cfg = {
         "weekly_target":        target_seq,
         "binding_pocket":       getattr(config, "binding_pocket", None),
         "max_distance":         getattr(config, "max_distance", None),
         "force":                getattr(config, "force", False),
-        "boltz_metric":         getattr(config, "boltz_metric",
-                                        ["affinity_probability_binary",
-                                         "affinity_pred_value"]),
-        "combination_strategy": getattr(config, "combination_strategy",
-                                        "heavy_atom_normalization"),
+        "boltz_metric":         getattr(
+            config, "boltz_metric",
+            ["affinity_probability_binary", "affinity_pred_value"]
+        ),
+        "combination_strategy": getattr(
+            config, "combination_strategy", "heavy_atom_normalization"
+        ),
         "sample_selection":     getattr(config, "sample_selection", "first"),
     }
 
@@ -1079,7 +1152,7 @@ async def run_pipeline(state: Dict[str, Any]) -> None:
         )
         logger.info(f"{'='*65}")
 
-        # ── 1. Load seeds ──────────────────────────────────────────────
+        # ── 1. Load seeds ────────────────────────────────────────────
         seeds_df = load_seed_molecules(rxn_id, config)
         if seeds_df.empty:
             logger.warning("No seeds. Waiting 30s...")
@@ -1092,20 +1165,21 @@ async def run_pipeline(state: Dict[str, Any]) -> None:
             surrogate.save()
             logger.info(f"Surrogate bootstrapped from {len(seeds_df)} seeds")
 
-        # ── 2. Champion component analysis ────────────────────────────
+        # ── 2. Champion component analysis ──────────────────────────
         top_seeds_for_champ = seeds_df[seeds_df["score"] >= TOP_SEED_THRESHOLD]
         if top_seeds_for_champ.empty:
             top_seeds_for_champ = seeds_df.head(20)
         champion_a, champion_b = analyse_champion_components(top_seeds_for_champ)
 
-        # ── 3. Generate tiered candidates ─────────────────────────────
+        # ── 3. Generate tiered candidates ────────────────────────────
+        # target_seq passed so HF duplicates are filtered during generation
         tiers = generate_tiered_candidates(
             seeds_df, champion_a, champion_b,
             index, rxn_id, seen_names, config,
+            target_seq=target_seq,
         )
 
-        # ── 4. Surrogate rank within each tier ────────────────────────
-        # (DB cache check is now inside score_molecules_with_boltz_batched)
+        # ── 4. Surrogate rank within each tier ───────────────────────
         use_ucb = round_num <= 3
 
         t1_to_score = surrogate.top_k(tiers["tier1"], t1_budget, use_ucb=use_ucb)
@@ -1118,12 +1192,7 @@ async def run_pipeline(state: Dict[str, Any]) -> None:
             f"(T1={len(t1_to_score)}, T2={len(t2_to_score)}, T3={len(t3_to_score)})"
         )
 
-        # ── 5. Batched Boltz2 scoring ──────────────────────────────────
-        # score_molecules_with_boltz_batched handles:
-        #   - DB cache lookup per batch (skips already-scored)
-        #   - GPU scoring in BOLTZ_BATCH_SIZE chunks
-        #   - Immediate DB write after each batch
-        #   - Score extraction with 3-level fallback
+        # ── 5. Batched Boltz2 scoring ────────────────────────────────
         if to_score:
             all_results = await score_molecules_with_boltz_batched(
                 to_score,
@@ -1136,24 +1205,28 @@ async def run_pipeline(state: Dict[str, Any]) -> None:
             all_results = []
             logger.info("No candidates to score this round")
 
-        newly_scored = [r for r in all_results if r.get("score") is not None
-                        and r.get("score_source") == "boltz"]
+        newly_scored = [
+            r for r in all_results
+            if r.get("score") is not None and r.get("score_source") == "boltz"
+        ]
 
-        # ── 6. Update surrogate ────────────────────────────────────────
+        # ── 6. Update surrogate ──────────────────────────────────────
         if newly_scored:
             surrogate.update(newly_scored)
             surrogate.save()
 
-        # ── 7. Merge all scored for this round ────────────────────────
+        # ── 7. Merge all scored for this round ───────────────────────
         all_scored = [r for r in all_results if r.get("score") is not None]
-        all_scored.sort(key=lambda r: r.get("score") or float("-inf"), reverse=True)
+        all_scored.sort(
+            key=lambda r: r.get("score") or float("-inf"), reverse=True
+        )
 
         if not all_scored:
             logger.warning("No scored molecules this round")
             await asyncio.sleep(5)
             continue
 
-        # ── 8. Diverse top-K ──────────────────────────────────────────
+        # ── 8. Diverse top-K ─────────────────────────────────────────
         top_diverse = diverse_top_k(all_scored, k=FINAL_DIVERSE_TOPK)
         above_good  = sum(
             1 for r in top_diverse
@@ -1210,10 +1283,10 @@ async def main():
         f"(~{BOLTZ_BUDGET_PER_ROUND * 3 / 60:.0f} min/round at 3s/mol)"
     )
 
-    # ── DB init ────────────────────────────────────────────────────────
+    # ── DB init ──────────────────────────────────────────────────────
     init_score_results_db()
 
-    # ── Load building blocks ───────────────────────────────────────────
+    # ── Load building blocks ─────────────────────────────────────────
     try:
         mols_A, mols_B, mols_C = load_components_for_reaction(HARDCODED_RXN_ID)
     except Exception as e:
@@ -1227,10 +1300,10 @@ async def main():
         )
         return
 
-    # ── Component FP index (built once) ───────────────────────────────
+    # ── Component FP index (built once) ──────────────────────────────
     index = ComponentIndex(mols_A, mols_B, mols_C)
 
-    # ── Surrogate (load from disk if available) ────────────────────────
+    # ── Surrogate (load from disk if available) ───────────────────────
     surrogate = SurrogateModel.load_or_create(SURROGATE_PATH)
 
     # Pre-fit from existing DB scores if surrogate not already fitted
@@ -1264,7 +1337,7 @@ async def main():
         except Exception as e:
             logger.warning(f"Could not pre-fit surrogate from DB: {e}")
 
-      # ── seen_names: pre-populate from DB ──────────────────────────────
+    # ── seen_names: pre-populate from DB ─────────────────────────────
     seen_names: Set[str] = set()
     if os.path.exists(SCORE_RESULTS_DB):
         try:
@@ -1281,7 +1354,7 @@ async def main():
         except Exception as e:
             logger.warning(f"Could not pre-load seen_names: {e}")
 
-    # ── Import BoltzWrapper ────────────────────────────────────────────
+    # ── Import BoltzWrapper ───────────────────────────────────────────
     boltz_scoring_dir = os.path.join(BASE_DIR, "boltz-scoring")
     boltz_src_dir     = os.path.join(boltz_scoring_dir, "boltz", "src")
     for d in [boltz_scoring_dir, boltz_src_dir]:
@@ -1297,7 +1370,7 @@ async def main():
         logger.error(traceback.format_exc())
         return
 
-    # ── State dict ─────────────────────────────────────────────────────
+    # ── State dict ────────────────────────────────────────────────────
     state: Dict[str, Any] = {
         "config":          config,
         "rxn_id":          HARDCODED_RXN_ID,
@@ -1312,7 +1385,7 @@ async def main():
         "mols_C":          mols_C,
     }
 
-    # ── Run pipeline ───────────────────────────────────────────────────
+    # ── Run pipeline ──────────────────────────────────────────────────
     try:
         await run_pipeline(state)
     except KeyboardInterrupt:
@@ -1325,4 +1398,4 @@ async def main():
 
 
 if __name__ == "__main__":
-  asyncio.run(main())
+    asyncio.run(main())
