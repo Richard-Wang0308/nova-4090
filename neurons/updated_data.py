@@ -40,7 +40,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 HARDCODED_RXN_ID      = 2
 STARTING_EPOCH        = 21492
 SEED_SCORE_THRESHOLD  = 0.15
-TOP_SEED_THRESHOLD    = 0.18
+TOP_SEED_THRESHOLD    = 0.17
 
 RXN_ROLE_MAP: Dict[int, Dict[str, Any]] = {
     1: {"name": "triazole",                     "roleA": 1,   "roleB": 2,    "roleC": None},
