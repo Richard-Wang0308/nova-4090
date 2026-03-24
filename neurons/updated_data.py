@@ -38,7 +38,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 # ══════════════════════════════════════════════════════════════════════════
 
 HARDCODED_RXN_ID      = 2
-STARTING_EPOCH        = 21492
+STARTING_EPOCH        = 21632
 SEED_SCORE_THRESHOLD  = 0.15
 TOP_SEED_THRESHOLD    = 0.17
 
@@ -52,7 +52,7 @@ RXN_ROLE_MAP: Dict[int, Dict[str, Any]] = {
 
 # ── GPU / scoring ────────────────────────────────────────────────────────────
 BOLTZ_BATCH_SIZE       = 10    # molecules per Boltz batch
-BOLTZ_BUDGET_PER_ROUND = 500   # max molecules scored per round
+BOLTZ_BUDGET_PER_ROUND = 100   # max molecules scored per round
 
 # ── Candidate generation ─────────────────────────────────────────────────────
 TIER1_NEIGHBOURS_PER_SEED = 60

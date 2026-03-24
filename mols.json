@@ -1,0 +1,32 @@
+
+Molecule names: ['rxn:2:141397:112875']
+SMILES: ['CNC1CC(C#Cc2cccs2)C1']
+Boltz scores: 0.20334202509659988
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=53
+Molecule names: ['rxn:1:57801:1060']
+SMILES: ['NCc1cc(F)ccc1CCCn1cc(-c2cc(Br)cs2)nn1']
+Boltz scores: 0.0596760252247686
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=54
+Molecule names: ['rxn:2:141397:143624']
+SMILES: ['CNC(C)c1ccc2c(c1)-c1ccccc1C2']
+Boltz scores: 0.16828113443711223
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=57
+Molecule names: ['rxn:2:141397:130267']
+SMILES: ['CNC(C)c1ccc2ccsc2c1']
+Boltz scores: 0.19473023598010725
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=58
+Molecule names: ['rxn:1:52141:2756']
+SMILES: ['Cc1cc(Br)c(-c2cn(CCC3CC3c3cnc(Cl)nc3N)nn2)s1']
+Boltz scores: 0.05623309910297394
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=59
+Molecule names: ['rxn:2:141397:90175']
+SMILES: ['CNC(C)c1cc2ccccc2o1']
+Boltz scores: 0.17612084058614877
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=60
+Molecule names: ['rxn:2:141397:145184']
+SMILES: ['CNC1CCC(c2c[nH]c3ccccc23)CC1']
+Boltz scores: 0.15743682664983413
+2026-03-23 16:52:04.862 | INFO | bittensor:ranking.py:139 | UID=61
+Molecule names: ['rxn:2:141397:126659']
+SMILES: ['CNC(C)c1cc2cc(C)ccc2s1']
+Boltz scores: 0.18849411181041173

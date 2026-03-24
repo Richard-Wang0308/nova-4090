@@ -20,7 +20,7 @@ DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 21632
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "mols.csv")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR,"score_results.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -69,7 +69,7 @@ def validate_molecule_heavy_atoms(
 ) -> Tuple[bool, str]:
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms, max_atoms = 13, 28
+        min_atoms, max_atoms = 12, 22
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
         if heavy_atom_count > max_atoms:
@@ -467,10 +467,10 @@ def load_molecules_from_db_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 13:
+                if ha < 12:
                     heavy_atom_count += 1
                     continue
-                if ha > 28:
+                if ha > 22:
                     heavy_atom_count += 1
                     continue
 
@@ -583,7 +583,7 @@ def load_molecules_from_csv_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 13 or ha > 28:
+                if ha < 12 or ha > 22:
                     heavy_atom_count += 1
                     continue
 
@@ -673,7 +673,8 @@ def load_molecules_combined(
 
     csv_df["source"] = "csv"
     db_df["source"] = "database"
-    combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    # combined_df = pd.concat([csv_df, db_df], ignore_index=True)
+    combined_df = csv_df
 
     combined_df = combined_df.sort_values(
         by=["score", "source"], ascending=[False, True], na_position="last"
