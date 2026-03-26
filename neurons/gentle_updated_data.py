@@ -69,7 +69,7 @@ def validate_molecule_heavy_atoms(
 ) -> Tuple[bool, str]:
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms, max_atoms = 13, 28
+        min_atoms, max_atoms = 14, 30
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
         if heavy_atom_count > max_atoms:
@@ -467,10 +467,10 @@ def load_molecules_from_db_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 13:
+                if ha < 14:
                     heavy_atom_count += 1
                     continue
-                if ha > 28:
+                if ha > 30:
                     heavy_atom_count += 1
                     continue
 
@@ -583,7 +583,7 @@ def load_molecules_from_csv_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 13 or ha > 28:
+                if ha < 14 or ha > 30:
                     heavy_atom_count += 1
                     continue
 
@@ -1105,7 +1105,8 @@ async def generate_unique_molecules_enhanced(
         logger.error("Generator is still None after initialization")
         return []
 
-    top_molecules = top_molecules_df.head(1000).to_dict("records")
+    # top_molecules = top_molecules_df.head(1000).to_dict("records")
+    top_molecules = top_molecules_df[50:250].to_dict("records")
 
     logger.info(
         f"Generating {desired_count} molecules using '{strategy}' strategy "
@@ -1257,7 +1258,8 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                 await asyncio.sleep(10)
                 continue
 
-            top_molecules_df = molecules_df.head(200)
+            # top_molecules_df = molecules_df.head(200)
+            top_molecules_df = molecules_df[50:250]
             state["top_pool"] = molecules_df.copy()
             state["seen_inchikeys"].update(molecules_df["InChIKey"].tolist())
 
