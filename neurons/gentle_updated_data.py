@@ -69,7 +69,7 @@ def validate_molecule_heavy_atoms(
 ) -> Tuple[bool, str]:
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms, max_atoms = 12, 22
+        min_atoms, max_atoms = 13, 28
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
         if heavy_atom_count > max_atoms:
@@ -467,10 +467,10 @@ def load_molecules_from_db_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 12:
+                if ha < 13:
                     heavy_atom_count += 1
                     continue
-                if ha > 22:
+                if ha > 28:
                     heavy_atom_count += 1
                     continue
 
@@ -583,7 +583,7 @@ def load_molecules_from_csv_with_validation(
                     continue
 
                 ha = get_heavy_atom_count(smiles)
-                if ha < 12 or ha > 22:
+                if ha < 13 or ha > 28:
                     heavy_atom_count += 1
                     continue
 

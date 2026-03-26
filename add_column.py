@@ -6,7 +6,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q01959"  # Replace with actual target protein
+TARGET_PROTEIN = "P23977"  # Replace with actual target protein
 
 
 async def check_molecule_unique(target_protein: str, molecule_name: str, smiles: str) -> bool:
