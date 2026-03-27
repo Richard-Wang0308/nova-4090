@@ -1106,7 +1106,7 @@ async def generate_unique_molecules_enhanced(
         return []
 
     # top_molecules = top_molecules_df.head(1000).to_dict("records")
-    top_molecules = top_molecules_df[50:250].to_dict("records")
+    top_molecules = top_molecules_df[10:210].to_dict("records")
 
     logger.info(
         f"Generating {desired_count} molecules using '{strategy}' strategy "
