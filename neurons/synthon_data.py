@@ -1737,7 +1737,8 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                     combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
                     
                     # Keep top 200
-                    state['top_200_df'] = combined_df.head(200)
+                    # state['top_200_df'] = combined_df.head(200)
+                    state['top_200_df'] = combined_df[50:250]
                     
                     print(f"✅ Updated top_200_df: {len(state['top_200_df'])} molecules")
             else:
