@@ -17,8 +17,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 2
-STARTING_EPOCH = 21632
+HARDCODED_RXN_ID = 5
+STARTING_EPOCH = 21771
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "mols.csv")
 SCORE_RESULTS_DB = os.path.join(BASE_DIR,"score_results.sqlite")
 
@@ -1106,7 +1106,7 @@ async def generate_unique_molecules_enhanced(
         return []
 
     # top_molecules = top_molecules_df.head(1000).to_dict("records")
-    top_molecules = top_molecules_df[10:210].to_dict("records")
+    top_molecules = top_molecules_df.head(1000).to_dict("records")
 
     logger.info(
         f"Generating {desired_count} molecules using '{strategy}' strategy "
@@ -1258,8 +1258,8 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                 await asyncio.sleep(10)
                 continue
 
-            # top_molecules_df = molecules_df.head(200)
-            top_molecules_df = molecules_df[50:250]
+            top_molecules_df = molecules_df.head(100)
+            # top_molecules_df = molecules_df[50:250]
             state["top_pool"] = molecules_df.copy()
             state["seen_inchikeys"].update(molecules_df["InChIKey"].tolist())
 

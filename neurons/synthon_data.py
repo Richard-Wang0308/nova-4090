@@ -1738,7 +1738,7 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                     
                     # Keep top 200
                     # state['top_200_df'] = combined_df.head(200)
-                    state['top_200_df'] = combined_df[50:250]
+                    state['top_200_df'] = combined_df[30:500]
                     
                     print(f"✅ Updated top_200_df: {len(state['top_200_df'])} molecules")
             else:
