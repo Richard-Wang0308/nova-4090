@@ -21,8 +21,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 2
-STARTING_EPOCH = 21632
+HARDCODED_RXN_ID = 5
+STARTING_EPOCH = 21771
 REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
 
@@ -67,7 +67,7 @@ def validate_molecule_heavy_atoms(
         heavy_atom_count = get_heavy_atom_count(smiles)
         # min_atoms = config.get('min_heavy_atoms', 10)
         min_atoms = 14
-        max_atoms = 30
+        max_atoms = 35
         
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -1737,8 +1737,8 @@ async def run_continuous_genetic_loop(state: Dict[str, Any]) -> None:
                     combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
                     
                     # Keep top 200
-                    # state['top_200_df'] = combined_df.head(200)
-                    state['top_200_df'] = combined_df[30:500]
+                    state['top_200_df'] = combined_df.head(200)
+                    # state['top_200_df'] = combined_df[30:500]
                     
                     print(f"✅ Updated top_200_df: {len(state['top_200_df'])} molecules")
             else:
