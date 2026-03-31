@@ -1,5 +1,6 @@
 .env
 timelock/
+boltz-scoring/boltz/boltz_tmp_files/*
 __pycache__/
 *.pyc
 *.pyo
