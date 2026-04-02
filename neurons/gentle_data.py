@@ -1236,7 +1236,7 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                 continue
             
             # top_molecules_df = molecules_df[30:500]
-            top_molecules_df = molecules_df.head(300)
+            top_molecules_df = molecules_df.head(500)
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
             
