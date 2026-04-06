@@ -2,7 +2,7 @@
 
 # Protein selection
 protein_selection:
-  weekly_target: "P23977"  # Target protein code (UniProt ID)
+  weekly_target: "P23975"  # Target protein code (UniProt ID)
   antitarget: "H6AQJ3"     # Antitarget protein code (UniProt ID)
 
 # Protein constraints (for target only)
