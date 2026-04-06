@@ -42,3 +42,4 @@ CUDA_VISIBLE_DEVICES=1 pm2 start "python3 neurons/synthon_data.py --logging.debu
 
 
 
+python3 neurons/repeat_submit_one.py --wallet.name nova --wallet.hotkey nota --netuid 68 --network finney
