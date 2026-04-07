@@ -118,7 +118,8 @@ async def update_available_values(df: pd.DataFrame, target_protein: str, batch_s
     """
     try:
         # Get molecules that haven't been processed yet (available is None/NaN)
-        unprocessed_mask = df['available'].isna()
+        # unprocessed_mask = df['available'].isna()
+        unprocessed_mask = df['available'] != False
         unprocessed_df = df[unprocessed_mask]
         
         total = len(unprocessed_df)
