@@ -11,9 +11,7 @@ python3 neurons/miner_ban_neighbour_mutate.py --wallet.name multisig-jjpes-shib 
 python3 neurons/miner_ban_random_mutate_db.py --wallet.name multisig-jjpes-shib --wallet.hotkey hotd --logging.debug
 
 #simple submit
-python3 neurons/simple_submit.py --wallet.name nova --wallet.hotkey notc --logging.debug
-python3 neurons/simple_submit.py --wallet.name nova --wallet.hotkey notd --logging.debug
-python3 neurons/simple_submit.py --wallet.name nova --wallet.hotkey note --logging.debug
+python3 neurons/simple_submit.py --logging.debug --wallet.name nova --wallet.hotkey notc
 
 
 #top submit
