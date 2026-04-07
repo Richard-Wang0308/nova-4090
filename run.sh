@@ -26,6 +26,6 @@ python3 neurons/mini_data.py --wallet.name multisig-jjpes-shib --wallet.hotkey h
 
 CUDA_VISIBLE_DEVICES=1 pm2 start "python3 neurons/synthon_data.py --logging.debug" --name "synthon_data"
 
-
+pm2 start "python3 neurons/repeat_submit_one.py --wallet.name nova --wallet.hotkey notc --netuid 68 --network finney" --name one
 pm2 start "python3 neurons/repeat_submit_two.py --wallet.name nova --wallet.hotkey notd --netuid 68 --network finney" --name two
 pm2 start "python3 neurons/repeat_submit_three.py --wallet.name nova --wallet.hotkey note --netuid 68 --network finney" --name three
