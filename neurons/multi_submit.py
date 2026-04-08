@@ -30,9 +30,11 @@ ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 # HARDCODED HOTKEYS - EDIT THIS LIST
 # ============================================================================
 HOTKEY_NAMES = [
-    "notc",
-    "notd",
+    'nota',
+    'notf',
     "note",
+    "notd",
+    "notc",
     # Add more hotkey names as needed
 ]
 # ============================================================================
