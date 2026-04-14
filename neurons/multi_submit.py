@@ -45,7 +45,8 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
-    'nota'
+    'notb',
+    'nota',
 ]
 
 # Timing configuration
@@ -414,8 +415,9 @@ async def submit_response(
         
         # Encrypt response
         bt.logging.info(f"      🔐 Encrypting response...")
+        message = f"{candidate_product}|~"
         encrypted_response = state['bdt'].encrypt(
-            miner_uid, candidate_product, current_block
+            miner_uid, message, current_block
         )
         bt.logging.info(f"      ✅ Encryption successful")
         
