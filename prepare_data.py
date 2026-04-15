@@ -48,7 +48,7 @@ def fetch_leaderboard_data(epoch: int, metric: str = 'boltz') -> dict:
     Returns:
         JSON response as dict, or None if failed
     """
-    url = f"https://dashboard-backend-multitarget.up.railway.app/api/leaderboard/{epoch}?metric={metric}"
+    url = f"https://compound-api-staging.metanova-labs.ai/api/competitions/leaderboard/{epoch}/molecules"
     
     try:
         response = requests.get(url, timeout=30)
@@ -72,26 +72,17 @@ def extract_training_samples(data: dict) -> list:
     samples = []
     
     # Extract competition info
-    competition = data.get('competition', {})
-    
-    # Try multiple ways to get target proteins
-    target_proteins = competition.get('target_proteins', [])
-    if not target_proteins:
-        target_proteins = data.get('target_proteins', [])
-    
-    if not target_proteins:
-        logger.warning("Missing target proteins in competition data")
-        return samples
+    competition = "Q63380"
     
     # Process leaderboard entries
-    leaderboard = data.get('leaderboard', [])
+    leaderboard = data.get('data', [])
     if not leaderboard:
         logger.warning("No leaderboard data found")
         return samples
     
     for entry in leaderboard:
         # Get final score
-        final_score = entry.get('boltz_score')
+        final_score = entry.get('final_score')
         
         # Get molecules
         molecules = entry.get('molecules', [])
