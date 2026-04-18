@@ -49,15 +49,14 @@ HOTKEY_NAMES = [
     'notb',
     'note',
     'notd',
-    'notf',
-    'notc'
+    'notf'
 ]
 
 # Timing configuration
-BLOCKS_BEFORE_BOUNDARY = 25  # Trigger point: 28 blocks before epoch end
+BLOCKS_BEFORE_BOUNDARY = 30  # Trigger point: 28 blocks before epoch end
 EPOCH_LENGTH = 361           # Blocks per epoch
 STATUS_LOG_INTERVAL = 60     # Log status every N seconds
-SUBMISSION_DELAY = 8        # Seconds between each hotkey submission
+SUBMISSION_DELAY = 2        # Seconds between each hotkey submission
 
 # ============================================================================
 
