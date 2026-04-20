@@ -1,7 +1,7 @@
 # Number of targets and antitargets to select
 protein_selection:
 
-  weekly_target: "Q63380"
+  weekly_target: "Q13547"
   num_antitargets: 1
 
 protein_constraints: # target only

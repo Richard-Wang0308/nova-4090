@@ -28,8 +28,9 @@ def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Continuously collect training data from competition API")
     parser.add_argument('--start_epoch', type=int, default=22050, help='Starting epoch number to collect from')
+    parser.add_argument('--end_epoch', type=int, default=22188, help='Ending epoch number to collect to')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
-    parser.add_argument('--output', type=str, default='data/mols.csv', help='Output CSV file')
+    parser.add_argument('--output', type=str, default='data/train1.csv', help='Output CSV file')
     parser.add_argument('--time', type=int, default=1, 
                        help='Remaining time in seconds until first collection. If None, collect immediately.')
     
@@ -348,7 +349,8 @@ async def continuous_collection_loop(config: argparse.Namespace):
                 search_start = last_collected_epoch
             
             # Find latest epoch
-            latest_epoch = find_latest_epoch(search_start, config.metric)
+            latest_epoch = config.end_epoch
+            # latest_epoch = find_latest_epoch(search_start, config.metric)
             
             # Collect all new epochs
             samples_collected = await collect_new_epochs(
