@@ -37,7 +37,7 @@ sys.path.append(BASE_DIR)
 
 # Database paths
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_old.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # Wallet configuration
@@ -45,11 +45,8 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
-    'nota',
-    'notb',
+    'notc',
     'note',
-    'notd',
-    'notf'
 ]
 
 # Timing configuration

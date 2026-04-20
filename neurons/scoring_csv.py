@@ -16,7 +16,7 @@ import pandas as pd
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
-MOLECULES_CSV      = os.path.join(BASE_DIR, "data", "data.csv")
+MOLECULES_CSV      = os.path.join(BASE_DIR, "data", "train.csv")
 SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results.sqlite")
 
 from config.config_loader import load_config
