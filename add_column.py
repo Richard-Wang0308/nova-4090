@@ -307,9 +307,14 @@ def get_statistics(db_path: str):
         bt.logging.info("DATABASE STATISTICS")
         bt.logging.info("=" * 60)
         bt.logging.info(f"Total molecules:        {total}")
-        bt.logging.info(f"Not yet processed:      {null_count} ({null_count/total*100:.1f}%)")
-        bt.logging.info(f"Available (TRUE):       {true_count} ({true_count/total*100:.1f}%)")
-        bt.logging.info(f"Not available (FALSE):  {false_count} ({false_count/total*100:.1f}%)")
+        if total == 0:
+            bt.logging.info("Not yet processed:      0 (n/a — empty table)")
+            bt.logging.info("Available (TRUE):       0 (n/a — empty table)")
+            bt.logging.info("Not available (FALSE):  0 (n/a — empty table)")
+        else:
+            bt.logging.info(f"Not yet processed:      {null_count} ({null_count/total*100:.1f}%)")
+            bt.logging.info(f"Available (TRUE):       {true_count} ({true_count/total*100:.1f}%)")
+            bt.logging.info(f"Not available (FALSE):  {false_count} ({false_count/total*100:.1f}%)")
         bt.logging.info("=" * 60)
         
         return {

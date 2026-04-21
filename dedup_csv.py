@@ -266,9 +266,14 @@ def get_statistics(df: pd.DataFrame) -> Dict[str, Any]:
         bt.logging.info("DATAFRAME STATISTICS")
         bt.logging.info("=" * 70)
         bt.logging.info(f"Total molecules:        {total}")
-        bt.logging.info(f"Not yet processed:      {null_count} ({null_count/total*100:.1f}%)")
-        bt.logging.info(f"Unique (TRUE):          {true_count} ({true_count/total*100:.1f}%)")
-        bt.logging.info(f"Duplicates (FALSE):     {false_count} ({false_count/total*100:.1f}%)")
+        if total == 0:
+            bt.logging.info("Not yet processed:      0 (n/a — empty dataframe)")
+            bt.logging.info("Unique (TRUE):          0 (n/a — empty dataframe)")
+            bt.logging.info("Duplicates (FALSE):     0 (n/a — empty dataframe)")
+        else:
+            bt.logging.info(f"Not yet processed:      {null_count} ({null_count/total*100:.1f}%)")
+            bt.logging.info(f"Unique (TRUE):          {true_count} ({true_count/total*100:.1f}%)")
+            bt.logging.info(f"Duplicates (FALSE):     {false_count} ({false_count/total*100:.1f}%)")
         bt.logging.info("=" * 70)
         
         return {

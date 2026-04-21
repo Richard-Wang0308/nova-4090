@@ -22,6 +22,8 @@ import hashlib
 import subprocess
 import sqlite3
 import signal
+import glob
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
@@ -47,7 +49,8 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 HOTKEY_NAMES = [
     'notc',
     'note',
-    'notb'
+    'notb',
+    'notf'
 ]
 
 # Timing configuration
@@ -297,6 +300,83 @@ def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
         return None
 
     return os.path.join(BASE_DIR, f"score_molecules_{reaction_id}.db")
+
+
+def discover_per_reaction_score_db_paths() -> List[str]:
+    """All ``score_molecules_<id>.db`` files under BASE_DIR, sorted by reaction id."""
+    pattern = os.path.join(BASE_DIR, "score_molecules_*.db")
+    paths = glob.glob(pattern)
+
+    def sort_key(p: str) -> Tuple[int, str]:
+        m = re.search(r"score_molecules_(\d+)\.db$", os.path.basename(p))
+        return (int(m.group(1)), p) if m else (10**9, p)
+
+    return sorted(paths, key=sort_key)
+
+
+def get_top_n_molecules_all_reactions(n: int) -> List[Tuple[str, float]]:
+    """
+    For SAVI epochs: merge available molecules from every per-reaction score DB,
+    keeping each molecule's best score across reactions, then return global top N.
+    """
+    paths = discover_per_reaction_score_db_paths()
+    if not paths:
+        bt.logging.warning(
+            "   ⚠️  No score_molecules_*.db files found; falling back to SCORE_RESULTS_DB "
+            f"({SCORE_RESULTS_DB})"
+        )
+        return get_top_n_molecules_from_db(n, db_path=SCORE_RESULTS_DB)
+
+    bt.logging.info(
+        f"   🗄️  SAVI mode: merging available molecules from {len(paths)} reaction DBs"
+    )
+    for p in paths:
+        bt.logging.info(f"      • {os.path.basename(p)}")
+
+    best_score_by_molecule: Dict[str, float] = {}
+    for db_path in paths:
+        if not os.path.exists(db_path):
+            bt.logging.warning(f"   ⚠️  Missing file (skipped): {db_path}")
+            continue
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT molecule_name, score
+                FROM   scored_molecules
+                WHERE  available = TRUE
+                """
+            )
+            for mol_name, score in cursor.fetchall():
+                s = float(score)
+                prev = best_score_by_molecule.get(mol_name)
+                if prev is None or s > prev:
+                    best_score_by_molecule[mol_name] = s
+            conn.close()
+        except sqlite3.Error as e:
+            bt.logging.warning(f"   ⚠️  Skipping {db_path}: {e}")
+        except Exception as e:
+            bt.logging.warning(f"   ⚠️  Skipping {db_path}: {e}")
+
+    if not best_score_by_molecule:
+        bt.logging.warning(
+            "   ⚠️  No available molecules found across reaction databases (SAVI)"
+        )
+        return []
+
+    ranked = sorted(
+        best_score_by_molecule.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:n]
+
+    bt.logging.info(
+        f"   ✅ Top {len(ranked)} molecules by best score across reactions:"
+    )
+    for idx, (mol_name, score) in enumerate(ranked, 1):
+        bt.logging.info(f"      {idx}. {mol_name:<30} | Score: {score:.6f}")
+    return ranked
 
 
 def get_top_n_molecules_from_db(
@@ -629,26 +709,31 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     continue
 
                 bt.logging.info(f"   🎯 Allowed reaction for epoch {current_epoch}: {allowed_reaction}")
-                reaction_db_path = get_reaction_score_db_path(allowed_reaction)
 
-                if not reaction_db_path:
-                    bt.logging.warning(
-                        "   ⚠️  Could not resolve per-reaction DB for this epoch. "
-                        "Skipping submission.\n"
+                if str(allowed_reaction).lower() == "savi":
+                    top_molecules = get_top_n_molecules_all_reactions(num_hotkeys)
+                    selection_label = "savi (all reactions)"
+                else:
+                    reaction_db_path = get_reaction_score_db_path(allowed_reaction)
+                    if not reaction_db_path:
+                        bt.logging.warning(
+                            "   ⚠️  Could not resolve per-reaction DB for this epoch. "
+                            "Skipping submission.\n"
+                        )
+                        last_acted_epoch = current_epoch
+                        await asyncio.sleep(12)
+                        continue
+
+                    bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
+                    top_molecules = get_top_n_molecules_from_db(
+                        n=num_hotkeys,
+                        db_path=reaction_db_path,
                     )
-                    last_acted_epoch = current_epoch
-                    await asyncio.sleep(12)
-                    continue
-
-                bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
-                top_molecules = get_top_n_molecules_from_db(
-                    n=num_hotkeys,
-                    db_path=reaction_db_path,
-                )
+                    selection_label = str(allowed_reaction)
 
                 if not top_molecules:
                     bt.logging.warning(
-                        f"   ⚠️  No available molecules found for {allowed_reaction}. "
+                        f"   ⚠️  No available molecules found for {selection_label}. "
                         "Skipping submission for this epoch.\n"
                     )
                     last_acted_epoch = current_epoch
