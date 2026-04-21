@@ -6,7 +6,15 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q63380"  # Replace with actual target protein
+TARGET_PROTEIN = "Q13547"  # Replace with actual target protein
+
+
+def scored_molecules_table_exists(cursor: sqlite3.Cursor) -> bool:
+    """Return True when the scored_molecules table exists in the connected DB."""
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scored_molecules' LIMIT 1"
+    )
+    return cursor.fetchone() is not None
 
 
 async def check_molecule_unique(target_protein: str, molecule_name: str, smiles: str) -> bool:
@@ -49,6 +57,13 @@ def fix_available_column(db_path: str):
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        if not scored_molecules_table_exists(cursor):
+            bt.logging.warning(
+                f"⚠️  Table 'scored_molecules' not found in {db_path}; skipping column fix."
+            )
+            conn.close()
+            return
         
         # Check if column exists and get its type
         cursor.execute("PRAGMA table_info(scored_molecules)")
@@ -118,6 +133,13 @@ def fix_available_column_simple(db_path: str):
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        if not scored_molecules_table_exists(cursor):
+            bt.logging.warning(
+                f"⚠️  Table 'scored_molecules' not found in {db_path}; skipping column fix."
+            )
+            conn.close()
+            return
         
         # Check if column exists
         cursor.execute("PRAGMA table_info(scored_molecules)")
@@ -169,6 +191,13 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        if not scored_molecules_table_exists(cursor):
+            bt.logging.warning(
+                f"⚠️  Table 'scored_molecules' not found in {db_path}; skipping availability update."
+            )
+            conn.close()
+            return
         
         # Get molecules that need processing
         if force_recalculate:
@@ -259,6 +288,20 @@ def get_statistics(db_path: str):
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        if not scored_molecules_table_exists(cursor):
+            conn.close()
+            bt.logging.warning(
+                f"⚠️  Table 'scored_molecules' not found in {db_path}; no statistics to report."
+            )
+            return {
+                'total': 0,
+                'null': 0,
+                'true': 0,
+                'false': 0,
+                'column_exists': False,
+                'table_exists': False,
+            }
         
         # Check if 'available' column exists
         cursor.execute("PRAGMA table_info(scored_molecules)")
@@ -330,7 +373,11 @@ def get_statistics(db_path: str):
         return None
 
 
-async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
+async def main(
+    force_recalculate: bool = False,
+    skip_column_fix: bool = False,
+    db_path: str = "score_results.sqlite",
+):
     """
     Main function to fix column type and update values.
     
@@ -338,8 +385,12 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
         force_recalculate: If True, recalculate all molecules. If False, only process TRUE values.
         skip_column_fix: If True, skip the column type fix (useful for subsequent runs)
     """
-    # Set database path
-    db_path = "score_results.sqlite"
+    db_path = os.path.abspath(os.path.expanduser(db_path))
+    if not os.path.exists(db_path):
+        bt.logging.warning(
+            f"⚠️  Database file does not exist: {db_path}. Skipping update."
+        )
+        return
     
     # Fix available column first (only needed once)
     # This ensures the column exists before we try to get statistics
@@ -368,13 +419,35 @@ async def main(force_recalculate: bool = False, skip_column_fix: bool = False):
 
 if __name__ == "__main__":
     import asyncio
-    import sys
-    
-    # Parse command line arguments
-    force_recalculate = "--force" in sys.argv
-    skip_column_fix = "--skip-fix" in sys.argv
-    
-    if force_recalculate:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Fix/refresh the 'available' column in a score_results SQLite DB."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recalculate availability for all molecules",
+    )
+    parser.add_argument(
+        "--skip-fix",
+        action="store_true",
+        help="Skip available-column schema fix and only run updates",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=os.path.join(os.path.dirname(__file__), "score_results.sqlite"),
+        help="Path to target SQLite database",
+    )
+    args = parser.parse_args()
+
+    if args.force:
         bt.logging.warning("⚠️  FORCE RECALCULATE MODE: Will process ALL molecules")
-    
-    asyncio.run(main(force_recalculate=force_recalculate, skip_column_fix=skip_column_fix))
+
+    asyncio.run(
+        main(
+            force_recalculate=args.force,
+            skip_column_fix=args.skip_fix,
+            db_path=args.db_path,
+        )
+    )

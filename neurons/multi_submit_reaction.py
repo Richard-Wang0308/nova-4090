@@ -39,7 +39,7 @@ sys.path.append(BASE_DIR)
 
 # Database paths
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_1.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # Wallet configuration
@@ -444,12 +444,14 @@ def run_add_column_script() -> bool:
         True if successful, False otherwise
     """
     try:
-        bt.logging.info(f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix")
+        bt.logging.info(
+            f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix --db-path {SCORE_RESULTS_DB}"
+        )
         
         start_time = datetime.datetime.now()
         
         result = subprocess.run(
-            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix"],
+            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix", "--db-path", SCORE_RESULTS_DB],
             capture_output=True,
             text=True,
             timeout=120,  # 2 minute timeout

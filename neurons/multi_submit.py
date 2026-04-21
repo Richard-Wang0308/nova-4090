@@ -335,12 +335,14 @@ def run_add_column_script() -> bool:
         True if successful, False otherwise
     """
     try:
-        bt.logging.info(f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix")
+        bt.logging.info(
+            f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix --db-path {SCORE_RESULTS_DB}"
+        )
         
         start_time = datetime.datetime.now()
         
         result = subprocess.run(
-            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix"],
+            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix", "--db-path", SCORE_RESULTS_DB],
             capture_output=True,
             text=True,
             timeout=120,  # 2 minute timeout
