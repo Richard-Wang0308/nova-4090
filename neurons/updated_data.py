@@ -24,7 +24,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH            = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "data.csv")
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "mold.csv")
 SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results_5.sqlite")
 SURROGATE_PATH     = os.path.join(BASE_DIR, "surrogate_model.pkl")
 

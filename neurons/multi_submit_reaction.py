@@ -86,6 +86,100 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ============================================================================
+# CHALLENGE PARAM HELPERS
+# ============================================================================
+
+def _get_config_value(config: argparse.Namespace, key: str, default: Any = None) -> Any:
+    """Read config values safely from Namespace-like config objects."""
+    try:
+        return getattr(config, key, default)
+    except Exception:
+        return default
+
+
+def resolve_challenge_params_from_blockhash(
+    block_hash: str,
+    config: argparse.Namespace,
+    include_reaction: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolve challenge params while supporting both miner and validator-style
+    get_challenge_params_from_blockhash signatures.
+    """
+    try:
+        # Miner-style signature (small_molecule_target / nanobody_target).
+        return get_challenge_params_from_blockhash(
+            block_hash=block_hash,
+            small_molecule_target=_get_config_value(config, "small_molecule_target"),
+            nanobody_target=_get_config_value(config, "nanobody_target"),
+            num_antitargets=_get_config_value(config, "num_antitargets", 0),
+            include_reaction=include_reaction,
+        )
+    except TypeError:
+        # Validator/repo-current signature (weekly_target / num_antitargets).
+        return get_challenge_params_from_blockhash(
+            block_hash=block_hash,
+            weekly_target=_get_config_value(config, "weekly_target"),
+            num_antitargets=_get_config_value(config, "num_antitargets", 0),
+            include_reaction=include_reaction,
+        )
+
+
+async def get_miner_challenge_params(
+    subtensor: Any,
+    config: argparse.Namespace,
+    epoch_length: int,
+    min_blocks_before_boundary: int = 20,
+    include_reaction: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[str]]:
+    """
+    Miner-style challenge retrieval:
+    - If too close to epoch end, wait for next epoch boundary and use that block.
+    - Otherwise use the current epoch boundary block.
+    """
+    current_block = await subtensor.get_current_block()
+    last_boundary = (current_block // epoch_length) * epoch_length
+    next_boundary = last_boundary + epoch_length
+
+    if next_boundary - current_block < min_blocks_before_boundary:
+        bt.logging.info("Too close to epoch end, waiting for next epoch to start...")
+        wait_blocks = next_boundary - current_block
+        if wait_blocks > 0:
+            await asyncio.sleep(12 * wait_blocks)
+        block_to_check = next_boundary
+    else:
+        block_to_check = last_boundary
+
+    block_hash = await subtensor.determine_block_hash(block_to_check)
+    challenge_params = resolve_challenge_params_from_blockhash(
+        block_hash=block_hash,
+        config=config,
+        include_reaction=include_reaction,
+    )
+    return challenge_params, block_to_check, block_hash
+
+
+async def get_epoch_challenge_params(
+    subtensor: Any,
+    config: argparse.Namespace,
+    epoch_length: int,
+    epoch_number: int,
+    include_reaction: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], int, str]:
+    """
+    Resolve challenge params from the BEGINNING block of a specific epoch.
+    """
+    epoch_start_block = epoch_number * epoch_length
+    block_hash = await subtensor.determine_block_hash(epoch_start_block)
+    challenge_params = resolve_challenge_params_from_blockhash(
+        block_hash=block_hash,
+        config=config,
+        include_reaction=include_reaction,
+    )
+    return challenge_params, epoch_start_block, block_hash
+
+
+# ============================================================================
 # ARGUMENT PARSING & LOGGING
 # ============================================================================
 
@@ -640,6 +734,36 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
             next_epoch_block = (current_epoch + 1) * state['epoch_length']
             blocks_remaining = next_epoch_block - current_block
 
+            # Resolve challenge params once at the beginning of each epoch.
+            if state.get('challenge_epoch') != current_epoch:
+                try:
+                    challenge_params, challenge_block, challenge_hash = await get_epoch_challenge_params(
+                        subtensor=state['subtensor'],
+                        config=state['config'],
+                        epoch_length=state['epoch_length'],
+                        epoch_number=current_epoch,
+                        include_reaction=bool(_get_config_value(state['config'], "random_valid_reaction", True)),
+                    )
+                    state['challenge_epoch'] = current_epoch
+                    state['current_epoch_challenge'] = challenge_params
+                    state['current_epoch_allowed_reaction'] = (
+                        challenge_params.get("allowed_reaction") if challenge_params else None
+                    )
+                    bt.logging.info(
+                        f"🧩 Epoch {current_epoch} challenge initialized from block {challenge_block} "
+                        f"({challenge_hash[:12]}...)"
+                    )
+                    bt.logging.info(
+                        f"   Allowed reaction (epoch start): {state['current_epoch_allowed_reaction']}"
+                    )
+                except Exception as e:
+                    bt.logging.error(
+                        f"❌ Failed to initialize epoch {current_epoch} challenge params: {e}"
+                    )
+                    state['challenge_epoch'] = current_epoch
+                    state['current_epoch_challenge'] = None
+                    state['current_epoch_allowed_reaction'] = None
+
             # Periodic status logging
             now = datetime.datetime.now()
             if (now - last_status_log).total_seconds() >= STATUS_LOG_INTERVAL:
@@ -669,27 +793,11 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 # STEP 1: Determine allowed reaction
                 # ============================================================
                 bt.logging.info("🔹 STEP 1/3: Determine Allowed Reaction")
-
-                epoch_start_block = current_epoch * state['epoch_length']
-                try:
-                    epoch_start_hash = await state['subtensor'].determine_block_hash(epoch_start_block)
-                    challenge_params = get_challenge_params_from_blockhash(
-                        block_hash=epoch_start_hash,
-                        weekly_target=state['config'].weekly_target,
-                        num_antitargets=state['config'].num_antitargets,
-                        include_reaction=True,
-                    )
-                    allowed_reaction = challenge_params.get("allowed_reaction") if challenge_params else None
-                except Exception as e:
-                    bt.logging.error(f"   ❌ Failed to determine allowed reaction for epoch {current_epoch}: {e}")
-                    bt.logging.warning("   ⚠️  Skipping submission for this epoch.")
-                    last_acted_epoch = current_epoch
-                    await asyncio.sleep(12)
-                    continue
+                allowed_reaction = state.get('current_epoch_allowed_reaction')
 
                 if not allowed_reaction:
                     bt.logging.warning(
-                        f"   ⚠️  No allowed reaction found for epoch {current_epoch}. "
+                        f"   ⚠️  No allowed reaction found for epoch {current_epoch} (from epoch start challenge). "
                         "Skipping submission for this epoch.\n"
                     )
                     last_acted_epoch = current_epoch
@@ -909,22 +1017,34 @@ async def run_miner(config: argparse.Namespace) -> None:
             'bdt': QuicknetBittensorDrandTimelock(),
         }
 
-        # Get challenge targets
-        current_block = await subtensor.get_current_block()
-        last_boundary = (current_block // epoch_length) * epoch_length
-        block_hash = await subtensor.determine_block_hash(last_boundary)
-        
-        startup_proteins = get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            weekly_target=config.weekly_target,
-            num_antitargets=config.num_antitargets,
+        # Get startup challenge params with miner-style boundary handling.
+        startup_challenge, block_to_check, block_hash = await get_miner_challenge_params(
+            subtensor=subtensor,
+            config=config,
+            epoch_length=epoch_length,
+            min_blocks_before_boundary=20,
+            include_reaction=bool(_get_config_value(config, "random_valid_reaction", True)),
         )
-        
-        if startup_proteins:
-            state['current_challenge_targets'] = startup_proteins["targets"]
-            state['current_challenge_antitargets'] = startup_proteins["antitargets"]
-            bt.logging.info(f"🎯 Challenge targets: {startup_proteins['targets']}")
-            bt.logging.info(f"🚫 Anti-targets: {startup_proteins['antitargets']}\n")
+
+        bt.logging.info(
+            f"Challenge params from block {block_to_check} "
+            f"({block_hash[:12]}...): {startup_challenge}"
+        )
+
+        if startup_challenge:
+            if "targets" in startup_challenge:
+                state['current_challenge_targets'] = startup_challenge.get("targets", [])
+                state['current_challenge_antitargets'] = startup_challenge.get("antitargets", [])
+                bt.logging.info(f"🎯 Challenge targets: {state['current_challenge_targets']}")
+                bt.logging.info(f"🚫 Anti-targets: {state['current_challenge_antitargets']}\n")
+            else:
+                state['current_small_molecule_target'] = startup_challenge.get("small_molecule_target")
+                state['current_nanobody_target'] = startup_challenge.get("nanobody_target")
+                bt.logging.info(
+                    "🎯 Challenge targets: "
+                    f"small_molecule={state['current_small_molecule_target']}, "
+                    f"nanobody={state['current_nanobody_target']}\n"
+                )
 
         # Start main loop
         await run_epoch_loop(state)
