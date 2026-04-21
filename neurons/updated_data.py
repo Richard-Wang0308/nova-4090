@@ -24,8 +24,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH            = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "mols.csv")
-SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results.sqlite")
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, "data", "data.csv")
+SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results_5.sqlite")
 SURROGATE_PATH     = os.path.join(BASE_DIR, "surrogate_model.pkl")
 
 from config.config_loader import load_config
@@ -37,10 +37,10 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════
 
-HARDCODED_RXN_ID      = 2
-STARTING_EPOCH        = 21910
-SEED_SCORE_THRESHOLD  = 0.15
-TOP_SEED_THRESHOLD    = 0.17
+HARDCODED_RXN_ID      = 5
+STARTING_EPOCH        = 22189
+SEED_SCORE_THRESHOLD  = 0.05
+TOP_SEED_THRESHOLD    = 0.075
 
 RXN_ROLE_MAP: Dict[int, Dict[str, Any]] = {
     1: {"name": "triazole",                     "roleA": 1,   "roleB": 2,    "roleC": None},

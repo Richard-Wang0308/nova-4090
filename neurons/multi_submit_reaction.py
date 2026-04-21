@@ -39,7 +39,7 @@ sys.path.append(BASE_DIR)
 
 # Database paths
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_1.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_5.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # Wallet configuration
@@ -279,7 +279,7 @@ async def setup_bittensor_objects(
 
 def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
     """
-    Resolve per-reaction score DB path (e.g. rxn:2 -> score_molecules_2.db).
+    Resolve per-reaction score DB path (e.g. rxn:2 -> score_results_2.sqlite).
     Returns None when reaction format is unsupported.
     """
     if not allowed_reaction:
@@ -299,16 +299,16 @@ def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
         )
         return None
 
-    return os.path.join(BASE_DIR, f"score_molecules_{reaction_id}.db")
+    return os.path.join(BASE_DIR, f"score_results_{reaction_id}.sqlite")
 
 
 def discover_per_reaction_score_db_paths() -> List[str]:
-    """All ``score_molecules_<id>.db`` files under BASE_DIR, sorted by reaction id."""
-    pattern = os.path.join(BASE_DIR, "score_molecules_*.db")
+    """All ``score_results_<id>.sqlite`` files under BASE_DIR, sorted by reaction id."""
+    pattern = os.path.join(BASE_DIR, "score_results_*.sqlite")
     paths = glob.glob(pattern)
 
     def sort_key(p: str) -> Tuple[int, str]:
-        m = re.search(r"score_molecules_(\d+)\.db$", os.path.basename(p))
+        m = re.search(r"score_results_(\d+)\.sqlite$", os.path.basename(p))
         return (int(m.group(1)), p) if m else (10**9, p)
 
     return sorted(paths, key=sort_key)
@@ -322,7 +322,7 @@ def get_top_n_molecules_all_reactions(n: int) -> List[Tuple[str, float]]:
     paths = discover_per_reaction_score_db_paths()
     if not paths:
         bt.logging.warning(
-            "   ⚠️  No score_molecules_*.db files found; falling back to SCORE_RESULTS_DB "
+            "   ⚠️  No score_results_*.sqlite files found; falling back to SCORE_RESULTS_DB "
             f"({SCORE_RESULTS_DB})"
         )
         return get_top_n_molecules_from_db(n, db_path=SCORE_RESULTS_DB)
@@ -436,22 +436,22 @@ def get_top_n_molecules_from_db(
         return []
 
 
-def run_add_column_script() -> bool:
+def run_add_column_script(db_path: str) -> bool:
     """
-    Execute add_column.py --skip-fix to update database availability.
+    Execute add_column.py --skip-fix for a specific score database.
     
     Returns:
         True if successful, False otherwise
     """
     try:
         bt.logging.info(
-            f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix --db-path {SCORE_RESULTS_DB}"
+            f"   💾 Running: python3 {ADD_COLUMN_SCRIPT} --skip-fix --db-path {db_path}"
         )
         
         start_time = datetime.datetime.now()
         
         result = subprocess.run(
-            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix", "--db-path", SCORE_RESULTS_DB],
+            ["python3", ADD_COLUMN_SCRIPT, "--skip-fix", "--db-path", db_path],
             capture_output=True,
             text=True,
             timeout=120,  # 2 minute timeout
@@ -619,9 +619,10 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
     Workflow:
     1. Poll blockchain every 6 seconds
     2. When blocks_remaining <= BLOCKS_BEFORE_BOUNDARY (and not yet acted):
-       a. Update database (run add_column.py)
-       b. Fetch top N molecules
-       c. Submit all molecules SEQUENTIALLY with delays
+       a. Determine allowed reaction
+       b. Update matching reaction database(s)
+       c. Fetch top N molecules
+       d. Submit all molecules SEQUENTIALLY with delays
     3. Wait for next epoch's submission window
     4. Repeat
     """
@@ -665,24 +666,9 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 submission_start_time = datetime.datetime.now()
 
                 # ============================================================
-                # STEP 1: Update Database
+                # STEP 1: Determine allowed reaction
                 # ============================================================
-                bt.logging.info("🔹 STEP 1/3: Database Update")
-                bt.logging.info("💾 DATABASE UPDATE STARTING")
-                
-                db_update_success = run_add_column_script()
-                
-                if not db_update_success:
-                    bt.logging.error(
-                        "   ⚠️  Database update failed, but continuing with submission...\n"
-                    )
-                
-                bt.logging.info("")
-
-                # ============================================================
-                # STEP 2: Determine allowed reaction and fetch molecules
-                # ============================================================
-                bt.logging.info("🔹 STEP 2/3: Fetching Top Molecules for Allowed Reaction")
+                bt.logging.info("🔹 STEP 1/3: Determine Allowed Reaction")
 
                 epoch_start_block = current_epoch * state['epoch_length']
                 try:
@@ -711,6 +697,66 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     continue
 
                 bt.logging.info(f"   🎯 Allowed reaction for epoch {current_epoch}: {allowed_reaction}")
+
+                # ============================================================
+                # STEP 2: Update matching database(s)
+                # ============================================================
+                bt.logging.info("🔹 STEP 2/3: Database Update")
+                bt.logging.info("💾 DATABASE UPDATE STARTING")
+
+                db_paths_to_update: List[str] = []
+                if str(allowed_reaction).lower() == "savi":
+                    db_paths_to_update = discover_per_reaction_score_db_paths()
+                    if not db_paths_to_update:
+                        bt.logging.warning(
+                            "   ⚠️  No per-reaction DBs found for SAVI epoch. "
+                            "Skipping submission for this epoch.\n"
+                        )
+                        last_acted_epoch = current_epoch
+                        await asyncio.sleep(12)
+                        continue
+                else:
+                    reaction_db_path = get_reaction_score_db_path(allowed_reaction)
+                    if not reaction_db_path:
+                        bt.logging.warning(
+                            "   ⚠️  Could not resolve per-reaction DB for this epoch. "
+                            "Skipping submission.\n"
+                        )
+                        last_acted_epoch = current_epoch
+                        await asyncio.sleep(12)
+                        continue
+                    if not os.path.exists(reaction_db_path):
+                        bt.logging.warning(
+                            f"   ⚠️  Missing DB for {allowed_reaction}: {reaction_db_path}. "
+                            "Skipping submission for this epoch.\n"
+                        )
+                        last_acted_epoch = current_epoch
+                        await asyncio.sleep(12)
+                        continue
+                    db_paths_to_update = [reaction_db_path]
+
+                all_updates_ok = True
+                for db_path in db_paths_to_update:
+                    db_update_success = run_add_column_script(db_path)
+                    if not db_update_success:
+                        all_updates_ok = False
+                        bt.logging.error(
+                            f"   ⚠️  Database update failed for {db_path}. "
+                            "Skipping submission for this epoch.\n"
+                        )
+                        break
+
+                if not all_updates_ok:
+                    last_acted_epoch = current_epoch
+                    await asyncio.sleep(12)
+                    continue
+
+                bt.logging.info("")
+
+                # ============================================================
+                # STEP 3: Fetch top molecules for allowed reaction
+                # ============================================================
+                bt.logging.info("🔹 STEP 3/3: Fetching Top Molecules for Allowed Reaction")
 
                 if str(allowed_reaction).lower() == "savi":
                     top_molecules = get_top_n_molecules_all_reactions(num_hotkeys)
@@ -745,9 +791,9 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info("")
 
                 # ============================================================
-                # STEP 3: Submit SEQUENTIALLY (one at a time with delays)
+                # STEP 4: Submit SEQUENTIALLY (one at a time with delays)
                 # ============================================================
-                bt.logging.info("🔹 STEP 3/3: Sequential Submission with Delays")
+                bt.logging.info("🔹 STEP 4/4: Sequential Submission with Delays")
                 bt.logging.info(f"   ⚡ Submitting {len(top_molecules)} molecules using {num_hotkeys} hotkeys")
                 bt.logging.info(f"   ⏱️  Delay between submissions: {SUBMISSION_DELAY}s")
 
