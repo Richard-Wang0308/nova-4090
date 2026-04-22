@@ -18,7 +18,7 @@ sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 HARDCODED_RXN_ID = 5
 STARTING_EPOCH = 22050
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'mols.csv')
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn_5.csv')
 SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_5.sqlite")
 
 from config.config_loader import load_config
@@ -66,7 +66,7 @@ def validate_molecule_heavy_atoms(
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
         # min_atoms = config.get('min_heavy_atoms', 10)
-        min_atoms = 10
+        min_atoms = 22
         max_atoms = 35
 
         if heavy_atom_count < min_atoms:
@@ -479,7 +479,7 @@ def load_molecules_from_db_with_validation(
                 
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 10
+                min_heavy_atoms = 22
                 max_heavy_atoms = 35
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
@@ -616,7 +616,7 @@ def load_molecules_from_csv_with_validation(
                 
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
-                min_heavy_atoms = 10
+                min_heavy_atoms = 22
                 max_heavy_atoms = 35
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
