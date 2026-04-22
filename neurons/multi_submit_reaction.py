@@ -22,8 +22,6 @@ import hashlib
 import subprocess
 import sqlite3
 import signal
-import glob
-import re
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
@@ -83,100 +81,6 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
-
-
-# ============================================================================
-# CHALLENGE PARAM HELPERS
-# ============================================================================
-
-def _get_config_value(config: argparse.Namespace, key: str, default: Any = None) -> Any:
-    """Read config values safely from Namespace-like config objects."""
-    try:
-        return getattr(config, key, default)
-    except Exception:
-        return default
-
-
-def resolve_challenge_params_from_blockhash(
-    block_hash: str,
-    config: argparse.Namespace,
-    include_reaction: bool = True,
-) -> Optional[Dict[str, Any]]:
-    """
-    Resolve challenge params while supporting both miner and validator-style
-    get_challenge_params_from_blockhash signatures.
-    """
-    try:
-        # Miner-style signature (small_molecule_target / nanobody_target).
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            small_molecule_target=_get_config_value(config, "small_molecule_target"),
-            nanobody_target=_get_config_value(config, "nanobody_target"),
-            num_antitargets=_get_config_value(config, "num_antitargets", 0),
-            include_reaction=include_reaction,
-        )
-    except TypeError:
-        # Validator/repo-current signature (weekly_target / num_antitargets).
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            weekly_target=_get_config_value(config, "weekly_target"),
-            num_antitargets=_get_config_value(config, "num_antitargets", 0),
-            include_reaction=include_reaction,
-        )
-
-
-async def get_miner_challenge_params(
-    subtensor: Any,
-    config: argparse.Namespace,
-    epoch_length: int,
-    min_blocks_before_boundary: int = 20,
-    include_reaction: bool = True,
-) -> Tuple[Optional[Dict[str, Any]], Optional[int], Optional[str]]:
-    """
-    Miner-style challenge retrieval:
-    - If too close to epoch end, wait for next epoch boundary and use that block.
-    - Otherwise use the current epoch boundary block.
-    """
-    current_block = await subtensor.get_current_block()
-    last_boundary = (current_block // epoch_length) * epoch_length
-    next_boundary = last_boundary + epoch_length
-
-    if next_boundary - current_block < min_blocks_before_boundary:
-        bt.logging.info("Too close to epoch end, waiting for next epoch to start...")
-        wait_blocks = next_boundary - current_block
-        if wait_blocks > 0:
-            await asyncio.sleep(12 * wait_blocks)
-        block_to_check = next_boundary
-    else:
-        block_to_check = last_boundary
-
-    block_hash = await subtensor.determine_block_hash(block_to_check)
-    challenge_params = resolve_challenge_params_from_blockhash(
-        block_hash=block_hash,
-        config=config,
-        include_reaction=include_reaction,
-    )
-    return challenge_params, block_to_check, block_hash
-
-
-async def get_epoch_challenge_params(
-    subtensor: Any,
-    config: argparse.Namespace,
-    epoch_length: int,
-    epoch_number: int,
-    include_reaction: bool = True,
-) -> Tuple[Optional[Dict[str, Any]], int, str]:
-    """
-    Resolve challenge params from the BEGINNING block of a specific epoch.
-    """
-    epoch_start_block = epoch_number * epoch_length
-    block_hash = await subtensor.determine_block_hash(epoch_start_block)
-    challenge_params = resolve_challenge_params_from_blockhash(
-        block_hash=block_hash,
-        config=config,
-        include_reaction=include_reaction,
-    )
-    return challenge_params, epoch_start_block, block_hash
 
 
 # ============================================================================
@@ -373,10 +277,13 @@ async def setup_bittensor_objects(
 
 def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
     """
-    Resolve per-reaction score DB path (e.g. rxn:2 -> score_results_2.sqlite).
-    Returns None when reaction format is unsupported.
+    Resolve per-reaction score DB path for rxn:1 .. rxn:5 only
+    (e.g. rxn:2 -> score_results_2.sqlite).
     """
     if not allowed_reaction:
+        return None
+
+    if str(allowed_reaction).lower() == "savi":
         return None
 
     if not allowed_reaction.startswith("rxn:"):
@@ -393,84 +300,13 @@ def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
         )
         return None
 
+    if reaction_id not in (1, 2, 3, 4, 5):
+        bt.logging.warning(
+            f"   ⚠️  Allowed reaction must be rxn:1..rxn:5, got: {allowed_reaction}"
+        )
+        return None
+
     return os.path.join(BASE_DIR, f"score_results_{reaction_id}.sqlite")
-
-
-def discover_per_reaction_score_db_paths() -> List[str]:
-    """All ``score_results_<id>.sqlite`` files under BASE_DIR, sorted by reaction id."""
-    pattern = os.path.join(BASE_DIR, "score_results_*.sqlite")
-    paths = glob.glob(pattern)
-
-    def sort_key(p: str) -> Tuple[int, str]:
-        m = re.search(r"score_results_(\d+)\.sqlite$", os.path.basename(p))
-        return (int(m.group(1)), p) if m else (10**9, p)
-
-    return sorted(paths, key=sort_key)
-
-
-def get_top_n_molecules_all_reactions(n: int) -> List[Tuple[str, float]]:
-    """
-    For SAVI epochs: merge available molecules from every per-reaction score DB,
-    keeping each molecule's best score across reactions, then return global top N.
-    """
-    paths = discover_per_reaction_score_db_paths()
-    if not paths:
-        bt.logging.warning(
-            "   ⚠️  No score_results_*.sqlite files found; falling back to SCORE_RESULTS_DB "
-            f"({SCORE_RESULTS_DB})"
-        )
-        return get_top_n_molecules_from_db(n, db_path=SCORE_RESULTS_DB)
-
-    bt.logging.info(
-        f"   🗄️  SAVI mode: merging available molecules from {len(paths)} reaction DBs"
-    )
-    for p in paths:
-        bt.logging.info(f"      • {os.path.basename(p)}")
-
-    best_score_by_molecule: Dict[str, float] = {}
-    for db_path in paths:
-        if not os.path.exists(db_path):
-            bt.logging.warning(f"   ⚠️  Missing file (skipped): {db_path}")
-            continue
-        try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT molecule_name, score
-                FROM   scored_molecules
-                WHERE  available = TRUE
-                """
-            )
-            for mol_name, score in cursor.fetchall():
-                s = float(score)
-                prev = best_score_by_molecule.get(mol_name)
-                if prev is None or s > prev:
-                    best_score_by_molecule[mol_name] = s
-            conn.close()
-        except sqlite3.Error as e:
-            bt.logging.warning(f"   ⚠️  Skipping {db_path}: {e}")
-        except Exception as e:
-            bt.logging.warning(f"   ⚠️  Skipping {db_path}: {e}")
-
-    if not best_score_by_molecule:
-        bt.logging.warning(
-            "   ⚠️  No available molecules found across reaction databases (SAVI)"
-        )
-        return []
-
-    ranked = sorted(
-        best_score_by_molecule.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )[:n]
-
-    bt.logging.info(
-        f"   ✅ Top {len(ranked)} molecules by best score across reactions:"
-    )
-    for idx, (mol_name, score) in enumerate(ranked, 1):
-        bt.logging.info(f"      {idx}. {mol_name:<30} | Score: {score:.6f}")
-    return ranked
 
 
 def get_top_n_molecules_from_db(
@@ -734,36 +570,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
             next_epoch_block = (current_epoch + 1) * state['epoch_length']
             blocks_remaining = next_epoch_block - current_block
 
-            # Resolve challenge params once at the beginning of each epoch.
-            if state.get('challenge_epoch') != current_epoch:
-                try:
-                    challenge_params, challenge_block, challenge_hash = await get_epoch_challenge_params(
-                        subtensor=state['subtensor'],
-                        config=state['config'],
-                        epoch_length=state['epoch_length'],
-                        epoch_number=current_epoch,
-                        include_reaction=bool(_get_config_value(state['config'], "random_valid_reaction", True)),
-                    )
-                    state['challenge_epoch'] = current_epoch
-                    state['current_epoch_challenge'] = challenge_params
-                    state['current_epoch_allowed_reaction'] = (
-                        challenge_params.get("allowed_reaction") if challenge_params else None
-                    )
-                    bt.logging.info(
-                        f"🧩 Epoch {current_epoch} challenge initialized from block {challenge_block} "
-                        f"({challenge_hash[:12]}...)"
-                    )
-                    bt.logging.info(
-                        f"   Allowed reaction (epoch start): {state['current_epoch_allowed_reaction']}"
-                    )
-                except Exception as e:
-                    bt.logging.error(
-                        f"❌ Failed to initialize epoch {current_epoch} challenge params: {e}"
-                    )
-                    state['challenge_epoch'] = current_epoch
-                    state['current_epoch_challenge'] = None
-                    state['current_epoch_allowed_reaction'] = None
-
             # Periodic status logging
             now = datetime.datetime.now()
             if (now - last_status_log).total_seconds() >= STATUS_LOG_INTERVAL:
@@ -793,12 +599,44 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 # STEP 1: Determine allowed reaction
                 # ============================================================
                 bt.logging.info("🔹 STEP 1/3: Determine Allowed Reaction")
-                allowed_reaction = state.get('current_epoch_allowed_reaction')
+                # Same as validator: start_block = epoch start; hash that block;
+                # get_challenge_params_from_blockhash(..., weekly_target, num_antitargets, include_reaction).
+                cfg = state["config"]
+                start_block = current_epoch * state["epoch_length"]
+                try:
+                    start_block_hash = await state["subtensor"].determine_block_hash(start_block)
+                    challenge_params = get_challenge_params_from_blockhash(
+                        block_hash=start_block_hash,
+                        weekly_target=cfg.weekly_target,
+                        num_antitargets=cfg.num_antitargets,
+                        include_reaction=cfg.random_valid_reaction,
+                    )
+                    allowed_reaction = (
+                        challenge_params.get("allowed_reaction") if challenge_params else None
+                    )
+                except Exception as e:
+                    bt.logging.error(
+                        f"   ❌ Failed to get challenge params for epoch {current_epoch}: {e}"
+                    )
+                    last_acted_epoch = current_epoch
+                    await asyncio.sleep(12)
+                    continue
 
                 if not allowed_reaction:
                     bt.logging.warning(
-                        f"   ⚠️  No allowed reaction found for epoch {current_epoch} (from epoch start challenge). "
+                        f"   ⚠️  No allowed reaction for epoch {current_epoch} "
+                        f"(random_valid_reaction={cfg.random_valid_reaction}). "
                         "Skipping submission for this epoch.\n"
+                    )
+                    last_acted_epoch = current_epoch
+                    await asyncio.sleep(12)
+                    continue
+
+                reaction_db_path = get_reaction_score_db_path(allowed_reaction)
+                if not reaction_db_path:
+                    bt.logging.warning(
+                        f"   ⚠️  Invalid allowed reaction for this miner "
+                        f"(need rxn:1..rxn:5): {allowed_reaction}. Skipping epoch.\n"
                     )
                     last_acted_epoch = current_epoch
                     await asyncio.sleep(12)
@@ -812,36 +650,15 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info("🔹 STEP 2/3: Database Update")
                 bt.logging.info("💾 DATABASE UPDATE STARTING")
 
-                db_paths_to_update: List[str] = []
-                if str(allowed_reaction).lower() == "savi":
-                    db_paths_to_update = discover_per_reaction_score_db_paths()
-                    if not db_paths_to_update:
-                        bt.logging.warning(
-                            "   ⚠️  No per-reaction DBs found for SAVI epoch. "
-                            "Skipping submission for this epoch.\n"
-                        )
-                        last_acted_epoch = current_epoch
-                        await asyncio.sleep(12)
-                        continue
-                else:
-                    reaction_db_path = get_reaction_score_db_path(allowed_reaction)
-                    if not reaction_db_path:
-                        bt.logging.warning(
-                            "   ⚠️  Could not resolve per-reaction DB for this epoch. "
-                            "Skipping submission.\n"
-                        )
-                        last_acted_epoch = current_epoch
-                        await asyncio.sleep(12)
-                        continue
-                    if not os.path.exists(reaction_db_path):
-                        bt.logging.warning(
-                            f"   ⚠️  Missing DB for {allowed_reaction}: {reaction_db_path}. "
-                            "Skipping submission for this epoch.\n"
-                        )
-                        last_acted_epoch = current_epoch
-                        await asyncio.sleep(12)
-                        continue
-                    db_paths_to_update = [reaction_db_path]
+                if not os.path.exists(reaction_db_path):
+                    bt.logging.warning(
+                        f"   ⚠️  Missing DB for {allowed_reaction}: {reaction_db_path}. "
+                        "Skipping submission for this epoch.\n"
+                    )
+                    last_acted_epoch = current_epoch
+                    await asyncio.sleep(12)
+                    continue
+                db_paths_to_update = [reaction_db_path]
 
                 all_updates_ok = True
                 for db_path in db_paths_to_update:
@@ -866,26 +683,12 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 # ============================================================
                 bt.logging.info("🔹 STEP 3/3: Fetching Top Molecules for Allowed Reaction")
 
-                if str(allowed_reaction).lower() == "savi":
-                    top_molecules = get_top_n_molecules_all_reactions(num_hotkeys)
-                    selection_label = "savi (all reactions)"
-                else:
-                    reaction_db_path = get_reaction_score_db_path(allowed_reaction)
-                    if not reaction_db_path:
-                        bt.logging.warning(
-                            "   ⚠️  Could not resolve per-reaction DB for this epoch. "
-                            "Skipping submission.\n"
-                        )
-                        last_acted_epoch = current_epoch
-                        await asyncio.sleep(12)
-                        continue
-
-                    bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
-                    top_molecules = get_top_n_molecules_from_db(
-                        n=num_hotkeys,
-                        db_path=reaction_db_path,
-                    )
-                    selection_label = str(allowed_reaction)
+                bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
+                top_molecules = get_top_n_molecules_from_db(
+                    n=num_hotkeys,
+                    db_path=reaction_db_path,
+                )
+                selection_label = str(allowed_reaction)
 
                 if not top_molecules:
                     bt.logging.warning(
@@ -1016,35 +819,6 @@ async def run_miner(config: argparse.Namespace) -> None:
             'epoch_length': epoch_length,
             'bdt': QuicknetBittensorDrandTimelock(),
         }
-
-        # Get startup challenge params with miner-style boundary handling.
-        startup_challenge, block_to_check, block_hash = await get_miner_challenge_params(
-            subtensor=subtensor,
-            config=config,
-            epoch_length=epoch_length,
-            min_blocks_before_boundary=20,
-            include_reaction=bool(_get_config_value(config, "random_valid_reaction", True)),
-        )
-
-        bt.logging.info(
-            f"Challenge params from block {block_to_check} "
-            f"({block_hash[:12]}...): {startup_challenge}"
-        )
-
-        if startup_challenge:
-            if "targets" in startup_challenge:
-                state['current_challenge_targets'] = startup_challenge.get("targets", [])
-                state['current_challenge_antitargets'] = startup_challenge.get("antitargets", [])
-                bt.logging.info(f"🎯 Challenge targets: {state['current_challenge_targets']}")
-                bt.logging.info(f"🚫 Anti-targets: {state['current_challenge_antitargets']}\n")
-            else:
-                state['current_small_molecule_target'] = startup_challenge.get("small_molecule_target")
-                state['current_nanobody_target'] = startup_challenge.get("nanobody_target")
-                bt.logging.info(
-                    "🎯 Challenge targets: "
-                    f"small_molecule={state['current_small_molecule_target']}, "
-                    f"nanobody={state['current_nanobody_target']}\n"
-                )
 
         # Start main loop
         await run_epoch_loop(state)

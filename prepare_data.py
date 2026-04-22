@@ -28,7 +28,7 @@ def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Continuously collect training data from competition API")
     parser.add_argument('--start_epoch', type=int, default=22189, help='Starting epoch number to collect from')
-    parser.add_argument('--end_epoch', type=int, default=22205, help='Ending epoch number to collect to')
+    parser.add_argument('--end_epoch', type=int, default=22216, help='Ending epoch number to collect to')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
     parser.add_argument('--output', type=str, default='data/data.csv', help='Output CSV file')
     parser.add_argument('--time', type=int, default=1, 
