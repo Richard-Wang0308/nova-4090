@@ -45,8 +45,8 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
-    'notc',
-    'note',
+    'nota',
+    'notd',
     'notb',
     'notf'
 ]
@@ -81,6 +81,33 @@ def signal_handler(signum, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ============================================================================
+# CHALLENGE PARAM COMPAT
+# ============================================================================
+
+def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Optional[Dict[str, Any]]:
+    """
+    Handle both challenge helper signatures:
+    - weekly_target/num_antitargets (validator-style)
+    - small_molecule_target/nanobody_target/num_antitargets (challenge.py)
+    """
+    try:
+        return get_challenge_params_from_blockhash(
+            block_hash=block_hash,
+            weekly_target=config.weekly_target,
+            num_antitargets=config.num_antitargets,
+            include_reaction=config.random_valid_reaction,
+        )
+    except TypeError:
+        return get_challenge_params_from_blockhash(
+            block_hash=block_hash,
+            small_molecule_target=config.weekly_target,
+            nanobody_target=config.weekly_target,
+            num_antitargets=config.num_antitargets,
+            include_reaction=config.random_valid_reaction,
+        )
 
 
 # ============================================================================
@@ -605,12 +632,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 start_block = current_epoch * state["epoch_length"]
                 try:
                     start_block_hash = await state["subtensor"].determine_block_hash(start_block)
-                    challenge_params = get_challenge_params_from_blockhash(
-                        block_hash=start_block_hash,
-                        weekly_target=cfg.weekly_target,
-                        num_antitargets=cfg.num_antitargets,
-                        include_reaction=cfg.random_valid_reaction,
-                    )
+                    challenge_params = resolve_challenge_params(cfg, start_block_hash)
                     allowed_reaction = (
                         challenge_params.get("allowed_reaction") if challenge_params else None
                     )
