@@ -16,10 +16,10 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 4
+HARDCODED_RXN_ID = 2
 STARTING_EPOCH = 22050
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn_4.csv')
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_4.sqlite")
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn_2.csv')
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -1230,7 +1230,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(100)
+            top_200_df = molecules_df.head(200)
             # top_200_df = molecules_df[50:500]
             # top_200_df = molecules_df[10:110]
             
