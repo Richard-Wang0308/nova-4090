@@ -37,7 +37,7 @@ sys.path.append(BASE_DIR)
 
 # Database paths
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_5.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # Wallet configuration
