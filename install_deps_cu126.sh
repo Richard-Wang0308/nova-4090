@@ -44,4 +44,6 @@ export PYO3_CROSS_PYTHON_VERSION="3.12" && cd timelock/wasm && ./wasm_build_py.s
 cd timelock/py && uv pip install --upgrade build && python3.12 -m build
 uv pip install timelock
 
+uv pip install async-substrate-interface==1.6.2
+
 echo "Installation complete."

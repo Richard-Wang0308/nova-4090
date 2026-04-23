@@ -71,7 +71,7 @@ def validate_molecule_heavy_atoms(
     """Validate heavy atom count."""
     try:
         heavy_atom_count = get_heavy_atom_count(smiles)
-        min_atoms = 10
+        min_atoms = 20
         max_atoms = 35
 
         if heavy_atom_count < min_atoms:
