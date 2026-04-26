@@ -47,9 +47,8 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 HOTKEY_NAMES = [
     'nota',
     'notb',
-    'notd',
-    'note',
-    'notc'
+    'notc',
+    'notd'
 ]
 
 # Timing configuration
