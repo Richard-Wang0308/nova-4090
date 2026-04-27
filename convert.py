@@ -3,8 +3,8 @@ import csv
 import os
 
 # ── Config ──────────────────────────────────────────────
-SQLITE_FILE = "score_results_1_2769.sqlite"   # <-- change this
-OUTPUT_CSV  = "data.csv"   # <-- change this (optional)
+SQLITE_FILE = "score_results_5.sqlite"   # <-- change this
+OUTPUT_CSV  = "data/rxn5.csv"   # <-- change this (optional)
 TABLE_NAME  = "scored_molecules"
 COLUMNS     = ["molecule_name", "score"]
 SORT_ORDER  = "DESC"   # "DESC" = highest score first | "ASC" = lowest first
