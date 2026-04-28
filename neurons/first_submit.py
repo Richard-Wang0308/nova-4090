@@ -4,10 +4,10 @@ MULTI-HOTKEY EPOCH-BASED MOLECULE SUBMISSION SCRIPT
 
 Workflow:
 1. Monitor blockchain for epoch boundaries
-2. At 28 blocks before boundary, update database
+2. At the START of each new epoch (or immediately on first run), update database
 3. Fetch top N molecules from database
 4. Submit all N molecules SEQUENTIALLY (one at a time with delays)
-5. Wait for next epoch's submission window
+5. Wait for next epoch start
 """
 
 import os
@@ -45,16 +45,17 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
-    'notd',
-    'note',
-    'notf'
+    'nota',
+    'notb',
+    'notc',
+    'notd'
 ]
 
 # Timing configuration
-BLOCKS_BEFORE_BOUNDARY = 30  # Trigger point: 28 blocks before epoch end
+BLOCKS_BEFORE_BOUNDARY = 30  # Kept for reference/logging only (no longer used as trigger)
 EPOCH_LENGTH = 361           # Blocks per epoch
 STATUS_LOG_INTERVAL = 60     # Log status every N seconds
-SUBMISSION_DELAY = 2        # Seconds between each hotkey submission
+SUBMISSION_DELAY = 2         # Seconds between each hotkey submission
 
 # ============================================================================
 
@@ -189,7 +190,7 @@ def setup_logging(config: argparse.Namespace) -> None:
     bt.logging.info(f"💼 Wallet: {WALLET_NAME}")
     bt.logging.info(f"👥 Hotkeys configured: {len(HOTKEY_NAMES)}")
     bt.logging.info(f"   {HOTKEY_NAMES}")
-    bt.logging.info(f"⏰ Trigger point: {BLOCKS_BEFORE_BOUNDARY} blocks before epoch boundary")
+    bt.logging.info(f"⏰ Trigger: Immediately at epoch start (or on first run)")
     bt.logging.info(f"📊 Epoch length: {EPOCH_LENGTH} blocks")
     bt.logging.info(f"⏱️  Submission delay: {SUBMISSION_DELAY}s between hotkeys")
     bt.logging.info("="*70 + "\n")
@@ -571,19 +572,21 @@ async def submit_response(
 async def run_epoch_loop(state: Dict[str, Any]) -> None:
     """
     Main monitoring and submission loop.
-    
+
     Workflow:
     1. Poll blockchain every 6 seconds
-    2. When blocks_remaining <= BLOCKS_BEFORE_BOUNDARY (and not yet acted):
+    2. As soon as a NEW epoch is detected (current_epoch != last_acted_epoch):
        a. Determine allowed reaction
        b. Update matching reaction database(s)
        c. Fetch top N molecules
        d. Submit all molecules SEQUENTIALLY with delays
-    3. Wait for next epoch's submission window
+    3. Mark epoch as handled; wait for next epoch
     4. Repeat
     """
     bt.logging.info("🔄 Starting epoch monitoring loop...\n")
+    bt.logging.info("ℹ️  Submissions will fire immediately at each new epoch start.\n")
 
+    # -1 ensures we act immediately on the very first detected epoch
     last_acted_epoch = -1
     last_status_log = datetime.datetime.now()
     num_hotkeys = len(state['wallets'])
@@ -606,17 +609,18 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 last_status_log = now
 
             # ================================================================
-            # SUBMISSION WINDOW: <= 28 blocks before epoch boundary
-            # Changed from == to <= to avoid missing the window
+            # SUBMISSION TRIGGER: Fire immediately when a new epoch is detected
+            # (also fires on first run since last_acted_epoch starts at -1)
             # ================================================================
-            if blocks_remaining <= BLOCKS_BEFORE_BOUNDARY and current_epoch != last_acted_epoch:
-                
+            if current_epoch != last_acted_epoch:
+
                 bt.logging.info("\n" + "="*70)
-                bt.logging.info("⏰ SUBMISSION WINDOW REACHED")
+                bt.logging.info("🆕 NEW EPOCH DETECTED — STARTING SUBMISSION")
                 bt.logging.info("="*70)
-                bt.logging.info(f"📍 Current block: {current_block}")
-                bt.logging.info(f"📍 Current epoch: {current_epoch}")
-                bt.logging.info(f"📍 Blocks until boundary: {blocks_remaining}")
+                bt.logging.info(f"📍 Current block:    {current_block}")
+                bt.logging.info(f"📍 Current epoch:    {current_epoch}")
+                bt.logging.info(f"📍 Epoch start block: {current_epoch * state['epoch_length']}")
+                bt.logging.info(f"📍 Blocks remaining: {blocks_remaining}")
                 bt.logging.info("="*70 + "\n")
 
                 submission_start_time = datetime.datetime.now()
@@ -625,8 +629,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 # STEP 1: Determine allowed reaction
                 # ============================================================
                 bt.logging.info("🔹 STEP 1/3: Determine Allowed Reaction")
-                # Same as validator: start_block = epoch start; hash that block;
-                # get_challenge_params_from_blockhash(..., weekly_target, num_antitargets, include_reaction).
                 cfg = state["config"]
                 start_block = current_epoch * state["epoch_length"]
                 try:
@@ -679,9 +681,10 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     last_acted_epoch = current_epoch
                     await asyncio.sleep(12)
                     continue
-                db_paths_to_update = [reaction_db_path]
 
+                db_paths_to_update = [reaction_db_path]
                 all_updates_ok = True
+
                 for db_path in db_paths_to_update:
                     db_update_success = run_add_column_script(db_path)
                     if not db_update_success:
@@ -703,8 +706,8 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 # STEP 3: Fetch top molecules for allowed reaction
                 # ============================================================
                 bt.logging.info("🔹 STEP 3/3: Fetching Top Molecules for Allowed Reaction")
-
                 bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
+
                 top_molecules = get_top_n_molecules_from_db(
                     n=num_hotkeys,
                     db_path=reaction_db_path,
@@ -729,10 +732,9 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 bt.logging.info(f"   ⚡ Submitting {len(top_molecules)} molecules using {num_hotkeys} hotkeys")
                 bt.logging.info(f"   ⏱️  Delay between submissions: {SUBMISSION_DELAY}s")
 
-                # Submit one at a time
                 results = []
                 submission_details = []
-                
+
                 for idx, (molecule_name, score) in enumerate(top_molecules):
                     if idx >= len(state['wallets']):
                         bt.logging.warning(
@@ -743,16 +745,15 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
 
                     wallet = state['wallets'][idx]
                     miner_uid = state['miner_uids'][idx]
-                    
-                    # Submit this hotkey
+
                     success = await submit_response(
                         wallet, miner_uid, molecule_name, state,
                         idx + 1, len(top_molecules)
                     )
-                    
+
                     results.append(success)
                     submission_details.append((wallet, molecule_name, miner_uid, score))
-                    
+
                     # Wait before next submission (except for last one)
                     if idx < len(top_molecules) - 1:
                         bt.logging.info(f"\n   ⏳ Waiting {SUBMISSION_DELAY}s before next submission...\n")
@@ -768,17 +769,17 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
 
                 success_count = sum(1 for r in results if r)
                 failure_count = len(results) - success_count
-
                 submission_elapsed = (datetime.datetime.now() - submission_start_time).total_seconds()
 
                 bt.logging.info(f"✅ Successful: {success_count}/{len(results)}")
-                bt.logging.info(f"❌ Failed: {failure_count}/{len(results)}")
+                bt.logging.info(f"❌ Failed:     {failure_count}/{len(results)}")
                 bt.logging.info(f"⏱️  Total time: {submission_elapsed:.2f}s")
                 bt.logging.info("="*70)
-                
-                # Detailed results
+
                 bt.logging.info("\n📋 Detailed Results:")
-                for idx, (success, (wallet, molecule_name, miner_uid, score)) in enumerate(zip(results, submission_details), 1):
+                for idx, (success, (wallet, molecule_name, miner_uid, score)) in enumerate(
+                    zip(results, submission_details), 1
+                ):
                     status = "✅" if success else "❌"
                     hotkey_name = wallet.hotkey_str if hasattr(wallet, 'hotkey_str') else 'unknown'
                     bt.logging.info(
@@ -786,28 +787,27 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                         f"{molecule_name:<30} | Score: {score:.6f}"
                     )
 
-                # Calculate next submission window
-                next_submission_epoch = current_epoch + 1
-                next_submission_block = (next_submission_epoch + 1) * state['epoch_length'] - BLOCKS_BEFORE_BOUNDARY
-                blocks_until_next = next_submission_block - current_block
+                # Next epoch info
+                next_epoch_start_block = (current_epoch + 1) * state['epoch_length']
+                blocks_until_next = next_epoch_start_block - current_block
                 time_until_next = blocks_until_next * 12  # ~12 seconds per block
 
                 bt.logging.info("")
                 bt.logging.info("="*70)
                 bt.logging.info(f"⏭️  Next submission window:")
-                bt.logging.info(f"   Epoch: {next_submission_epoch}")
-                bt.logging.info(f"   Block: ~{next_submission_block}")
-                bt.logging.info(f"   ETA: ~{time_until_next // 60} minutes ({time_until_next} seconds)")
+                bt.logging.info(f"   Epoch: {current_epoch + 1}")
+                bt.logging.info(f"   Block: ~{next_epoch_start_block}")
+                bt.logging.info(f"   ETA:   ~{time_until_next // 60} minutes ({time_until_next} seconds)")
                 bt.logging.info("="*70 + "\n")
 
                 # Mark this epoch as handled
                 last_acted_epoch = current_epoch
 
-                # Sleep briefly to avoid re-triggering
+                # Brief sleep to avoid re-triggering on the same block
                 await asyncio.sleep(12)
                 continue
 
-            # Not at submission window - continue monitoring
+            # Not a new epoch — continue polling
             await asyncio.sleep(6)
 
         except Exception as e:

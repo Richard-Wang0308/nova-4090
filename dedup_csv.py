@@ -8,7 +8,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q63380"  # Replace with actual target protein
+TARGET_PROTEIN = "Q92769"  # Replace with actual target protein
 
 
 async def check_molecule_unique(target_protein: str, molecule_name: str, smiles: str) -> bool:
@@ -327,7 +327,7 @@ async def main(mode: str = "check", batch_size: int = 100):
             - "stats": Only show statistics
         batch_size: Number of molecules to process before logging progress
     """
-    csv_path = "data/data.csv"
+    csv_path = "data/rxn5.csv"
     
     if not os.path.exists(csv_path):
         bt.logging.error(f"CSV file not found: {csv_path}")

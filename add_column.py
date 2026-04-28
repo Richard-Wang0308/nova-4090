@@ -6,7 +6,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q13547"  # Replace with actual target protein
+TARGET_PROTEIN = "Q92769"  # Replace with actual target protein
 
 
 def scored_molecules_table_exists(cursor: sqlite3.Cursor) -> bool:
@@ -436,7 +436,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--db-path",
-        default=os.path.join(os.path.dirname(__file__), "score_results.sqlite"),
+        default=os.path.join(os.path.dirname(__file__), "score_results_1.sqlite"),
         help="Path to target SQLite database",
     )
     args = parser.parse_args()
