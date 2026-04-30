@@ -45,6 +45,10 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
+    'note',
+    'notf',
+    'nota',
+    'notb',
     'notd',
     'notc'
 ]
