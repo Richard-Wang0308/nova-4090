@@ -45,19 +45,19 @@ WALLET_NAME = "nova"  # Hardcoded wallet name
 
 # Hotkey configuration - EDIT THIS LIST
 HOTKEY_NAMES = [
-    'note',
-    'notf',
-    'nota',
-    'notb',
+    'notc',
     'notd',
-    'notc'
+    'notb',
+    'nota',
+    'note',
+    'notf'
 ]
 
 # Timing configuration
 BLOCKS_BEFORE_BOUNDARY = 30  # Trigger point: 28 blocks before epoch end
 EPOCH_LENGTH = 361           # Blocks per epoch
 STATUS_LOG_INTERVAL = 60     # Log status every N seconds
-SUBMISSION_DELAY = 2        # Seconds between each hotkey submission
+SUBMISSION_DELAY = 0.5        # Seconds between each hotkey submission
 
 # ============================================================================
 
