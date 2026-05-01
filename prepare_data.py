@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 EPOCH_DURATION = 12 * 361  # 12 seconds per block * 361 blocks = 4332 seconds
-BLOCK_TIME = 12  # seconds per block
+BLOCK_TIME = 12  # seconds per blockui
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
