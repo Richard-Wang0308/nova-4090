@@ -6,7 +6,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q92769"  # Replace with actual target protein
+TARGET_PROTEIN = "B1WC68"  # Replace with actual target protein
 
 
 def scored_molecules_table_exists(cursor: sqlite3.Cursor) -> bool:
