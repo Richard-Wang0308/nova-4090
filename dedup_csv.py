@@ -327,7 +327,7 @@ async def main(mode: str = "check", batch_size: int = 100):
             - "stats": Only show statistics
         batch_size: Number of molecules to process before logging progress
     """
-    csv_path = "data/rxn5.csv"
+    csv_path = "data/b.csv"
     
     if not os.path.exists(csv_path):
         bt.logging.error(f"CSV file not found: {csv_path}")
