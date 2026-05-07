@@ -47,7 +47,7 @@ ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
     ("nova",   "notf"),
-    ("nova",   "note")
+    ("nova",   "note"),
     ("nova",   "notb") # Example: add more wallets below
     # ("alpha",  "hotkey1"),
     # ("alpha",  "hotkey2"),
