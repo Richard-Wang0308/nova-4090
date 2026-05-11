@@ -1235,8 +1235,8 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                 await asyncio.sleep(10)
                 continue
             
-            # top_molecules_df = molecules_df[50:200]
-            top_molecules_df = molecules_df.head(200)
+            top_molecules_df = molecules_df[50:250]
+            # top_molecules_df = molecules_df.head(200)
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
             

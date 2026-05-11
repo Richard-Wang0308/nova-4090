@@ -308,8 +308,8 @@ def save_samples(samples: list, output_file: str, append: bool = True):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare training data from competition API")
-    parser.add_argument('--start_epoch', type=int, default=22050, help='Starting epoch number')
-    parser.add_argument('--end_epoch', type=int, default=22188, help='Ending epoch number (None for auto-detect latest)')
+    parser.add_argument('--start_epoch', type=int, default=20377, help='Starting epoch number')
+    parser.add_argument('--end_epoch', type=int, default=20515, help='Ending epoch number (None for auto-detect latest)')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
     parser.add_argument('--output', type=str, default='data/train1.csv', help='Output CSV file')
     parser.add_argument('--no-resume', action='store_true', help='Do not resume from existing file')
