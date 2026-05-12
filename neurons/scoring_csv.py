@@ -17,7 +17,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 MOLECULES_CSV      = os.path.join(BASE_DIR, "rxn1.csv")
-SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results_1_new.sqlite")
+SCORE_RESULTS_DB   = os.path.join(BASE_DIR, "score_results_1.sqlite")
 
 from config.config_loader import load_config
 from combinatorial_db.reactions import get_smiles_from_reaction

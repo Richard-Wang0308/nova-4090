@@ -6,9 +6,9 @@ Workflow:
 1. Monitor blockchain for epoch boundaries
 2. At 28 blocks before boundary, update database
 3. Fetch top N molecules from reaction DB
-4. Fetch top N nanobodies from nanobody GPU Flask API
+4. Fetch top N nanobodies DIRECTLY from local nanobody SQLite DB (no Flask)
 5. Submit all N pairs SEQUENTIALLY as "molecule|nanobody"
-   - If nanobody API is unavailable → fallback to "molecule|~"
+   - If nanobody DB is unavailable → fallback to "molecule|~"
 6. Wait for next epoch's submission window
 """
 
@@ -27,7 +27,6 @@ import signal
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
-import requests
 import bittensor as bt
 from bittensor.core.errors import MetadataError
 
@@ -39,18 +38,19 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 # Database paths
-DB_PATH          = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
+DB_PATH           = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
+SCORE_RESULTS_DB  = os.path.join(BASE_DIR, "score_results_2.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # ============================================================================
-# NANOBODY API CONFIGURATION
-# Point this at the Flask server running on the nanobody GPU (serve_db.py)
+# NANOBODY DB CONFIGURATION
+# Direct SQLite access — no Flask server needed
 # ============================================================================
-NANOBODY_API_URL     = os.getenv("NANOBODY_API_URL", "http://154.7.92.56:5001")
-NANOBODY_API_TOKEN   = os.getenv("NANOBODY_API_TOKEN", "")   # leave empty if no auth
-NANOBODY_API_TIMEOUT = 15   # seconds
-NANOBODY_FALLBACK    = "~"  # used when API is unreachable or returns no results
+NANOBODY_DB_PATH  = os.getenv(
+    "NANOBODY_DB_PATH",
+    "/root/workspace/nova-4090/nanobodies.sqlite"
+)
+NANOBODY_FALLBACK = "~"
 
 # ============================================================================
 # WALLET + HOTKEY CONFIGURATION
@@ -59,9 +59,7 @@ WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
     ("nova", "nota"),
     ("nova", "notb"),
     ("nova", "notc"),
-    # ("alpha", "hotkey1"),
 ]
-# ============================================================================
 
 # Timing configuration
 BLOCKS_BEFORE_BOUNDARY = 30
@@ -133,16 +131,10 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--netuid", type=int, default=68, help="The chain subnet uid")
     parser.add_argument(
-        "--nanobody-api-url",
-        default=NANOBODY_API_URL,
-        dest="nanobody_api_url",
-        help="Base URL of the nanobody Flask API (e.g. http://1.2.3.4:5001)",
-    )
-    parser.add_argument(
-        "--nanobody-api-token",
-        default=NANOBODY_API_TOKEN,
-        dest="nanobody_api_token",
-        help="Bearer token for nanobody API auth (leave empty if no auth)",
+        "--nanobody-db-path",
+        default=NANOBODY_DB_PATH,
+        dest="nanobody_db_path",
+        help="Path to nanobody SQLite database (e.g. /root/workspace/nanobodies.sqlite)",
     )
     parser.add_argument(
         "--nanobody-target",
@@ -210,8 +202,7 @@ def setup_logging(config: argparse.Namespace) -> None:
     bt.logging.info(f"👥 Total wallet/hotkey pairs: {len(WALLET_HOTKEY_PAIRS)}")
     for idx, (wname, hname) in enumerate(WALLET_HOTKEY_PAIRS, 1):
         bt.logging.info(f"   {idx:>2}. wallet={wname:<12}  hotkey={hname}")
-    bt.logging.info(f"🧬 Nanobody API URL:     {config.nanobody_api_url}")
-    bt.logging.info(f"🧬 Nanobody API auth:    {'yes' if config.nanobody_api_token else 'no'}")
+    bt.logging.info(f"🧬 Nanobody DB path:     {config.nanobody_db_path}")
     bt.logging.info(f"🧬 Nanobody target:      {config.nanobody_target or '(from challenge params)'}")
     bt.logging.info(f"⏰ Trigger point:        {BLOCKS_BEFORE_BOUNDARY} blocks before epoch boundary")
     bt.logging.info(f"📊 Epoch length:         {EPOCH_LENGTH} blocks")
@@ -309,120 +300,136 @@ async def setup_bittensor_objects(
 
 
 # ============================================================================
-# NANOBODY API CLIENT
+# NANOBODY DIRECT SQLite ACCESS
+# Replaces the Flask API client entirely — no network calls needed
 # ============================================================================
 
-def _nanobody_api_headers(token: str) -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+def check_nanobody_db_health(db_path: str) -> bool:
+    """
+    Check that the nanobody SQLite DB exists and is readable.
+    Mirrors the old check_nanobody_api_health() behaviour.
+    """
+    if not os.path.exists(db_path):
+        bt.logging.warning(
+            f"   ⚠️  [Nanobody DB] File not found: {db_path}"
+        )
+        return False
+    try:
+        conn   = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM nanobodies")
+        total_rows = cursor.fetchone()[0]
+
+        try:
+            cursor.execute(
+                "SELECT created_at FROM nanobodies ORDER BY rowid DESC LIMIT 1"
+            )
+            row        = cursor.fetchone()
+            last_write = row[0] if row else "N/A"
+        except sqlite3.OperationalError:
+            last_write = "N/A"
+
+        conn.close()
+        bt.logging.info(
+            f"   ✅ [Nanobody DB] Health OK  "
+            f"total_rows={total_rows}  last_write={last_write}"
+        )
+        return True
+    except sqlite3.Error as e:
+        bt.logging.warning(f"   ⚠️  [Nanobody DB] Health check failed: {e}")
+        return False
 
 
 def fetch_top_nanobodies(
     target: str,
     n: int,
-    api_url: str,
-    api_token: str = "",
+    db_path: str,
 ) -> List[str]:
     """
-    Fetch top-N nanobody sequences from the nanobody GPU Flask API.
+    Fetch top-N nanobody sequences directly from the local SQLite DB,
+    ordered by final_nanobody_score DESC.
 
     Returns:
         List of sequence strings (length up to n), ordered best-first.
-        Returns empty list on any error — caller should use NANOBODY_FALLBACK.
+        Returns empty list on any error — caller uses NANOBODY_FALLBACK.
     """
     if not target:
-        bt.logging.warning("   ⚠️  [Nanobody API] No target specified — skipping nanobody fetch")
+        bt.logging.warning(
+            "   ⚠️  [Nanobody DB] No target specified — skipping nanobody fetch"
+        )
         return []
 
-    url = f"{api_url.rstrip('/')}/top"
-    params = {"target": target, "n": n}
+    if not os.path.exists(db_path):
+        bt.logging.warning(
+            f"   ⚠️  [Nanobody DB] File not found: {db_path}  "
+            f"→ falling back to '{NANOBODY_FALLBACK}'"
+        )
+        return []
 
     try:
-        bt.logging.info(f"   🧬 [Nanobody API] GET {url}  target={target}  n={n}")
-        resp = requests.get(
-            url,
-            params=params,
-            headers=_nanobody_api_headers(api_token),
-            timeout=NANOBODY_API_TIMEOUT,
+        bt.logging.info(
+            f"   🧬 [Nanobody DB] Querying top {n} for target={target}  db={db_path}"
         )
-        resp.raise_for_status()
-        data = resp.json()
+        # Open read-only to avoid locking conflicts with nano.py writer
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-        results  = data.get("results", [])
-        seqs     = [r["sequence"] for r in results if r.get("sequence")]
+        cursor.execute(
+            """
+            SELECT sequence, final_nanobody_score
+            FROM   nanobodies
+            WHERE  target = ?
+              AND  sequence IS NOT NULL
+              AND  sequence != ''
+            ORDER  BY final_nanobody_score DESC
+            LIMIT  ?
+            """,
+            (target, n),
+        )
+        rows = cursor.fetchall()
+        conn.close()
 
-        if seqs:
-            bt.logging.info(
-                f"   ✅ [Nanobody API] Got {len(seqs)} nanobodies for target={target}"
-            )
-            for i, seq in enumerate(seqs, 1):
-                score = results[i - 1].get("final_nanobody_score", "N/A")
-                bt.logging.info(
-                    f"      {i:>2}. score={score}  {seq[:40]}..."
-                )
-        else:
+        if not rows:
             bt.logging.warning(
-                f"   ⚠️  [Nanobody API] No sequences returned for target={target}"
+                f"   ⚠️  [Nanobody DB] No sequences found for target={target}  "
+                f"→ falling back to '{NANOBODY_FALLBACK}'"
             )
+            return []
 
+        seqs = [row["sequence"] for row in rows]
+        bt.logging.info(
+            f"   ✅ [Nanobody DB] Got {len(seqs)} nanobodies for target={target}"
+        )
+        for i, row in enumerate(rows, 1):
+            bt.logging.info(
+                f"      {i:>2}. score={row['final_nanobody_score']}  "
+                f"{row['sequence'][:40]}..."
+            )
         return seqs
 
-    except requests.exceptions.ConnectionError:
+    except sqlite3.OperationalError as e:
         bt.logging.warning(
-            f"   ⚠️  [Nanobody API] Connection refused at {api_url}  "
+            f"   ⚠️  [Nanobody DB] DB not ready yet ({e})  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
-    except requests.exceptions.Timeout:
+    except sqlite3.Error as e:
         bt.logging.warning(
-            f"   ⚠️  [Nanobody API] Request timed out after {NANOBODY_API_TIMEOUT}s  "
-            f"→ falling back to '{NANOBODY_FALLBACK}'"
-        )
-        return []
-    except requests.exceptions.HTTPError as e:
-        bt.logging.warning(
-            f"   ⚠️  [Nanobody API] HTTP error: {e}  "
+            f"   ⚠️  [Nanobody DB] SQLite error: {e}  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
     except Exception as e:
         bt.logging.error(
-            f"   ❌ [Nanobody API] Unexpected error: {e}  "
+            f"   ❌ [Nanobody DB] Unexpected error: {e}  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
 
 
-def check_nanobody_api_health(api_url: str, api_token: str = "") -> bool:
-    """Ping /health endpoint. Returns True if reachable and status==ok."""
-    try:
-        url  = f"{api_url.rstrip('/')}/health"
-        resp = requests.get(
-            url,
-            headers=_nanobody_api_headers(api_token),
-            timeout=5,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        ok   = data.get("status") == "ok"
-        if ok:
-            bt.logging.info(
-                f"   ✅ [Nanobody API] Health OK  "
-                f"total_rows={data.get('total_rows', '?')}  "
-                f"last_write={data.get('last_write', '?')}"
-            )
-        else:
-            bt.logging.warning(f"   ⚠️  [Nanobody API] Health returned: {data}")
-        return ok
-    except Exception as e:
-        bt.logging.warning(f"   ⚠️  [Nanobody API] Health check failed: {e}")
-        return False
-
-
 # ============================================================================
-# DATABASE OPERATIONS
+# DATABASE OPERATIONS (molecules)
 # ============================================================================
 
 def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
@@ -546,18 +553,6 @@ async def submit_response(
     Submission format:
       "molecule|nanobody_sequence"   — when nanobody is available
       "molecule|~"                   — fallback when no nanobody
-
-    Args:
-        wallet:             Bittensor wallet object
-        miner_uid:          Miner UID
-        candidate_product:  Molecule name to submit
-        nanobody_sequence:  Nanobody AA sequence (or "~" as fallback)
-        state:              Global state dictionary
-        submission_number:  Current submission index (for logging)
-        total_submissions:  Total number of submissions (for logging)
-
-    Returns:
-        True if submission successful, False otherwise
     """
     if not candidate_product:
         bt.logging.warning(f"      ⚠️  UID {miner_uid}: No candidate product")
@@ -567,7 +562,6 @@ async def submit_response(
     hotkey_name = wallet.hotkey_str if hasattr(wallet, "hotkey_str") else "unknown"
     label       = f"{wallet_name}/{hotkey_name}"
 
-    # Build submission message
     nanobody_part = nanobody_sequence if nanobody_sequence else NANOBODY_FALLBACK
     message       = f"{candidate_product}|{nanobody_part}"
 
@@ -659,26 +653,10 @@ async def submit_response(
 # ============================================================================
 
 async def run_epoch_loop(state: Dict[str, Any]) -> None:
-    """
-    Main monitoring and submission loop.
-
-    Workflow per epoch:
-      1. Determine allowed reaction
-      2. Verify reaction DB exists
-      3. Update reaction DB (add_column.py)
-      4. Fetch top N molecules from reaction DB
-      5. Fetch top N nanobodies from nanobody GPU Flask API
-         → fallback to "~" if API unreachable or returns nothing
-      6. Submit N pairs as "molecule|nanobody" (or "molecule|~")
-    """
     bt.logging.info("🔄 Starting epoch monitoring loop...\n")
 
-    # Health-check nanobody API at startup
-    bt.logging.info("🧬 Checking nanobody API health at startup...")
-    check_nanobody_api_health(
-        state["config"].nanobody_api_url,
-        state["config"].nanobody_api_token,
-    )
+    bt.logging.info("🧬 Checking nanobody DB health at startup...")
+    check_nanobody_db_health(state["config"].nanobody_db_path)
 
     last_acted_epoch = -1
     last_status_log  = datetime.datetime.now()
@@ -691,7 +669,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
             next_epoch_block = (current_epoch + 1) * state["epoch_length"]
             blocks_remaining = next_epoch_block - current_block
 
-            # Periodic status logging
             now = datetime.datetime.now()
             if (now - last_status_log).total_seconds() >= STATUS_LOG_INTERVAL:
                 bt.logging.info(
@@ -701,9 +678,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 )
                 last_status_log = now
 
-            # ==============================================================
-            # SUBMISSION WINDOW
-            # ==============================================================
             if (blocks_remaining <= BLOCKS_BEFORE_BOUNDARY
                     and current_epoch != last_acted_epoch):
 
@@ -717,9 +691,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
 
                 submission_start_time = datetime.datetime.now()
 
-                # ──────────────────────────────────────────────────────────
                 # STEP 1: Determine allowed reaction
-                # ──────────────────────────────────────────────────────────
                 bt.logging.info("🔹 STEP 1/5: Determine Allowed Reaction")
                 cfg         = state["config"]
                 start_block = current_epoch * state["epoch_length"]
@@ -765,9 +737,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     f"{allowed_reaction}"
                 )
 
-                # ──────────────────────────────────────────────────────────
                 # STEP 2: Verify & update reaction DB
-                # ──────────────────────────────────────────────────────────
                 bt.logging.info("🔹 STEP 2/5: Database Update")
 
                 if not os.path.exists(reaction_db_path):
@@ -789,9 +759,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     await asyncio.sleep(12)
                     continue
 
-                # ──────────────────────────────────────────────────────────
                 # STEP 3: Fetch top N molecules
-                # ──────────────────────────────────────────────────────────
                 bt.logging.info("🔹 STEP 3/5: Fetching Top Molecules")
                 bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
 
@@ -809,15 +777,9 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     await asyncio.sleep(12)
                     continue
 
-                # ──────────────────────────────────────────────────────────
-                # STEP 4: Fetch top N nanobodies from nanobody GPU API
-                # ──────────────────────────────────────────────────────────
-                bt.logging.info("🔹 STEP 4/5: Fetching Top Nanobodies from API")
+                # STEP 4: Fetch top N nanobodies — DIRECT SQLite
+                bt.logging.info("🔹 STEP 4/5: Fetching Top Nanobodies from local DB")
 
-                # Resolve nanobody target:
-                #   1. CLI arg / env var  --nanobody-target
-                #   2. challenge_params["nanobody_target"]
-                #   3. challenge_params["weekly_target"]  (fallback)
                 nanobody_target = cfg.nanobody_target or ""
                 if not nanobody_target and challenge_params:
                     nanobody_target = (
@@ -831,8 +793,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     nanobody_seqs = fetch_top_nanobodies(
                         target=nanobody_target,
                         n=num_pairs,
-                        api_url=cfg.nanobody_api_url,
-                        api_token=cfg.nanobody_api_token,
+                        db_path=cfg.nanobody_db_path,
                     )
                 else:
                     bt.logging.warning(
@@ -841,8 +802,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     )
                     nanobody_seqs = []
 
-                # Pad / truncate nanobody list to match molecule count
-                # If fewer nanobodies than molecules → reuse best one, else fallback
                 n_mols = len(top_molecules)
                 if nanobody_seqs:
                     if len(nanobody_seqs) < n_mols:
@@ -863,9 +822,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     )
                     nanobody_seqs = [NANOBODY_FALLBACK] * n_mols
 
-                bt.logging.info(
-                    f"   📋 Submission pairs ({n_mols} total):"
-                )
+                bt.logging.info(f"   📋 Submission pairs ({n_mols} total):")
                 for i, ((mol, score), nb) in enumerate(
                     zip(top_molecules, nanobody_seqs), 1
                 ):
@@ -878,9 +835,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                         f"nb={nb_display}"
                     )
 
-                # ──────────────────────────────────────────────────────────
                 # STEP 5: Submit SEQUENTIALLY
-                # ──────────────────────────────────────────────────────────
                 bt.logging.info("🔹 STEP 5/5: Sequential Submission")
                 bt.logging.info(
                     f"   ⚡ Submitting {n_mols} pairs using "
@@ -929,9 +884,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                         )
                         await asyncio.sleep(SUBMISSION_DELAY)
 
-                # ──────────────────────────────────────────────────────────
                 # Results summary
-                # ──────────────────────────────────────────────────────────
                 bt.logging.info("")
                 bt.logging.info("=" * 70)
                 bt.logging.info(f"📊 EPOCH {current_epoch} SUBMISSION RESULTS")
@@ -965,7 +918,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                         f"mol={mol:<28} | score={score:.4f} | nb={nb_display}"
                     )
 
-                # Next window ETA
                 next_submission_epoch = current_epoch + 1
                 next_submission_block = (
                     (next_submission_epoch + 1) * state["epoch_length"]
