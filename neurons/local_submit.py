@@ -56,10 +56,9 @@ NANOBODY_FALLBACK = "~"
 # WALLET + HOTKEY CONFIGURATION
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova", "nota"),
-    ("nova", "notb"),
-    ("nova", "notc"),
-    ("nova", "notd")
+    ("nova",   "notd"),
+    ("gentle",   "hota"),
+    ("gentle",   "hotb")
 ]
 
 # Timing configuration
