@@ -59,6 +59,7 @@ WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
     ("nova", "nota"),
     ("nova", "notb"),
     ("nova", "notc"),
+    ("nova", "notd")
 ]
 
 # Timing configuration
@@ -344,10 +345,17 @@ def fetch_top_nanobodies(
     target: str,
     n: int,
     db_path: str,
+    offset: int = 0,
 ) -> List[str]:
     """
-    Fetch top-N nanobody sequences directly from the local SQLite DB,
+    Fetch nanobody sequences directly from the local SQLite DB,
     ordered by final_nanobody_score ASC (lowest scores first).
+
+    Args:
+        target: Protein target id (matches nanobodies.target column).
+        n: Maximum rows to return in this page.
+        db_path: Path to nanobodies.sqlite.
+        offset: SQL OFFSET for pagination (used when scanning past HF duplicates).
 
     Returns:
         List of sequence strings (length up to n), lowest score first.
@@ -384,9 +392,9 @@ def fetch_top_nanobodies(
               AND  sequence IS NOT NULL
               AND  sequence != ''
             ORDER  BY final_nanobody_score ASC
-            LIMIT  ?
+            LIMIT  ? OFFSET ?
             """,
-            (target, n),
+            (target, n, offset),
         )
         rows = cursor.fetchall()
         conn.close()
@@ -427,6 +435,62 @@ def fetch_top_nanobodies(
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
+
+
+def fetch_hf_unique_top_nanobodies_from_db(
+    target: str,
+    n: int,
+    db_path: str,
+) -> List[str]:
+    """
+    Build up to ``n`` nanobody sequences for submission that are not already
+    present on the Hugging Face Submission-Archive for this nanobody target,
+    scanning the local DB in score order (same hash contract as nano.py).
+    """
+    from utils.nanobodies import nanobody_unique_for_target_hf
+
+    picked: List[str] = []
+    seen_sequences: set[str] = set()
+    offset = 0
+    chunk = max(64, n * 4)
+    max_rounds = 200
+
+    for _ in range(max_rounds):
+        if len(picked) >= n:
+            break
+        batch = fetch_top_nanobodies(
+            target=target,
+            n=chunk,
+            db_path=db_path,
+            offset=offset,
+        )
+        if not batch:
+            break
+        offset += len(batch)
+        for seq in batch:
+            if seq in seen_sequences:
+                continue
+            if not nanobody_unique_for_target_hf(target, seq):
+                bt.logging.debug(
+                    "   [Nanobody DB] Skipping sequence already in HF archive for "
+                    f"target={target}: {seq[:40]}..."
+                )
+                continue
+            picked.append(seq)
+            seen_sequences.add(seq)
+            if len(picked) >= n:
+                break
+
+    if len(picked) < n:
+        bt.logging.warning(
+            f"   ⚠️  Only {len(picked)} HF-unique nanobodies for target={target} "
+            f"(wanted {n})"
+        )
+    else:
+        bt.logging.info(
+            f"   ✅ Selected {len(picked)} HF-unique nanobodies for target={target}"
+        )
+    return picked
 
 
 # ============================================================================
@@ -791,7 +855,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
 
                 if nanobody_target:
                     bt.logging.info(f"   🧬 Nanobody target: {nanobody_target}")
-                    nanobody_seqs = fetch_top_nanobodies(
+                    nanobody_seqs = fetch_hf_unique_top_nanobodies_from_db(
                         target=nanobody_target,
                         n=num_pairs,
                         db_path=cfg.nanobody_db_path,

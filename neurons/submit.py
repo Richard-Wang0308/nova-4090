@@ -47,7 +47,7 @@ ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 # NANOBODY API CONFIGURATION
 # Point this at the Flask server running on the nanobody GPU (serve_db.py)
 # ============================================================================
-NANOBODY_API_URL     = os.getenv("NANOBODY_API_URL", "http://154.7.92.56:5001")
+NANOBODY_API_URL     = os.getenv("NANOBODY_API_URL", "http://154.7.92.56:50011")
 NANOBODY_API_TOKEN   = os.getenv("NANOBODY_API_TOKEN", "")   # leave empty if no auth
 NANOBODY_API_TIMEOUT = 15   # seconds
 NANOBODY_FALLBACK    = "~"  # used when API is unreachable or returns no results
@@ -59,6 +59,7 @@ WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
     ("nova", "nota"),
     ("nova", "notb"),
     ("nova", "notc"),
+    ("nova", "notd")
     # ("alpha", "hotkey1"),
 ]
 # ============================================================================
@@ -393,6 +394,54 @@ def fetch_top_nanobodies(
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
+
+
+def fetch_hf_unique_top_nanobodies_from_api(
+    target: str,
+    n: int,
+    api_url: str,
+    api_token: str = "",
+) -> List[str]:
+    """
+    Request a larger batch from the nanobody API, then keep the first ``n``
+    sequences that are not already on Hugging Face Submission-Archive for
+    this nanobody target (sequence_hash contract matches neurons/nano.py).
+    """
+    from utils.nanobodies import nanobody_unique_for_target_hf
+
+    request_n = min(2500, max(n * 40, n + 20))
+    raw = fetch_top_nanobodies(
+        target=target,
+        n=request_n,
+        api_url=api_url,
+        api_token=api_token,
+    )
+    picked: List[str] = []
+    seen: set[str] = set()
+    for seq in raw:
+        if seq in seen:
+            continue
+        if not nanobody_unique_for_target_hf(target, seq):
+            bt.logging.debug(
+                "   [Nanobody API] Skipping sequence already in HF archive for "
+                f"target={target}: {seq[:40]}..."
+            )
+            continue
+        picked.append(seq)
+        seen.add(seq)
+        if len(picked) >= n:
+            break
+
+    if len(picked) < n:
+        bt.logging.warning(
+            f"   ⚠️  Only {len(picked)} HF-unique nanobodies for target={target} "
+            f"(wanted {n}; requested {request_n} from API)"
+        )
+    else:
+        bt.logging.info(
+            f"   ✅ Selected {len(picked)} HF-unique nanobodies for target={target}"
+        )
+    return picked
 
 
 def check_nanobody_api_health(api_url: str, api_token: str = "") -> bool:
@@ -828,7 +877,7 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
 
                 if nanobody_target:
                     bt.logging.info(f"   🧬 Nanobody target: {nanobody_target}")
-                    nanobody_seqs = fetch_top_nanobodies(
+                    nanobody_seqs = fetch_hf_unique_top_nanobodies_from_api(
                         target=nanobody_target,
                         n=num_pairs,
                         api_url=cfg.nanobody_api_url,

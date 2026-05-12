@@ -16,10 +16,10 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 4
+HARDCODED_RXN_ID = 3
 STARTING_EPOCH = 22608
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn4.csv')
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_4.sqlite")
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn3.csv')
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_3.sqlite")
 
 from config.config_loader import load_config
 from utils import (
@@ -67,7 +67,7 @@ def validate_molecule_heavy_atoms(
         heavy_atom_count = get_heavy_atom_count(smiles)
         # min_atoms = config.get('min_heavy_atoms', 10)
         min_atoms = 10
-        max_atoms = 40
+        max_atoms = 45
 
         if heavy_atom_count < min_atoms:
             return False, f"Insufficient heavy atoms: {heavy_atom_count} < {min_atoms}"
@@ -480,7 +480,7 @@ def load_molecules_from_db_with_validation(
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 10
-                max_heavy_atoms = 40
+                max_heavy_atoms = 45
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
@@ -617,7 +617,7 @@ def load_molecules_from_csv_with_validation(
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 10
-                max_heavy_atoms = 40
+                max_heavy_atoms = 45
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
