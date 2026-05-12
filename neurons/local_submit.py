@@ -347,10 +347,10 @@ def fetch_top_nanobodies(
 ) -> List[str]:
     """
     Fetch top-N nanobody sequences directly from the local SQLite DB,
-    ordered by final_nanobody_score DESC.
+    ordered by final_nanobody_score ASC (lowest scores first).
 
     Returns:
-        List of sequence strings (length up to n), ordered best-first.
+        List of sequence strings (length up to n), lowest score first.
         Returns empty list on any error — caller uses NANOBODY_FALLBACK.
     """
     if not target:
@@ -368,7 +368,8 @@ def fetch_top_nanobodies(
 
     try:
         bt.logging.info(
-            f"   🧬 [Nanobody DB] Querying top {n} for target={target}  db={db_path}"
+            f"   🧬 [Nanobody DB] Querying lowest-scoring {n} for target={target}  "
+            f"db={db_path}"
         )
         # Open read-only to avoid locking conflicts with nano.py writer
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -382,7 +383,7 @@ def fetch_top_nanobodies(
             WHERE  target = ?
               AND  sequence IS NOT NULL
               AND  sequence != ''
-            ORDER  BY final_nanobody_score DESC
+            ORDER  BY final_nanobody_score ASC
             LIMIT  ?
             """,
             (target, n),
