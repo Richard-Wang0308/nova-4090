@@ -14,6 +14,7 @@ Workflow:
 
 import os
 import sys
+import math
 import asyncio
 import argparse
 import datetime
@@ -340,43 +341,65 @@ def check_nanobody_db_health(db_path: str) -> bool:
         return False
 
 
+def _nanobody_sequence_from_row(row: sqlite3.Row) -> Optional[str]:
+    """Non-empty trimmed sequence with finite final_nanobody_score, else None."""
+    raw = row["sequence"]
+    if raw is None:
+        return None
+    seq = str(raw).strip()
+    if not seq:
+        return None
+    sc = row["final_nanobody_score"]
+    if sc is None:
+        return None
+    try:
+        sf = float(sc)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sf):
+        return None
+    return seq
+
+
 def fetch_top_nanobodies(
     target: str,
     n: int,
     db_path: str,
     offset: int = 0,
-) -> List[str]:
+) -> Tuple[List[str], int]:
     """
-    Fetch nanobody sequences directly from the local SQLite DB,
-    ordered by final_nanobody_score ASC (lowest scores first).
+    Fetch nanobody sequences from the local SQLite DB: rows with minimum
+    ``final_nanobody_score`` first (ORDER BY score ASC), excluding rows with
+    empty/whitespace-only sequence or NULL/non-finite score.
 
     Args:
         target: Protein target id (matches nanobodies.target column).
-        n: Maximum rows to return in this page.
+        n: Maximum SQL rows to read in this page (LIMIT).
         db_path: Path to nanobodies.sqlite.
-        offset: SQL OFFSET for pagination (used when scanning past HF duplicates).
+        offset: SQL OFFSET for pagination.
 
     Returns:
-        List of sequence strings (length up to n), lowest score first.
-        Returns empty list on any error — caller uses NANOBODY_FALLBACK.
+        (sequences, sql_rows_read): trimmed non-empty sequences in score order,
+        and the number of table rows consumed (for OFFSET advancement).
+        On error: ([], 0).
     """
     if not target:
         bt.logging.warning(
             "   ⚠️  [Nanobody DB] No target specified — skipping nanobody fetch"
         )
-        return []
+        return [], 0
 
     if not os.path.exists(db_path):
         bt.logging.warning(
             f"   ⚠️  [Nanobody DB] File not found: {db_path}  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
-        return []
+        return [], 0
 
     try:
         bt.logging.info(
-            f"   🧬 [Nanobody DB] Querying lowest-scoring {n} for target={target}  "
-            f"db={db_path}"
+            f"   🧬 [Nanobody DB] Querying min final_nanobody_score page "
+            f"(limit={n} offset={offset}) for target={target}  db={db_path}"
         )
         # Open read-only to avoid locking conflicts with nano.py writer
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -388,9 +411,9 @@ def fetch_top_nanobodies(
             SELECT sequence, final_nanobody_score
             FROM   nanobodies
             WHERE  target = ?
-              AND  sequence IS NOT NULL
-              AND  sequence != ''
-            ORDER  BY final_nanobody_score ASC
+              AND  TRIM(COALESCE(sequence, '')) != ''
+              AND  final_nanobody_score IS NOT NULL
+            ORDER  BY final_nanobody_score ASC, sequence ASC
             LIMIT  ? OFFSET ?
             """,
             (target, n, offset),
@@ -398,42 +421,56 @@ def fetch_top_nanobodies(
         rows = cursor.fetchall()
         conn.close()
 
+        sql_rows_read = len(rows)
         if not rows:
-            bt.logging.warning(
-                f"   ⚠️  [Nanobody DB] No sequences found for target={target}  "
-                f"→ falling back to '{NANOBODY_FALLBACK}'"
-            )
-            return []
+            if offset == 0:
+                bt.logging.warning(
+                    f"   ⚠️  [Nanobody DB] No qualifying rows for target={target}  "
+                    f"→ falling back to '{NANOBODY_FALLBACK}'"
+                )
+            else:
+                bt.logging.debug(
+                    f"   [Nanobody DB] End of rows for target={target} at offset={offset}"
+                )
+            return [], 0
 
-        seqs = [row["sequence"] for row in rows]
+        seqs: List[str] = []
+        for row in rows:
+            s = _nanobody_sequence_from_row(row)
+            if s is not None:
+                seqs.append(s)
         bt.logging.info(
-            f"   ✅ [Nanobody DB] Got {len(seqs)} nanobodies for target={target}"
+            f"   ✅ [Nanobody DB] Read {sql_rows_read} row(s), "
+            f"{len(seqs)} non-empty finite-score sequence(s) for target={target}"
         )
         for i, row in enumerate(rows, 1):
+            s = _nanobody_sequence_from_row(row)
+            if s is None:
+                continue
             bt.logging.info(
                 f"      {i:>2}. score={row['final_nanobody_score']}  "
-                f"{row['sequence'][:40]}..."
+                f"{s[:40]}..."
             )
-        return seqs
+        return seqs, sql_rows_read
 
     except sqlite3.OperationalError as e:
         bt.logging.warning(
             f"   ⚠️  [Nanobody DB] DB not ready yet ({e})  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
-        return []
+        return [], 0
     except sqlite3.Error as e:
         bt.logging.warning(
             f"   ⚠️  [Nanobody DB] SQLite error: {e}  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
-        return []
+        return [], 0
     except Exception as e:
         bt.logging.error(
             f"   ❌ [Nanobody DB] Unexpected error: {e}  "
             f"→ falling back to '{NANOBODY_FALLBACK}'"
         )
-        return []
+        return [], 0
 
 
 def fetch_hf_unique_top_nanobodies_from_db(
@@ -457,15 +494,17 @@ def fetch_hf_unique_top_nanobodies_from_db(
     for _ in range(max_rounds):
         if len(picked) >= n:
             break
-        batch = fetch_top_nanobodies(
+        batch, sql_rows = fetch_top_nanobodies(
             target=target,
             n=chunk,
             db_path=db_path,
             offset=offset,
         )
-        if not batch:
+        offset += sql_rows
+        if sql_rows == 0:
             break
-        offset += len(batch)
+        if not batch:
+            continue
         for seq in batch:
             if seq in seen_sequences:
                 continue

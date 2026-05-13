@@ -14,6 +14,7 @@ Workflow:
 
 import os
 import sys
+import math
 import asyncio
 import argparse
 import datetime
@@ -327,11 +328,9 @@ def fetch_top_nanobodies(
     api_token: str = "",
 ) -> List[str]:
     """
-    Fetch top-N nanobody sequences from the nanobody GPU Flask API.
-
-    Returns:
-        List of sequence strings (length up to n), ordered best-first.
-        Returns empty list on any error — caller should use NANOBODY_FALLBACK.
+    Fetch nanobody sequences from the nanobody GPU Flask API, ordered by
+    minimum ``final_nanobody_score`` first. Skips empty/whitespace-only
+    sequences and rows without a finite score.
     """
     if not target:
         bt.logging.warning("   ⚠️  [Nanobody API] No target specified — skipping nanobody fetch")
@@ -351,21 +350,39 @@ def fetch_top_nanobodies(
         resp.raise_for_status()
         data = resp.json()
 
-        results  = data.get("results", [])
-        seqs     = [r["sequence"] for r in results if r.get("sequence")]
+        results = data.get("results", [])
+        scored: List[Tuple[float, str]] = []
+        for r in results:
+            seq = (r.get("sequence") or "").strip()
+            if not seq:
+                continue
+            raw_score = r.get("final_nanobody_score")
+            if raw_score is None:
+                continue
+            try:
+                sf = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(sf):
+                continue
+            scored.append((sf, seq))
+
+        scored.sort(key=lambda t: (t[0], t[1]))
+        seqs = [seq for _, seq in scored[:n]]
 
         if seqs:
             bt.logging.info(
-                f"   ✅ [Nanobody API] Got {len(seqs)} nanobodies for target={target}"
+                f"   ✅ [Nanobody API] Got {len(seqs)} nanobodies "
+                f"(min final_nanobody_score order) for target={target}"
             )
-            for i, seq in enumerate(seqs, 1):
-                score = results[i - 1].get("final_nanobody_score", "N/A")
+            for i, (sf, seq) in enumerate(scored[:n], 1):
                 bt.logging.info(
-                    f"      {i:>2}. score={score}  {seq[:40]}..."
+                    f"      {i:>2}. score={sf}  {seq[:40]}..."
                 )
         else:
             bt.logging.warning(
-                f"   ⚠️  [Nanobody API] No sequences returned for target={target}"
+                f"   ⚠️  [Nanobody API] No non-empty finite-score sequences "
+                f"for target={target}"
             )
 
         return seqs
