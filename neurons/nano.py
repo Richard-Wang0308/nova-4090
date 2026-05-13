@@ -154,6 +154,7 @@ def init_db(db_path: str = DB_PATH) -> None:
             id                            INTEGER PRIMARY KEY AUTOINCREMENT,
             sequence                      TEXT    NOT NULL,
             target                        TEXT    NOT NULL,
+            available                     BOOLEAN,
             design_iiptm                  REAL,
             design_ptm                    REAL,
             design_to_target_iptm         REAL,
@@ -176,9 +177,15 @@ def init_db(db_path: str = DB_PATH) -> None:
             UNIQUE(sequence, target)
         )
     """)
+    # Serving-side validation may set ``available``; submit scripts only read rows
+    # with available = TRUE. Add column for existing DBs created before this field.
+    try:
+        c.execute("ALTER TABLE nanobodies ADD COLUMN available BOOLEAN")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
-    log_db.info(f"  DB ready (schema v1)")
+    log_db.info(f"  DB ready (schema with optional ``available`` for submit gating)")
     log_db.info(_sep())
 
 

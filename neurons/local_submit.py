@@ -6,7 +6,7 @@ Workflow:
 1. Monitor blockchain for epoch boundaries
 2. At 28 blocks before boundary, update database
 3. Fetch top N molecules from reaction DB
-4. Fetch top N nanobodies DIRECTLY from local nanobody SQLite DB (no Flask)
+4. Fetch top N nanobodies DIRECTLY from local nanobody SQLite (``available = TRUE``, min score)
 5. Submit all N pairs SEQUENTIALLY as "molecule|nanobody"
    - If nanobody DB is unavailable → fallback to "molecule|~"
 6. Wait for next epoch's submission window
@@ -305,6 +305,28 @@ async def setup_bittensor_objects(
 # Replaces the Flask API client entirely — no network calls needed
 # ============================================================================
 
+_nanobodies_available_column_cache: Dict[str, bool] = {}
+
+
+def _nanobodies_table_has_available(db_path: str) -> bool:
+    """True if ``nanobodies`` has an ``available`` column (required for submit queries)."""
+    if db_path in _nanobodies_available_column_cache:
+        return _nanobodies_available_column_cache[db_path]
+    if not os.path.exists(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(nanobodies)")
+        cols = {row[1] for row in cur.fetchall()}
+        conn.close()
+        ok = "available" in cols
+    except sqlite3.Error:
+        ok = False
+    _nanobodies_available_column_cache[db_path] = ok
+    return ok
+
+
 def check_nanobody_db_health(db_path: str) -> bool:
     """
     Check that the nanobody SQLite DB exists and is readable.
@@ -368,20 +390,10 @@ def fetch_top_nanobodies(
     offset: int = 0,
 ) -> Tuple[List[str], int]:
     """
-    Fetch nanobody sequences from the local SQLite DB: rows with minimum
-    ``final_nanobody_score`` first (ORDER BY score ASC), excluding rows with
-    empty/whitespace-only sequence or NULL/non-finite score.
-
-    Args:
-        target: Protein target id (matches nanobodies.target column).
-        n: Maximum SQL rows to read in this page (LIMIT).
-        db_path: Path to nanobodies.sqlite.
-        offset: SQL OFFSET for pagination.
-
-    Returns:
-        (sequences, sql_rows_read): trimmed non-empty sequences in score order,
-        and the number of table rows consumed (for OFFSET advancement).
-        On error: ([], 0).
+    Fetch nanobody sequences from the serving SQLite DB (read-only): lowest
+    ``final_nanobody_score`` first, non-empty sequence, finite score, and
+    ``available = TRUE`` (validation is maintained server-side on the DB
+    service; this query runs when the submission window opens).
     """
     if not target:
         bt.logging.warning(
@@ -397,9 +409,16 @@ def fetch_top_nanobodies(
         return [], 0
 
     try:
+        if not _nanobodies_table_has_available(db_path):
+            bt.logging.error(
+                "   ❌ [Nanobody DB] Table ``nanobodies`` has no ``available`` column — "
+                "cannot select submit-eligible rows. Add the column on the serving DB."
+            )
+            return [], 0
+
         bt.logging.info(
-            f"   🧬 [Nanobody DB] Querying min final_nanobody_score page "
-            f"(limit={n} offset={offset}) for target={target}  db={db_path}"
+            f"   🧬 [Nanobody DB] Querying available=TRUE, min score "
+            f"(limit={n} offset={offset}) target={target}  db={db_path}"
         )
         # Open read-only to avoid locking conflicts with nano.py writer
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -413,6 +432,7 @@ def fetch_top_nanobodies(
             WHERE  target = ?
               AND  TRIM(COALESCE(sequence, '')) != ''
               AND  final_nanobody_score IS NOT NULL
+              AND  (available = 1 OR CAST(available AS INTEGER) = 1)
             ORDER  BY final_nanobody_score ASC, sequence ASC
             LIMIT  ? OFFSET ?
             """,
@@ -474,59 +494,48 @@ def fetch_top_nanobodies(
 
 
 def fetch_hf_unique_top_nanobodies_from_db(
-    target: str,
+    nanobody_targets: List[str],
     n: int,
     db_path: str,
 ) -> List[str]:
     """
-    Build up to ``n`` nanobody sequences for submission that are not already
-    present on the Hugging Face Submission-Archive for this nanobody target,
-    scanning the local DB in score order (same hash contract as nano.py).
+    Load up to ``n`` nanobodies for submission from the serving DB at window time.
+    Rows must already be validated there: ``available = TRUE``, non-empty sequence,
+    finite ``final_nanobody_score``, ordered by minimum score. Client does not
+    re-run HF/similarity checks.
     """
-    from utils.nanobodies import nanobody_unique_for_target_hf
+    from utils.nanobodies import normalize_seq
 
+    if not nanobody_targets or not str(nanobody_targets[0]).strip():
+        return []
+
+    sql_target = str(nanobody_targets[0]).strip()
+    seqs, _ = fetch_top_nanobodies(
+        target=sql_target,
+        n=n,
+        db_path=db_path,
+        offset=0,
+    )
+    seen_norm: set[str] = set()
     picked: List[str] = []
-    seen_sequences: set[str] = set()
-    offset = 0
-    chunk = max(64, n * 4)
-    max_rounds = 200
-
-    for _ in range(max_rounds):
+    for seq in seqs:
+        nk = normalize_seq(seq)
+        if nk in seen_norm:
+            continue
+        seen_norm.add(nk)
+        picked.append(seq)
         if len(picked) >= n:
             break
-        batch, sql_rows = fetch_top_nanobodies(
-            target=target,
-            n=chunk,
-            db_path=db_path,
-            offset=offset,
-        )
-        offset += sql_rows
-        if sql_rows == 0:
-            break
-        if not batch:
-            continue
-        for seq in batch:
-            if seq in seen_sequences:
-                continue
-            if not nanobody_unique_for_target_hf(target, seq):
-                bt.logging.debug(
-                    "   [Nanobody DB] Skipping sequence already in HF archive for "
-                    f"target={target}: {seq[:40]}..."
-                )
-                continue
-            picked.append(seq)
-            seen_sequences.add(seq)
-            if len(picked) >= n:
-                break
 
     if len(picked) < n:
         bt.logging.warning(
-            f"   ⚠️  Only {len(picked)} HF-unique nanobodies for target={target} "
-            f"(wanted {n})"
+            f"   ⚠️  Only {len(picked)} available=TRUE nanobodies for "
+            f"targets={nanobody_targets!r} (wanted {n})"
         )
     else:
         bt.logging.info(
-            f"   ✅ Selected {len(picked)} HF-unique nanobodies for target={target}"
+            f"   ✅ Loaded {len(picked)} available=TRUE nanobodies "
+            f"(min score order) for targets={nanobody_targets!r}"
         )
     return picked
 
@@ -880,21 +889,26 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     await asyncio.sleep(12)
                     continue
 
-                # STEP 4: Fetch top N nanobodies — DIRECT SQLite
-                bt.logging.info("🔹 STEP 4/5: Fetching Top Nanobodies from local DB")
+                # STEP 4: Nanobodies — query serving DB only inside submission window
+                bt.logging.info(
+                    "🔹 STEP 4/5: Fetching submit-eligible nanobodies "
+                    "(available=TRUE, min final_nanobody_score) from local DB"
+                )
 
-                nanobody_target = cfg.nanobody_target or ""
-                if not nanobody_target and challenge_params:
-                    nanobody_target = (
-                        challenge_params.get("nanobody_target")
-                        or challenge_params.get("weekly_target")
-                        or ""
+                from utils.nanobody_archive_similarity import (
+                    collect_nanobody_targets_for_submission,
+                )
+
+                nanobody_targets = collect_nanobody_targets_for_submission(
+                    cfg, challenge_params
+                )
+
+                if nanobody_targets:
+                    bt.logging.info(
+                        f"   🧬 Nanobody target protein(s): {nanobody_targets}"
                     )
-
-                if nanobody_target:
-                    bt.logging.info(f"   🧬 Nanobody target: {nanobody_target}")
                     nanobody_seqs = fetch_hf_unique_top_nanobodies_from_db(
-                        target=nanobody_target,
+                        nanobody_targets=nanobody_targets,
                         n=num_pairs,
                         db_path=cfg.nanobody_db_path,
                     )

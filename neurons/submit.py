@@ -6,7 +6,7 @@ Workflow:
 1. Monitor blockchain for epoch boundaries
 2. At 28 blocks before boundary, update database
 3. Fetch top N molecules from reaction DB
-4. Fetch top N nanobodies from nanobody GPU Flask API
+4. Fetch top N nanobodies from nanobody DB service (``available = TRUE``, min score)
 5. Submit all N pairs SEQUENTIALLY as "molecule|nanobody"
    - If nanobody API is unavailable → fallback to "molecule|~"
 6. Wait for next epoch's submission window
@@ -40,36 +40,37 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 # Database paths
-DB_PATH          = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
+DB_PATH           = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
+SCORE_RESULTS_DB  = os.path.join(BASE_DIR, "score_results_2.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # ============================================================================
 # NANOBODY API CONFIGURATION
-# Point this at the Flask server running on the nanobody GPU (serve_db.py)
 # ============================================================================
-NANOBODY_API_URL     = os.getenv("NANOBODY_API_URL", "http://154.7.92.56:50011")
-NANOBODY_API_TOKEN   = os.getenv("NANOBODY_API_TOKEN", "")   # leave empty if no auth
-NANOBODY_API_TIMEOUT = 15   # seconds
-NANOBODY_FALLBACK    = "~"  # used when API is unreachable or returns no results
+NANOBODY_API_URL   = os.getenv("NANOBODY_API_URL",   "http://154.7.92.56:50001")
+NANOBODY_API_TOKEN = os.getenv("NANOBODY_API_TOKEN", "Gentleman25!")
+
+# FIX: was 15s — serve_db.py runs dedup+similarity (HF download + search engine)
+# which can take 10-30s on slow HuggingFace days. 120s is safe.
+NANOBODY_API_TIMEOUT = 120  # seconds
+
+NANOBODY_FALLBACK = "~"  # used when API is unreachable or returns no results
 
 # ============================================================================
 # WALLET + HOTKEY CONFIGURATION
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova", "nota"),
-    ("nova", "notb"),
-    ("nova", "notc"),
-    ("nova", "notd")
-    # ("alpha", "hotkey1"),
+    ("gentle", "hotd"),
+    ("gentle", "hotc"),
+    ("gentle", "hota"),
+    ("gentle", "hotb"),
 ]
-# ============================================================================
 
 # Timing configuration
 BLOCKS_BEFORE_BOUNDARY = 30
-EPOCH_LENGTH           = 361
-STATUS_LOG_INTERVAL    = 60
-SUBMISSION_DELAY       = 0.5
+EPOCH_LENGTH            = 361
+STATUS_LOG_INTERVAL     = 60
+SUBMISSION_DELAY        = 0.5
 
 # ============================================================================
 
@@ -118,6 +119,64 @@ def resolve_challenge_params(
             num_antitargets=config.num_antitargets,
             include_reaction=config.random_valid_reaction,
         )
+
+
+# ============================================================================
+# NANOBODY TARGET RESOLUTION
+# ============================================================================
+
+def resolve_nanobody_target(
+    config: argparse.Namespace,
+    challenge_params: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Resolve the single nanobody target protein ID to query.
+
+    Priority:
+      1. --nanobody-target CLI arg / NANOBODY_TARGET env var  (explicit override)
+      2. challenge_params["nanobody_target"]                  (from blockchain)
+      3. config.nanobody_target                               (from config.yaml)
+
+    Returns a single string target ID (e.g. "Q9NZQ7") or None.
+
+    IMPORTANT: challenge_params may contain a list like ['Q9NZQ7', 'Q6P6W3']
+    where the second entry is the small-molecule compound target — NOT a nanobody
+    target. We always take only the FIRST element of any list.
+    """
+    # 1. Explicit CLI / env override
+    cli_target = getattr(config, "nanobody_target", "") or ""
+    if cli_target.strip():
+        target = cli_target.strip()
+        bt.logging.info(f"   🧬 Nanobody target (from CLI/env): {target}")
+        return target
+
+    # 2. From challenge params
+    if challenge_params:
+        cp_target = challenge_params.get("nanobody_target")
+        if cp_target:
+            if isinstance(cp_target, (list, tuple)):
+                target = str(cp_target[0]).strip()
+                if len(cp_target) > 1:
+                    bt.logging.info(
+                        f"   🧬 challenge_params nanobody_target has {len(cp_target)} "
+                        f"entries {list(cp_target)} — using only first: '{target}' "
+                        f"(remaining entries are compound/small-molecule targets)"
+                    )
+            else:
+                target = str(cp_target).strip()
+            if target:
+                bt.logging.info(f"   🧬 Nanobody target (from challenge params): {target}")
+                return target
+
+    # 3. From config
+    cfg_target = getattr(config, "nanobody_target", "") or ""
+    if cfg_target.strip():
+        target = cfg_target.strip()
+        bt.logging.info(f"   🧬 Nanobody target (from config): {target}")
+        return target
+
+    bt.logging.warning("   ⚠️  Could not resolve nanobody target from any source")
+    return None
 
 
 # ============================================================================
@@ -190,7 +249,10 @@ def load_github_path() -> str:
     if github_repo_path == "":
         github_path = f"{github_repo_owner}/{github_repo_name}/{github_repo_branch}"
     else:
-        github_path = f"{github_repo_owner}/{github_repo_name}/{github_repo_branch}/{github_repo_path}"
+        github_path = (
+            f"{github_repo_owner}/{github_repo_name}"
+            f"/{github_repo_branch}/{github_repo_path}"
+        )
 
     if len(github_path) > 100:
         raise ValueError(
@@ -214,6 +276,7 @@ def setup_logging(config: argparse.Namespace) -> None:
         bt.logging.info(f"   {idx:>2}. wallet={wname:<12}  hotkey={hname}")
     bt.logging.info(f"🧬 Nanobody API URL:     {config.nanobody_api_url}")
     bt.logging.info(f"🧬 Nanobody API auth:    {'yes' if config.nanobody_api_token else 'no'}")
+    bt.logging.info(f"🧬 Nanobody API timeout: {NANOBODY_API_TIMEOUT}s")
     bt.logging.info(f"🧬 Nanobody target:      {config.nanobody_target or '(from challenge params)'}")
     bt.logging.info(f"⏰ Trigger point:        {BLOCKS_BEFORE_BOUNDARY} blocks before epoch boundary")
     bt.logging.info(f"📊 Epoch length:         {EPOCH_LENGTH} blocks")
@@ -248,7 +311,7 @@ async def setup_bittensor_objects(
                 bt.logging.info(
                     f"   📋 Initializing {len(WALLET_HOTKEY_PAIRS)} wallet/hotkey pairs:"
                 )
-                wallets: List[Any] = []
+                wallets: List[Any]    = []
                 miner_uids: List[int] = []
 
                 for idx, (wallet_name, hotkey_name) in enumerate(WALLET_HOTKEY_PAIRS, 1):
@@ -277,9 +340,7 @@ async def setup_bittensor_objects(
                         )
 
                 if not wallets:
-                    raise ValueError(
-                        "❌ No valid wallet/hotkey pairs found in metagraph!"
-                    )
+                    raise ValueError("❌ No valid wallet/hotkey pairs found in metagraph!")
 
                 bt.logging.info(
                     f"\n   ✅ Successfully initialized "
@@ -326,21 +387,31 @@ def fetch_top_nanobodies(
     n: int,
     api_url: str,
     api_token: str = "",
+    *,
+    available_only: bool = True,
 ) -> List[str]:
     """
-    Fetch nanobody sequences from the nanobody GPU Flask API, ordered by
-    minimum ``final_nanobody_score`` first. Skips empty/whitespace-only
-    sequences and rows without a finite score.
+    Fetch nanobodies from serve_db.py API: min final_nanobody_score first,
+    non-empty sequence, finite score.
+
+    NOTE: serve_db.py runs dedup+similarity internally when available_only=True,
+    which can take 10-30s (HF download + search engine). NANOBODY_API_TIMEOUT
+    must be set high enough (120s) to accommodate this.
     """
     if not target:
         bt.logging.warning("   ⚠️  [Nanobody API] No target specified — skipping nanobody fetch")
         return []
 
-    url = f"{api_url.rstrip('/')}/top"
-    params = {"target": target, "n": n}
+    url    = f"{api_url.rstrip('/')}/top"
+    params: Dict[str, Any] = {"target": target, "n": n}
+    if available_only:
+        params["available_only"] = "true"
 
     try:
-        bt.logging.info(f"   🧬 [Nanobody API] GET {url}  target={target}  n={n}")
+        bt.logging.info(
+            f"   🧬 [Nanobody API] GET {url}  target={target}  n={n}  "
+            f"available_only={available_only}  timeout={NANOBODY_API_TIMEOUT}s"
+        )
         resp = requests.get(
             url,
             params=params,
@@ -353,6 +424,10 @@ def fetch_top_nanobodies(
         results = data.get("results", [])
         scored: List[Tuple[float, str]] = []
         for r in results:
+            if available_only:
+                av = r.get("available")
+                if av is not None and av not in (True, 1, "1", "true", "TRUE"):
+                    continue
             seq = (r.get("sequence") or "").strip()
             if not seq:
                 continue
@@ -373,12 +448,10 @@ def fetch_top_nanobodies(
         if seqs:
             bt.logging.info(
                 f"   ✅ [Nanobody API] Got {len(seqs)} nanobodies "
-                f"(min final_nanobody_score order) for target={target}"
+                f"(available subset, min score order) for target={target}"
             )
             for i, (sf, seq) in enumerate(scored[:n], 1):
-                bt.logging.info(
-                    f"      {i:>2}. score={sf}  {seq[:40]}..."
-                )
+                bt.logging.info(f"      {i:>2}. score={sf}  {seq[:40]}...")
         else:
             bt.logging.warning(
                 f"   ⚠️  [Nanobody API] No non-empty finite-score sequences "
@@ -395,8 +468,11 @@ def fetch_top_nanobodies(
         return []
     except requests.exceptions.Timeout:
         bt.logging.warning(
-            f"   ⚠️  [Nanobody API] Request timed out after {NANOBODY_API_TIMEOUT}s  "
-            f"→ falling back to '{NANOBODY_FALLBACK}'"
+            f"   ⚠️  [Nanobody API] Request timed out after {NANOBODY_API_TIMEOUT}s\n"
+            f"      serve_db.py dedup+similarity may be slow (HF network latency).\n"
+            f"      Call POST /cleanup proactively after each BoltzGen batch to\n"
+            f"      pre-filter sequences so /top returns instantly.\n"
+            f"      → falling back to '{NANOBODY_FALLBACK}'"
         )
         return []
     except requests.exceptions.HTTPError as e:
@@ -413,50 +489,59 @@ def fetch_top_nanobodies(
         return []
 
 
-def fetch_hf_unique_top_nanobodies_from_api(
-    target: str,
+def fetch_nanobodies_for_submission(
+    nanobody_target: str,
     n: int,
     api_url: str,
     api_token: str = "",
 ) -> List[str]:
     """
-    Request a larger batch from the nanobody API, then keep the first ``n``
-    sequences that are not already on Hugging Face Submission-Archive for
-    this nanobody target (sequence_hash contract matches neurons/nano.py).
-    """
-    from utils.nanobodies import nanobody_unique_for_target_hf
+    Fetch n submit-eligible nanobodies for a SINGLE nanobody target.
 
-    request_n = min(2500, max(n * 40, n + 20))
+    Replaces the old fetch_hf_unique_top_nanobodies_from_api which accepted
+    a list of targets and silently used only the first one. Here we are
+    explicit: one target string, one API query, client-side dedup by
+    normalized sequence.
+    """
+    from utils.nanobodies import normalize_seq
+
+    if not nanobody_target or not nanobody_target.strip():
+        bt.logging.warning(
+            "   ⚠️  fetch_nanobodies_for_submission: empty target — returning []"
+        )
+        return []
+
+    target = nanobody_target.strip()
+
     raw = fetch_top_nanobodies(
         target=target,
-        n=request_n,
+        n=n,
         api_url=api_url,
         api_token=api_token,
+        available_only=True,
     )
-    picked: List[str] = []
-    seen: set[str] = set()
+
+    # Client-side dedup by normalized sequence (defensive; server already deduped)
+    seen_norm: set[str] = set()
+    picked: List[str]   = []
     for seq in raw:
-        if seq in seen:
+        nk = normalize_seq(seq)
+        if nk in seen_norm:
             continue
-        if not nanobody_unique_for_target_hf(target, seq):
-            bt.logging.debug(
-                "   [Nanobody API] Skipping sequence already in HF archive for "
-                f"target={target}: {seq[:40]}..."
-            )
-            continue
+        seen_norm.add(nk)
         picked.append(seq)
-        seen.add(seq)
         if len(picked) >= n:
             break
 
     if len(picked) < n:
         bt.logging.warning(
-            f"   ⚠️  Only {len(picked)} HF-unique nanobodies for target={target} "
-            f"(wanted {n}; requested {request_n} from API)"
+            f"   ⚠️  Only {len(picked)} available=TRUE nanobodies from API "
+            f"for target='{target}' (wanted {n})"
         )
     else:
         bt.logging.info(
-            f"   ✅ Selected {len(picked)} HF-unique nanobodies for target={target}"
+            f"   ✅ Loaded {len(picked)} available=TRUE nanobodies from API "
+            f"for target='{target}'"
         )
     return picked
 
@@ -612,18 +697,6 @@ async def submit_response(
     Submission format:
       "molecule|nanobody_sequence"   — when nanobody is available
       "molecule|~"                   — fallback when no nanobody
-
-    Args:
-        wallet:             Bittensor wallet object
-        miner_uid:          Miner UID
-        candidate_product:  Molecule name to submit
-        nanobody_sequence:  Nanobody AA sequence (or "~" as fallback)
-        state:              Global state dictionary
-        submission_number:  Current submission index (for logging)
-        total_submissions:  Total number of submissions (for logging)
-
-    Returns:
-        True if submission successful, False otherwise
     """
     if not candidate_product:
         bt.logging.warning(f"      ⚠️  UID {miner_uid}: No candidate product")
@@ -633,7 +706,6 @@ async def submit_response(
     hotkey_name = wallet.hotkey_str if hasattr(wallet, "hotkey_str") else "unknown"
     label       = f"{wallet_name}/{hotkey_name}"
 
-    # Build submission message
     nanobody_part = nanobody_sequence if nanobody_sequence else NANOBODY_FALLBACK
     message       = f"{candidate_product}|{nanobody_part}"
 
@@ -733,13 +805,12 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
       2. Verify reaction DB exists
       3. Update reaction DB (add_column.py)
       4. Fetch top N molecules from reaction DB
-      5. Fetch top N nanobodies from nanobody GPU Flask API
+      5. Fetch top N nanobodies from nanobody GPU Flask API (single target only)
          → fallback to "~" if API unreachable or returns nothing
       6. Submit N pairs as "molecule|nanobody" (or "molecule|~")
     """
     bt.logging.info("🔄 Starting epoch monitoring loop...\n")
 
-    # Health-check nanobody API at startup
     bt.logging.info("🧬 Checking nanobody API health at startup...")
     check_nanobody_api_health(
         state["config"].nanobody_api_url,
@@ -876,26 +947,25 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     continue
 
                 # ──────────────────────────────────────────────────────────
-                # STEP 4: Fetch top N nanobodies from nanobody GPU API
+                # STEP 4: Fetch nanobodies — single target only
                 # ──────────────────────────────────────────────────────────
-                bt.logging.info("🔹 STEP 4/5: Fetching Top Nanobodies from API")
+                bt.logging.info(
+                    "🔹 STEP 4/5: Fetching submit-eligible nanobodies "
+                    "(available=TRUE, min final_nanobody_score) from API"
+                )
 
-                # Resolve nanobody target:
-                #   1. CLI arg / env var  --nanobody-target
-                #   2. challenge_params["nanobody_target"]
-                #   3. challenge_params["weekly_target"]  (fallback)
-                nanobody_target = cfg.nanobody_target or ""
-                if not nanobody_target and challenge_params:
-                    nanobody_target = (
-                        challenge_params.get("nanobody_target")
-                        or challenge_params.get("weekly_target")
-                        or ""
-                    )
+                # Resolve a SINGLE nanobody target.
+                # challenge_params may return a list like ['Q9NZQ7', 'Q6P6W3']
+                # where Q6P6W3 is the small-molecule compound target.
+                # resolve_nanobody_target() always takes only the first entry.
+                nanobody_target = resolve_nanobody_target(cfg, challenge_params)
 
                 if nanobody_target:
-                    bt.logging.info(f"   🧬 Nanobody target: {nanobody_target}")
-                    nanobody_seqs = fetch_hf_unique_top_nanobodies_from_api(
-                        target=nanobody_target,
+                    bt.logging.info(
+                        f"   🧬 Nanobody target protein: {nanobody_target}"
+                    )
+                    nanobody_seqs = fetch_nanobodies_for_submission(
+                        nanobody_target=nanobody_target,
                         n=num_pairs,
                         api_url=cfg.nanobody_api_url,
                         api_token=cfg.nanobody_api_token,
@@ -908,7 +978,6 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     nanobody_seqs = []
 
                 # Pad / truncate nanobody list to match molecule count
-                # If fewer nanobodies than molecules → reuse best one, else fallback
                 n_mols = len(top_molecules)
                 if nanobody_seqs:
                     if len(nanobody_seqs) < n_mols:
@@ -929,14 +998,12 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                     )
                     nanobody_seqs = [NANOBODY_FALLBACK] * n_mols
 
-                bt.logging.info(
-                    f"   📋 Submission pairs ({n_mols} total):"
-                )
+                bt.logging.info(f"   📋 Submission pairs ({n_mols} total):")
                 for i, ((mol, score), nb) in enumerate(
                     zip(top_molecules, nanobody_seqs), 1
                 ):
                     nb_display = (
-                        f"(fallback ~)" if nb == NANOBODY_FALLBACK
+                        "(fallback ~)" if nb == NANOBODY_FALLBACK
                         else f"{nb[:30]}..."
                     )
                     bt.logging.info(
@@ -1018,11 +1085,11 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                 for i, (success, (wallet, mol, nb, uid, score)) in enumerate(
                     zip(results, submission_details), 1
                 ):
-                    status      = "✅" if success else "❌"
-                    wname       = wallet.name       if hasattr(wallet, "name")       else "?"
-                    hname       = wallet.hotkey_str if hasattr(wallet, "hotkey_str") else "?"
-                    label       = f"{wname}/{hname}"
-                    nb_display  = (
+                    status     = "✅" if success else "❌"
+                    wname      = wallet.name       if hasattr(wallet, "name")       else "?"
+                    hname      = wallet.hotkey_str if hasattr(wallet, "hotkey_str") else "?"
+                    label      = f"{wname}/{hname}"
+                    nb_display = (
                         "(fallback ~)" if nb == NANOBODY_FALLBACK
                         else f"{nb[:25]}..."
                     )
