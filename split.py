@@ -10,7 +10,7 @@ def split_csv(input_file):
 
     # Open all 5 output files
     for i in range(1, 6):
-        f = open(f"rxn{i}.csv", "w", newline="")
+        f = open(f"data/rxn{i}.csv", "w", newline="")
         output_files[i] = f
         writers[i] = csv.writer(f)
 
@@ -56,7 +56,7 @@ def split_csv(input_file):
     # Print row counts per file
     print("\n📄 Row counts per output file (excluding header):")
     for i in range(1, 6):
-        fname = f"rxn{i}.csv"
+        fname = f"data/rxn{i}.csv"
         with open(fname, "r") as f:
             row_count = sum(1 for _ in f) - 1  # subtract header
         print(f"   {fname}: {row_count} rows")

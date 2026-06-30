@@ -27,10 +27,10 @@ BLOCK_TIME = 12  # seconds per blockui
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Continuously collect training data from competition API")
-    parser.add_argument('--start_epoch', type=int, default=22608, help='Starting epoch number to collect from')
-    parser.add_argument('--end_epoch', type=int, default=22652, help='Ending epoch number to collect to')
+    parser.add_argument('--start_epoch', type=int, default=23304, help='Starting epoch number to collect from')
+    parser.add_argument('--end_epoch', type=int, default=23599, help='Ending epoch number to collect to')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
-    parser.add_argument('--output', type=str, default='data/a.csv', help='Output CSV file')
+    parser.add_argument('--output', type=str, default='data/mols.csv', help='Output CSV file')
     parser.add_argument('--time', type=int, default=1, 
                        help='Remaining time in seconds until first collection. If None, collect immediately.')
     
@@ -73,7 +73,7 @@ def extract_training_samples(data: dict) -> list:
     samples = []
     
     # Extract competition info
-    competition = "Q63380"
+    competition = "Q9UKV0-3"
     
     # Process leaderboard entries
     leaderboard = data.get('data', [])
