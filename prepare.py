@@ -73,7 +73,7 @@ def extract_training_samples(data: dict) -> list:
     samples = []
     
     # Extract competition info
-    competition = "Q9UKV0-3"
+    competition = "P01584"
     
     # Process leaderboard entries
     leaderboard = data.get('data', [])

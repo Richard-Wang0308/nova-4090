@@ -10,9 +10,6 @@ wget -qO- https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
 # Install system build/env tools (Ubuntu/Debian):
-sudo apt update && sudo apt install -y build-essential
-sudo apt install -y python3.12-venv
-
 apt update && apt install -y build-essential
 apt install -y python3.12-venv
 
@@ -28,7 +25,7 @@ cd ..
 
 
 # Create and activate virtual environment
-uv venv --python python3.12 && source .venv/bin/activate \
+python3 -m venv .venv && source .venv/bin/activate \
         && uv pip install -r requirements/requirements.txt \
         && uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 \
         && uv pip install torch-geometric==2.6.1 \

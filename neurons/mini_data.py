@@ -89,7 +89,7 @@ def validate_molecule_banned_atoms(
         if mol is None:
             return False, "Cannot parse SMILES for banned atom check"
         
-        banned_atoms = config.get('banned_atom_types', [])
+        banned_atoms = config["banned_atom_types"]
         if not banned_atoms:
             return True, ""
         
@@ -112,8 +112,8 @@ def validate_molecule_rotatable_bonds(
             return False, "Cannot parse SMILES for rotatable bonds check"
         
         num_rotatable_bonds = Descriptors.NumRotatableBonds(mol)
-        min_bonds = config.get('min_rotatable_bonds', 1)
-        max_bonds = config.get('max_rotatable_bonds', 10)
+        min_bonds = config["min_rotatable_bonds"]
+        max_bonds = config["max_rotatable_bonds"]
         
         if num_rotatable_bonds < min_bonds or num_rotatable_bonds > max_bonds:
             return False, f"Rotatable bonds out of range: {num_rotatable_bonds} (expected {min_bonds}-{max_bonds})"
@@ -458,7 +458,8 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 smiles = get_smiles_from_reaction(molecule_name)
-                
+                logger.debug(f"Attempting to parse SMILES from DB for {molecule_name}: {smiles}")
+
                 if not smiles:
                     logger.debug(f"No SMILES found for {molecule_name}")
                     failed_count += 1
@@ -471,7 +472,7 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check banned atoms
-                banned_atoms = config.get('banned_atom_types', [])
+                banned_atoms = config["banned_atom_types"]
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
@@ -608,7 +609,7 @@ def load_molecules_from_csv_with_validation(
                     continue
                 
                 # Check banned atoms
-                banned_atoms = config.get('banned_atom_types', [])
+                banned_atoms = config["banned_atom_types"]
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
@@ -917,17 +918,25 @@ async def score_molecules_with_boltz_batched(
                 }
                 
                 num_molecules_to_score = len(molecules_to_score)
+                # subnet_config = {
+                #     'weekly_target': primary_target,
+                #     'num_antitargets': len(antitarget_proteins),
+                #     'binding_pocket': getattr(config, 'binding_pocket', None),
+                #     'max_distance': getattr(config, 'max_distance', None),
+                #     'force': getattr(config, 'force', False),
+                #     'num_molecules_boltz': num_molecules_to_score,
+                #     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                #     'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
+                #     'sample_selection': getattr(config, 'sample_selection', 'first'),
+                # }
+
+
                 subnet_config = {
-                    'weekly_target': primary_target,
-                    'num_antitargets': len(antitarget_proteins),
-                    'binding_pocket': getattr(config, 'binding_pocket', None),
-                    'max_distance': getattr(config, 'max_distance', None),
-                    'force': getattr(config, 'force', False),
-                    'num_molecules_boltz': num_molecules_to_score,
+                    'small_molecule_target': config['small_molecule_target'],
+                    'small_molecule_target_clip_interval': config['small_molecule_target_clip_interval'],
+                    'boltz_mode': getattr(config, 'boltz_mode', 'max'),
                     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
-                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
-                    'sample_selection': getattr(config, 'sample_selection', 'first'),
-                }
+                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization')                }
                 
                 final_block_hash = "0x" + "0" * 64
                 
@@ -935,11 +944,10 @@ async def score_molecules_with_boltz_batched(
                 start_time = time.time()
                 
                 def run_scoring():
-                    boltz.score_molecules_target(
+                    boltz.score_molecules(
                         valid_molecules_by_uid,
                         score_dict,
-                        subnet_config,
-                        final_block_hash
+                        subnet_config
                     )
                 
                 loop = asyncio.get_event_loop()
@@ -950,8 +958,15 @@ async def score_molecules_with_boltz_batched(
                 
                 uid = 0
                 smiles_to_score = {}
-                if uid in boltz.per_molecule_metric:
+                final_scores = getattr(boltz, 'final_boltz_scores', {}).get(uid, {})
+                if primary_target and primary_target in final_scores:
+                    smiles_to_score = final_scores[primary_target].copy()
+                elif final_scores:
+                    # Single-target fallback when key differs from primary_target string
+                    smiles_to_score = next(iter(final_scores.values())).copy()
+                elif hasattr(boltz, 'per_molecule_metric') and uid in boltz.per_molecule_metric:
                     smiles_to_score = boltz.per_molecule_metric[uid].copy()
+                if smiles_to_score:
                     logger.info(f"   ✅ Loaded {len(smiles_to_score)} unique SMILES scores")
                 
                 target_scores_list = None
@@ -1030,24 +1045,12 @@ def _import_boltz_wrapper():
     global BOLTZ_AVAILABLE, BoltzWrapper
     
     try:
-        BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
-        BOLTZ_SRC_DIR = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
-        
-        if not os.path.exists(BOLTZ_SCORING_DIR):
-            logger.warning(f"⚠️  Boltz-scoring directory not found at {BOLTZ_SCORING_DIR}")
-            return False
-        
-        if BOLTZ_SCORING_DIR not in sys.path:
-            sys.path.append(BOLTZ_SCORING_DIR)
+        BOLTZ_SRC_DIR = os.path.join(BASE_DIR, "boltz")
         
         if BOLTZ_SRC_DIR not in sys.path:
             sys.path.insert(0, BOLTZ_SRC_DIR)
         
-        boltz_utils_path = os.path.join(BOLTZ_SCORING_DIR, 'utils')
-        if os.path.exists(boltz_utils_path) and boltz_utils_path not in sys.path:
-            sys.path.insert(0, boltz_utils_path)
-        
-        from boltz.wrapper import BoltzWrapper as BW
+        from boltz_wrapper import BoltzWrapper as BW
         BoltzWrapper = BW
         BOLTZ_AVAILABLE = True
         logger.info(f"✅ BoltzWrapper imported successfully")
@@ -1230,8 +1233,8 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(200)
-            # top_200_df = molecules_df[20:120]
+            # top_200_df = molecules_df.head(200)
+            top_200_df = molecules_df[200:500]
             # top_200_df = molecules_df[10:110]
             
             # Update state with new molecules
@@ -1322,11 +1325,13 @@ async def main():
         logger.error(f"❌ Failed to load config: {e}")
         return
     
+
     # Initialize state
     state: Dict[str, Any] = {
         'config': config,
         'startup_complete': False,
         'current_challenge_targets': [],
+        'current_challenge_targets_clip_interval': [],
         'current_challenge_antitargets': [],
         'rxn_id': HARDCODED_RXN_ID,
         'top_pool': pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"]),
@@ -1336,15 +1341,9 @@ async def main():
         'boltz_wrapper': None,
         'top_200_df': pd.DataFrame(),
     }
-    
-    # Get target proteins from config
-    if hasattr(config, 'weekly_target'):
-        state['current_challenge_targets'] = [config.weekly_target]
-    elif isinstance(config, dict) and 'weekly_target' in config:
-        state['current_challenge_targets'] = [config['weekly_target']]
-    else:
-        logger.warning("No weekly_target found in config, using default")
-        state['current_challenge_targets'] = ['P31652']  # Default target
+
+    state['current_challenge_targets'] = config["small_molecule_target"]
+    state['current_challenge_targets_clip_interval'] = config["small_molecule_target_clip_interval"]
     
     logger.info(f"Target protein: {state['current_challenge_targets'][0]}")
     
@@ -1352,14 +1351,13 @@ async def main():
     logger.info("💾 Initializing score_results database...")
     init_score_results_db()
     logger.info(f"✅ Score results database initialized")
-    
     # Log validation config
     logger.info(
         f"✅ Loaded validation config:"
-        f"\n   - min_heavy_atoms: {config.get('min_heavy_atoms', 10) if isinstance(config, dict) else getattr(config, 'min_heavy_atoms', 10)}"
-        f"\n   - min_rotatable_bonds: {config.get('min_rotatable_bonds', 1) if isinstance(config, dict) else getattr(config, 'min_rotatable_bonds', 1)}"
-        f"\n   - max_rotatable_bonds: {config.get('max_rotatable_bonds', 10) if isinstance(config, dict) else getattr(config, 'max_rotatable_bonds', 10)}"
-        f"\n   - banned_atom_types: {config.get('banned_atom_types', []) if isinstance(config, dict) else getattr(config, 'banned_atom_types', [])}"
+        f"\n   - min_heavy_atoms: {config["min_heavy_atoms"]}"
+        f"\n   - min_rotatable_bonds: {config["min_rotatable_bonds"]}"
+        f"\n   - max_rotatable_bonds: {config["max_rotatable_bonds"]}"
+        f"\n   - banned_atom_types: {config["banned_atom_types"]}"
     )
     
     # Import BoltzWrapper
