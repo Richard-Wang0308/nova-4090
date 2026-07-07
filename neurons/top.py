@@ -517,8 +517,10 @@ def validate_molecule_heavy_atoms(
 ) -> Tuple[bool, str]:
     try:
         count     = get_heavy_atom_count(smiles)
-        min_atoms = config.get('min_heavy_atoms', 10)
-        max_atoms = config.get('max_heavy_atoms', 40)
+        # min_atoms = config["min_heavy_atoms"]
+        # max_atoms = config["max_heavy_atoms"]
+        min_atoms = 10
+        max_atoms = 40
         if count < min_atoms:
             return False, f"Insufficient heavy atoms: {count} < {min_atoms}"
         if count > max_atoms:
@@ -535,7 +537,7 @@ def validate_molecule_banned_atoms(
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return False, "Cannot parse SMILES for banned atom check"
-        banned = config.get('banned_atom_types', [])
+        banned = config["banned_atom_types"]
         if not banned:
             return True, ""
         if contains_atom_type(mol, banned):
@@ -553,8 +555,8 @@ def validate_molecule_rotatable_bonds(
         if mol is None:
             return False, "Cannot parse SMILES for rotatable bonds check"
         n_rot     = Descriptors.NumRotatableBonds(mol)
-        min_bonds = config.get('min_rotatable_bonds', 1)
-        max_bonds = config.get('max_rotatable_bonds', 10)
+        min_bonds = config["min_rotatable_bonds"]
+        max_bonds = config["max_rotatable_bonds"]
         if n_rot < min_bonds or n_rot > max_bonds:
             return False, (
                 f"Rotatable bonds out of range: {n_rot} "
@@ -991,204 +993,293 @@ def warm_start(
 # BoltzWrapper import + scoring
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _import_boltz_wrapper() -> bool:
+def _import_boltz_wrapper():
+    """Import BoltzWrapper following DataGenerator pattern."""
     global BOLTZ_AVAILABLE, BoltzWrapper
+    
     try:
-        BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
-        BOLTZ_SRC_DIR     = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
-        if not os.path.exists(BOLTZ_SCORING_DIR):
-            logger.warning(
-                f"⚠️  Boltz-scoring directory not found: {BOLTZ_SCORING_DIR}"
-            )
-            return False
-        for p in [BOLTZ_SCORING_DIR, BOLTZ_SRC_DIR]:
-            if p not in sys.path:
-                sys.path.insert(0, p)
-        boltz_utils = os.path.join(BOLTZ_SCORING_DIR, 'utils')
-        if os.path.exists(boltz_utils) and boltz_utils not in sys.path:
-            sys.path.insert(0, boltz_utils)
-        from boltz.wrapper import BoltzWrapper as BW
-        BoltzWrapper    = BW
+        BOLTZ_SRC_DIR = os.path.join(BASE_DIR, "boltz")
+        
+        if BOLTZ_SRC_DIR not in sys.path:
+            sys.path.insert(0, BOLTZ_SRC_DIR)
+        
+        from boltz_wrapper import BoltzWrapper as BW
+        BoltzWrapper = BW
         BOLTZ_AVAILABLE = True
-        logger.info("✅ BoltzWrapper imported successfully")
+        logger.info(f"✅ BoltzWrapper imported successfully")
         return True
-    except Exception as e:
+        
+    except ImportError as e:
         logger.warning(f"⚠️  Failed to import BoltzWrapper: {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️  Error setting up BoltzWrapper: {e}")
         return False
 
 
 async def score_molecules_with_boltz_batched(
     state: Dict[str, Any],
     molecules: List[Dict[str, Any]],
-    batch_size: int = 10,
+    batch_size: int = 10
 ) -> List[Dict[str, Any]]:
+    """
+    Score molecules using BoltzWrapper in batches.
+    
+    Args:
+        state: State dictionary
+        molecules: List of molecules to score
+        batch_size: Number of molecules per batch (default 10)
+        
+    Returns:
+        List of scored molecules
+    """
     if state.get('boltz_wrapper') is None:
         logger.warning("BoltzWrapper not available, skipping scoring")
         return molecules
+    
     if not molecules:
         return molecules
-
-    logger.info(
-        f"🔬 Scoring {len(molecules)} molecules (batch_size={batch_size})..."
-    )
+    
+    logger.info(f"🔬 Processing {len(molecules)} molecules for scoring in batches of {batch_size}...")
+    
     init_score_results_db()
-
-    all_scored    = []
+    
+    all_scored_molecules = []
     total_batches = (len(molecules) + batch_size - 1) // batch_size
-
+    
+    # Process molecules in batches
     for batch_idx in range(total_batches):
+        # Get batch
         start_idx = batch_idx * batch_size
-        batch     = molecules[start_idx: start_idx + batch_size]
-
+        end_idx = min(start_idx + batch_size, len(molecules))
+        batch = molecules[start_idx:end_idx]
+        
         logger.info(
-            f"📦 Batch {batch_idx + 1}/{total_batches}: {len(batch)} molecules"
+            f"📦 Batch {batch_idx + 1}/{total_batches}: "
+            f"Scoring {len(batch)} molecules"
         )
-
-        target_proteins     = state.get('current_challenge_targets', [])
-        antitarget_proteins = state.get('current_challenge_antitargets', [])
-        primary_target      = target_proteins[0] if target_proteins else None
-
-        db_scores = batch_get_scores_from_db([m['name'] for m in batch])
-
-        molecules_with_db  = []
-        molecules_in_hf    = []
+        
+        # Score this batch
         molecules_to_score = []
-
+        molecules_with_db_scores = []
+        molecules_in_hf = []
+        
+        target_proteins = state.get('current_challenge_targets', [])
+        primary_target = target_proteins[0] if target_proteins else None
+        
+        molecule_names = [mol['name'] for mol in batch]
+        db_scores = batch_get_scores_from_db(molecule_names)
+        
+        logger.info(f"   Found {len(db_scores)} molecules already in database")
+        
+        # Separate molecules by source
         for mol in batch:
-            if mol['name'] in db_scores:
-                mol['boltz_score']        = db_scores[mol['name']]
+            molecule_name = mol['name']
+            smiles = mol.get('smiles')
+            
+            if molecule_name in db_scores:
+                mol['boltz_score'] = db_scores[molecule_name]
                 mol['boltz_score_source'] = 'database'
-                molecules_with_db.append(mol)
+                molecules_with_db_scores.append(mol)
+                logger.debug(f"   ✓ {molecule_name}: score from DB = {db_scores[molecule_name]:.6f}")
                 continue
-            if primary_target and mol.get('smiles'):
+            
+            if primary_target and smiles:
                 try:
-                    if not molecule_unique_for_protein_hf(
-                        primary_target, mol['smiles']
-                    ):
+                    is_unique_hf = molecule_unique_for_protein_hf(primary_target, smiles)
+                    if not is_unique_hf:
+                        logger.debug(f"   ⏭️  {molecule_name}: already in HuggingFace, skipping")
                         molecules_in_hf.append(mol)
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"   Error checking HuggingFace for {molecule_name}: {e}")
+            
             molecules_to_score.append(mol)
-
+        
         logger.info(
-            f"   {len(molecules_with_db)} DB cache | "
-            f"{len(molecules_in_hf)} HF skip | "
-            f"{len(molecules_to_score)} → Boltz"
+            f"   Breakdown: {len(molecules_with_db_scores)} from DB, "
+            f"{len(molecules_in_hf)} in HuggingFace (skipped), "
+            f"{len(molecules_to_score)} need scoring"
         )
-
-        newly_scored = []
-        if molecules_to_score and target_proteins:
+        
+        newly_scored_molecules = []
+        if molecules_to_score:
+            logger.info(f"   Scoring {len(molecules_to_score)} new molecules with Boltz...")
+            
+            boltz = state['boltz_wrapper']
+            config = state['config']
+            target_proteins = state.get('current_challenge_targets', [])
+            antitarget_proteins = state.get('current_challenge_antitargets', [])
+            
+            if not target_proteins:
+                logger.warning("No target proteins available for scoring")
+                all_scored_molecules.extend(molecules_with_db_scores)
+                continue
+            
+            primary_target = target_proteins[0]
+            
             try:
-                boltz  = state['boltz_wrapper']
-                config = state['config']
-
-                output_dir = os.path.join(
-                    boltz.output_dir, 'boltz_results_inputs'
-                )
-                for d in ['processed/structures', 'processed/records',
-                          'processed/msa', 'predictions']:
-                    os.makedirs(os.path.join(output_dir, d), exist_ok=True)
-                try:
-                    import shutil
-                    ll = os.path.join(output_dir, 'lightning_logs')
-                    if os.path.exists(ll):
-                        shutil.rmtree(ll, ignore_errors=True)
-                except Exception:
-                    pass
-
+                output_dir = os.path.join(boltz.output_dir, 'boltz_results_inputs')
+                if os.path.exists(output_dir):
+                    try:
+                        lightning_logs_dir = os.path.join(output_dir, 'lightning_logs')
+                        if os.path.exists(lightning_logs_dir):
+                            import shutil
+                            shutil.rmtree(lightning_logs_dir, ignore_errors=True)
+                            logger.debug(f"Cleaned up old lightning_logs directory")
+                    except Exception as cleanup_err:
+                        logger.debug(f"Could not clean up old logs: {cleanup_err}")
+                
+                processed_dir = os.path.join(output_dir, 'processed')
+                structures_dir = os.path.join(processed_dir, 'structures')
+                records_dir = os.path.join(processed_dir, 'records')
+                msa_dir = os.path.join(processed_dir, 'msa')
+                predictions_dir = os.path.join(output_dir, 'predictions')
+                
+                os.makedirs(structures_dir, exist_ok=True)
+                os.makedirs(records_dir, exist_ok=True)
+                os.makedirs(msa_dir, exist_ok=True)
+                os.makedirs(predictions_dir, exist_ok=True)
+                
                 valid_molecules_by_uid = {
                     0: {
-                        'smiles': [m['smiles'] for m in molecules_to_score],
-                        'names':  [m['name']   for m in molecules_to_score],
+                        'smiles': [mol['smiles'] for mol in molecules_to_score],
+                        'names': [mol['name'] for mol in molecules_to_score]
                     }
                 }
+                
                 score_dict = {
                     0: {
-                        "target_scores": [[]], "antitarget_scores": [[]],
-                        "entropy": None, "entropy_boltz": None,
-                        "block_submitted": None, "push_time": "",
+                        "target_scores": [[]],
+                        "antitarget_scores": [[]],
+                        "entropy": None,
+                        "entropy_boltz": None,
+                        "block_submitted": None,
+                        "push_time": ""
                     }
                 }
+                
+                num_molecules_to_score = len(molecules_to_score)
+                # subnet_config = {
+                #     'weekly_target': primary_target,
+                #     'num_antitargets': len(antitarget_proteins),
+                #     'binding_pocket': getattr(config, 'binding_pocket', None),
+                #     'max_distance': getattr(config, 'max_distance', None),
+                #     'force': getattr(config, 'force', False),
+                #     'num_molecules_boltz': num_molecules_to_score,
+                #     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                #     'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
+                #     'sample_selection': getattr(config, 'sample_selection', 'first'),
+                # }
+
+
                 subnet_config = {
-                    'weekly_target':        primary_target,
-                    'num_antitargets':      len(antitarget_proteins),
-                    'binding_pocket':       getattr(config, 'binding_pocket', None),
-                    'max_distance':         getattr(config, 'max_distance', None),
-                    'force':                getattr(config, 'force', False),
-                    'num_molecules_boltz':  len(molecules_to_score),
-                    'boltz_metric':         getattr(config, 'boltz_metric', [
-                        'affinity_probability_binary', 'affinity_pred_value'
-                    ]),
-                    'combination_strategy': getattr(
-                        config, 'combination_strategy',
-                        'heavy_atom_normalization'
-                    ),
-                    'sample_selection':     getattr(
-                        config, 'sample_selection', 'first'
-                    ),
-                }
-
-                t0   = time.time()
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: boltz.score_molecules_target(
-                        valid_molecules_by_uid, score_dict,
-                        subnet_config, "0x" + "0" * 64,
+                    'small_molecule_target': config['small_molecule_target'],
+                    'small_molecule_target_clip_interval': config['small_molecule_target_clip_interval'],
+                    'boltz_mode': getattr(config, 'boltz_mode', 'max'),
+                    'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization')                }
+                
+                final_block_hash = "0x" + "0" * 64
+                
+                logger.info(f"   Running Boltz scoring for {len(molecules_to_score)} molecules...")
+                start_time = time.time()
+                
+                def run_scoring():
+                    boltz.score_molecules(
+                        valid_molecules_by_uid,
+                        score_dict,
+                        subnet_config
                     )
-                )
-                logger.info(f"   ✅ Boltz scored in {time.time()-t0:.2f}s")
-
-                uid                = 0
-                smiles_to_score    = boltz.per_molecule_metric.get(uid, {}).copy()
-                ts                 = score_dict[uid].get('target_scores', [[]])
-                target_scores_list = (
-                    ts[0] if ts and len(ts[0]) > 0 else None
-                )
-                avg_score = (
-                    score_dict[uid].get('boltz_score')
-                    if not smiles_to_score and not target_scores_list
-                    else None
-                )
-
-                for idx, mol in enumerate(molecules_to_score):
-                    smi   = mol['smiles']
-                    score = smiles_to_score.get(smi)
-                    if score is None and target_scores_list:
-                        score = (
-                            target_scores_list[idx]
-                            if idx < len(target_scores_list) else None
-                        )
-                    if score is None:
+                
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, run_scoring)
+                
+                elapsed = time.time() - start_time
+                logger.info(f"   ✅ Boltz scoring completed in {elapsed:.2f} seconds")
+                
+                uid = 0
+                smiles_to_score = {}
+                final_scores = getattr(boltz, 'final_boltz_scores', {}).get(uid, {})
+                if primary_target and primary_target in final_scores:
+                    smiles_to_score = final_scores[primary_target].copy()
+                elif final_scores:
+                    # Single-target fallback when key differs from primary_target string
+                    smiles_to_score = next(iter(final_scores.values())).copy()
+                elif hasattr(boltz, 'per_molecule_metric') and uid in boltz.per_molecule_metric:
+                    smiles_to_score = boltz.per_molecule_metric[uid].copy()
+                if smiles_to_score:
+                    logger.info(f"   ✅ Loaded {len(smiles_to_score)} unique SMILES scores")
+                
+                target_scores_list = None
+                target_scores = score_dict[uid].get('target_scores', [[]])
+                if target_scores and len(target_scores[0]) > 0:
+                    target_scores_list = target_scores[0] if isinstance(target_scores[0], list) else [target_scores[0]]
+                
+                avg_score = None
+                if not smiles_to_score and not target_scores_list:
+                    avg_score = score_dict[uid].get('boltz_score')
+                
+                for mol_idx, mol in enumerate(molecules_to_score):
+                    smiles = mol['smiles']
+                    score = None
+                    
+                    if smiles in smiles_to_score:
+                        score = smiles_to_score[smiles]
+                    elif target_scores_list and mol_idx < len(target_scores_list):
+                        score = target_scores_list[mol_idx]
+                    elif target_scores_list:
+                        try:
+                            valid_idx = valid_molecules_by_uid[uid]['smiles'].index(smiles)
+                            if valid_idx < len(target_scores_list):
+                                score = target_scores_list[valid_idx]
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    if score is None and avg_score is not None:
                         score = avg_score
+                    
                     mol['boltz_score'] = score
                     if score is not None:
-                        newly_scored.append(mol)
-
-                if newly_scored:
-                    write_scores_to_db(newly_scored)
-
+                        newly_scored_molecules.append(mol)
+                
+                if newly_scored_molecules:
+                    for mol in newly_scored_molecules:
+                        logger.debug(f"Molecule {mol['name']} scored {mol['boltz_score']}")
+                    write_scores_to_db(newly_scored_molecules)
+            
             except Exception as e:
-                logger.error(f"❌ Boltz scoring error: {e}")
-                import traceback; logger.error(traceback.format_exc())
-
+                logger.error(f"❌ Error scoring batch with Boltz: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        # Combine results from this batch
+        batch_results = molecules_with_db_scores + newly_scored_molecules
+        
         for mol in molecules_in_hf:
-            mol['boltz_score']        = None
+            mol['boltz_score'] = None
             mol['boltz_score_source'] = 'huggingface_skipped'
-
-        all_scored.extend(molecules_with_db + newly_scored + molecules_in_hf)
+            batch_results.append(mol)
+        
+        all_scored_molecules.extend(batch_results)
+        
         logger.info(
-            f"   ✅ Batch {batch_idx+1} done: "
-            f"{len(molecules_with_db)} DB + {len(newly_scored)} new + "
+            f"   ✅ Batch {batch_idx + 1} complete: "
+            f"{len(molecules_with_db_scores)} from DB, "
+            f"{len(newly_scored_molecules)} newly scored, "
             f"{len(molecules_in_hf)} skipped"
         )
-
-    return sorted(
-        all_scored,
-        key=lambda m: m.get('boltz_score') or float('-inf'),
-        reverse=True,
+    
+    # Sort all results by score
+    scored_molecules = sorted(
+        all_scored_molecules,
+        key=lambda m: m.get('boltz_score') if m.get('boltz_score') is not None else float('-inf'),
+        reverse=True
     )
+    
+    logger.info(f"✅ Batch scoring complete: {len(scored_molecules)} total molecules scored")
+    
+    return scored_molecules
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1900,22 +1991,14 @@ async def main():
     state: Dict[str, Any] = {
         'config':                        config,
         'current_challenge_targets':     [],
+        'current_challenge_targets_clip_interval': [],
         'current_challenge_antitargets': [],
         'boltz_wrapper':                 None,
     }
 
-    if hasattr(config, 'weekly_target'):
-        state['current_challenge_targets'] = [config.weekly_target]
-    elif isinstance(config, dict) and 'weekly_target' in config:
-        state['current_challenge_targets'] = [config['weekly_target']]
-    else:
-        logger.warning("⚠️  No weekly_target in config — using default P31652")
-        state['current_challenge_targets'] = ['P31652']
+    state['current_challenge_targets'] = config["small_molecule_target"]
+    state['current_challenge_targets_clip_interval'] = config["small_molecule_target_clip_interval"]
 
-    if hasattr(config, 'antitargets'):
-        state['current_challenge_antitargets'] = config.antitargets or []
-    elif isinstance(config, dict):
-        state['current_challenge_antitargets'] = config.get('antitargets', [])
 
     logger.info(f"🎯 Target:      {state['current_challenge_targets'][0]}")
     logger.info(f"🚫 Antitargets: {state['current_challenge_antitargets']}")

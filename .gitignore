@@ -1,6 +1,6 @@
 # .env
 timelock/
-boltz/boltz_tmp_files/*
+boltz/boltz_tmp_files/inputs/*.yaml
 __pycache__/
 *.pyc
 *.pyo

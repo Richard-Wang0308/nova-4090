@@ -5,6 +5,7 @@ import logging
 import asyncio
 import time
 import sqlite3
+import math
 import pandas as pd
 from typing import Any, Dict, List, Optional, Tuple, Set
 from pathlib import Path
@@ -94,7 +95,7 @@ def validate_molecule_banned_atoms(
         if mol is None:
             return False, "Cannot parse SMILES for banned atom check"
         
-        banned_atoms = config.get('banned_atom_types', [])
+        banned_atoms = config["banned_atom_types"]
         if not banned_atoms:
             return True, ""
         
@@ -117,8 +118,8 @@ def validate_molecule_rotatable_bonds(
             return False, "Cannot parse SMILES for rotatable bonds check"
         
         num_rotatable_bonds = Descriptors.NumRotatableBonds(mol)
-        min_bonds = config.get('min_rotatable_bonds', 1)
-        max_bonds = config.get('max_rotatable_bonds', 10)
+        min_bonds = config["min_rotatable_bonds"]
+        max_bonds = config["max_rotatable_bonds"]
         
         if num_rotatable_bonds < min_bonds or num_rotatable_bonds > max_bonds:
             return False, f"Rotatable bonds out of range: {num_rotatable_bonds} (expected {min_bonds}-{max_bonds})"
@@ -188,7 +189,6 @@ async def validate_molecule_complete(
     
     return len(errors) == 0, errors
 
-
 def load_components_from_db(role: str, rxn_id: int) -> List[Tuple[int, str, int]]:
     """
     Load component molecules from database.
@@ -257,9 +257,9 @@ def init_score_results_db(db_path: str = None) -> None:
         
         conn.commit()
         conn.close()
-        logger.info(f"✅ Initialized score_results database at {db_path}")
+        print(f"Initialized score_results database at {db_path}")
     except Exception as e:
-        logger.error(f"❌ Error initializing score_results database: {e}")
+        print(f"Error initializing score_results database: {e}")
 
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
@@ -304,15 +304,15 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         
         if to_insert:
             cursor.executemany(
-                "INSERT OR REPLACE INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
                 to_insert
             )
             conn.commit()
-            logger.info(f"✅ Wrote {len(to_insert)} scored molecules to database")
+            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
         
         conn.close()
     except Exception as e:
-        logger.error(f"❌ Error writing scores to database: {e}")
+        print(f"Error writing scores to database: {e}")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
@@ -335,10 +335,36 @@ def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> 
         results = cursor.fetchall()
         conn.close()
         
-        return {name: float(score) for name, score in results}
+        return {name: float(score) for name, score in results if math.isfinite(float(score))}
     except Exception as e:
         logger.debug(f"Error batch getting scores from DB: {e}")
         return {}
+
+
+def load_scored_molecule_names_from_db(
+    rxn_id: int,
+    db_path: str = None,
+) -> Set[str]:
+    """Return molecule names already present in the score results database."""
+    if db_path is None:
+        db_path = SCORE_RESULTS_DB
+
+    if not os.path.exists(db_path):
+        return set()
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT molecule_name FROM scored_molecules WHERE molecule_name LIKE ?",
+            (f"rxn:{rxn_id}:%",),
+        )
+        names = {row[0] for row in cursor.fetchall()}
+        conn.close()
+        return names
+    except Exception as e:
+        logger.debug(f"Error loading scored molecule names from DB: {e}")
+        return set()
 
 
 def load_molecules_from_db_with_validation(
@@ -386,7 +412,8 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 smiles = get_smiles_from_reaction(molecule_name)
-                
+                logger.debug(f"Attempting to parse SMILES from DB for {molecule_name}: {smiles}")
+
                 if not smiles:
                     logger.debug(f"No SMILES found for {molecule_name}")
                     failed_count += 1
@@ -399,15 +426,16 @@ def load_molecules_from_db_with_validation(
                     continue
                 
                 # Check banned atoms
-                banned_atoms = config.get('banned_atom_types', [])
+                banned_atoms = config["banned_atom_types"]
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
                     continue
                 
                 # Check heavy atom count
+                # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 10
-                max_heavy_atoms = 40    
+                max_heavy_atoms = 45
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
@@ -535,7 +563,7 @@ def load_molecules_from_csv_with_validation(
                     continue
                 
                 # Check banned atoms
-                banned_atoms = config.get('banned_atom_types', [])
+                banned_atoms = config["banned_atom_types"]
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
@@ -544,14 +572,12 @@ def load_molecules_from_csv_with_validation(
                 # Check heavy atom count
                 # min_heavy_atoms = config.get('min_heavy_atoms', 10)
                 min_heavy_atoms = 10
-                max_heavy_atoms = 40
-
+                max_heavy_atoms = 45
                 heavy_atom_count_val = get_heavy_atom_count(smiles)
                 if heavy_atom_count_val < min_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has insufficient heavy atoms ({heavy_atom_count_val} < {min_heavy_atoms}), skipping")
                     heavy_atom_count += 1
                     continue
-
                 if heavy_atom_count_val > max_heavy_atoms:
                     logger.debug(f"Molecule {molecule_name} has too many heavy atoms ({heavy_atom_count_val} > {max_heavy_atoms}), skipping")
                     heavy_atom_count += 1
@@ -655,20 +681,29 @@ def load_molecules_combined(
         return csv_df
     
     # Merge dataframes
+    # Add source column for tracking
     csv_df['source'] = 'csv'
     db_df['source'] = 'database'
     
+    # Combine dataframes
+    # combined_df = pd.concat([csv_df, db_df], ignore_index=True)
     combined_df = csv_df
     
     # Deduplicate by InChIKey, keeping the one with the highest score
+    # If scores are equal, prefer database (more recent scoring)
     combined_df = combined_df.sort_values(
         by=['score', 'source'],
-        ascending=[False, True],
+        ascending=[False, True],  # Higher score first, then 'database' before 'csv'
         na_position='last'
     )
     
+    # Keep first occurrence (highest score, or database if scores equal)
     combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
+    
+    # Remove source column
     combined_df = combined_df.drop(columns=['source'])
+    
+    # Sort by score
     combined_df = combined_df.sort_values(by='score', ascending=False, na_position='last')
     
     csv_count = len(csv_df)
@@ -837,17 +872,25 @@ async def score_molecules_with_boltz_batched(
                 }
                 
                 num_molecules_to_score = len(molecules_to_score)
+                # subnet_config = {
+                #     'weekly_target': primary_target,
+                #     'num_antitargets': len(antitarget_proteins),
+                #     'binding_pocket': getattr(config, 'binding_pocket', None),
+                #     'max_distance': getattr(config, 'max_distance', None),
+                #     'force': getattr(config, 'force', False),
+                #     'num_molecules_boltz': num_molecules_to_score,
+                #     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
+                #     'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
+                #     'sample_selection': getattr(config, 'sample_selection', 'first'),
+                # }
+
+
                 subnet_config = {
-                    'weekly_target': primary_target,
-                    'num_antitargets': len(antitarget_proteins),
-                    'binding_pocket': getattr(config, 'binding_pocket', None),
-                    'max_distance': getattr(config, 'max_distance', None),
-                    'force': getattr(config, 'force', False),
-                    'num_molecules_boltz': num_molecules_to_score,
+                    'small_molecule_target': config['small_molecule_target'],
+                    'small_molecule_target_clip_interval': config['small_molecule_target_clip_interval'],
+                    'boltz_mode': getattr(config, 'boltz_mode', 'max'),
                     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
-                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
-                    'sample_selection': getattr(config, 'sample_selection', 'first'),
-                }
+                    'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization')                }
                 
                 final_block_hash = "0x" + "0" * 64
                 
@@ -855,11 +898,10 @@ async def score_molecules_with_boltz_batched(
                 start_time = time.time()
                 
                 def run_scoring():
-                    boltz.score_molecules_target(
+                    boltz.score_molecules(
                         valid_molecules_by_uid,
                         score_dict,
-                        subnet_config,
-                        final_block_hash
+                        subnet_config
                     )
                 
                 loop = asyncio.get_event_loop()
@@ -870,8 +912,15 @@ async def score_molecules_with_boltz_batched(
                 
                 uid = 0
                 smiles_to_score = {}
-                if uid in boltz.per_molecule_metric:
+                final_scores = getattr(boltz, 'final_boltz_scores', {}).get(uid, {})
+                if primary_target and primary_target in final_scores:
+                    smiles_to_score = final_scores[primary_target].copy()
+                elif final_scores:
+                    # Single-target fallback when key differs from primary_target string
+                    smiles_to_score = next(iter(final_scores.values())).copy()
+                elif hasattr(boltz, 'per_molecule_metric') and uid in boltz.per_molecule_metric:
                     smiles_to_score = boltz.per_molecule_metric[uid].copy()
+                if smiles_to_score:
                     logger.info(f"   ✅ Loaded {len(smiles_to_score)} unique SMILES scores")
                 
                 target_scores_list = None
@@ -950,24 +999,12 @@ def _import_boltz_wrapper():
     global BOLTZ_AVAILABLE, BoltzWrapper
     
     try:
-        BOLTZ_SCORING_DIR = os.path.join(BASE_DIR, "boltz-scoring")
-        BOLTZ_SRC_DIR = os.path.join(BOLTZ_SCORING_DIR, "boltz", "src")
-        
-        if not os.path.exists(BOLTZ_SCORING_DIR):
-            logger.warning(f"⚠️  Boltz-scoring directory not found at {BOLTZ_SCORING_DIR}")
-            return False
-        
-        if BOLTZ_SCORING_DIR not in sys.path:
-            sys.path.append(BOLTZ_SCORING_DIR)
+        BOLTZ_SRC_DIR = os.path.join(BASE_DIR, "boltz")
         
         if BOLTZ_SRC_DIR not in sys.path:
             sys.path.insert(0, BOLTZ_SRC_DIR)
         
-        boltz_utils_path = os.path.join(BOLTZ_SCORING_DIR, 'utils')
-        if os.path.exists(boltz_utils_path) and boltz_utils_path not in sys.path:
-            sys.path.insert(0, boltz_utils_path)
-        
-        from boltz.wrapper import BoltzWrapper as BW
+        from boltz_wrapper import BoltzWrapper as BW
         BoltzWrapper = BW
         BOLTZ_AVAILABLE = True
         logger.info(f"✅ BoltzWrapper imported successfully")
@@ -1011,31 +1048,70 @@ async def generate_unique_molecules_enhanced(
         try:
             # Load component pool from database
             logger.info("📂 Loading component pools from database...")
+            uses_component_c = HARDCODED_RXN_ID in (3, 5)
             component_pool_A = load_components_from_db('A', HARDCODED_RXN_ID)
             component_pool_B = load_components_from_db('B', HARDCODED_RXN_ID)
-            component_pool_C = load_components_from_db('C', HARDCODED_RXN_ID)
+            component_pool_C = (
+                load_components_from_db('C', HARDCODED_RXN_ID)
+                if uses_component_c
+                else []
+            )
             
             if not component_pool_A or not component_pool_B:
                 logger.error("❌ Failed to load component pools from database")
-                logger.error(f"   A components: {len(component_pool_A)}, B components: {len(component_pool_B)}, C components: {len(component_pool_C)}")
+                logger.error(
+                    f"   A components: {len(component_pool_A)}, "
+                    f"B components: {len(component_pool_B)}, "
+                    f"C components: {len(component_pool_C)} "
+                    f"(C pool {'required' if uses_component_c else 'skipped'})"
+                )
                 return []
             
-            logger.info(f"✅ Loaded component pools: A={len(component_pool_A)}, B={len(component_pool_B)}, C={len(component_pool_C)}")
+            if uses_component_c and not component_pool_C:
+                logger.error(
+                    f"❌ Reaction rxn:{HARDCODED_RXN_ID} requires C components, "
+                    "but none were found in the database"
+                )
+                return []
+            
+            if uses_component_c:
+                logger.info(
+                    f"✅ Loaded component pools: A={len(component_pool_A)}, "
+                    f"B={len(component_pool_B)}, C={len(component_pool_C)}"
+                )
+            else:
+                logger.info(
+                    f"✅ Loaded component pools: A={len(component_pool_A)}, "
+                    f"B={len(component_pool_B)} (rxn:{HARDCODED_RXN_ID} is two-component)"
+                )
             
             # Initialize synthon library
             logger.info("🧪 Initializing SynthonLibrary...")
             synthon_lib = SynthonLibraryEnhanced(
                 molecules_A=component_pool_A,
                 molecules_B=component_pool_B,
-                molecules_C=component_pool_C if component_pool_C else None
+                molecules_C=component_pool_C if uses_component_c else None
             )
             
             # Extract component IDs
             component_ids_A = extract_component_ids(component_pool_A)
             component_ids_B = extract_component_ids(component_pool_B)
-            component_ids_C = extract_component_ids(component_pool_C) if component_pool_C else []
+            component_ids_C = (
+                extract_component_ids(component_pool_C)
+                if uses_component_c and component_pool_C
+                else []
+            )
             
-            logger.info(f"✅ Extracted component IDs: A={len(component_ids_A)}, B={len(component_ids_B)}, C={len(component_ids_C)}")
+            if uses_component_c:
+                logger.info(
+                    f"✅ Extracted component IDs: A={len(component_ids_A)}, "
+                    f"B={len(component_ids_B)}, C={len(component_ids_C)}"
+                )
+            else:
+                logger.info(
+                    f"✅ Extracted component IDs: A={len(component_ids_A)}, "
+                    f"B={len(component_ids_B)}"
+                )
             
             # Initialize generator
             logger.info("🔧 Initializing EnhancedMoleculeGenerator...")
@@ -1073,6 +1149,7 @@ async def generate_unique_molecules_enhanced(
     
     # Convert DataFrame to list of dicts for generation
     top_molecules = top_molecules_df.head(1000).to_dict('records')
+    generator.seed_populations_from_molecules(top_molecules)
     
     logger.info(
         f"🧬 Generating {desired_count} molecules using '{strategy}' strategy "
@@ -1080,8 +1157,20 @@ async def generate_unique_molecules_enhanced(
     )
     
     unique_molecules = []
-    generated_names = state.get('generated_molecules', set())
-    generated_inchikeys = state.get('generated_inchikeys', set())
+    db_scored_names = load_scored_molecule_names_from_db(HARDCODED_RXN_ID)
+    generated_names = set(state.get('generated_molecules', set()))
+    generated_names.update(db_scored_names)
+    generated_inchikeys = set(state.get('generated_inchikeys', set()))
+    generated_inchikeys.update(state.get('seen_inchikeys', set()))
+    for mol in top_molecules:
+        inchikey = mol.get('InChIKey')
+        if inchikey:
+            generated_inchikeys.add(inchikey)
+
+    logger.info(
+        f"🚫 Excluding {len(generated_names)} known molecule names "
+        f"({len(db_scored_names)} already scored in DB)"
+    )
     
     attempts = 0
     max_attempts = 1000
@@ -1095,6 +1184,7 @@ async def generate_unique_molecules_enhanced(
         'failed_banned_atoms': 0,
         'failed_rotatable_bonds': 0,
         'failed_hf_unique': 0,
+        'skipped_already_scored': 0,
     }
     
     while len(unique_molecules) < desired_count and attempts < max_attempts:
@@ -1117,8 +1207,10 @@ async def generate_unique_molecules_enhanced(
             if len(unique_molecules) >= desired_count:
                 break
             
-            # Skip if already generated
+            # Skip if already generated or previously scored
             if candidate.name in generated_names:
+                if candidate.name in db_scored_names:
+                    validation_stats['skipped_already_scored'] += 1
                 continue
             
             # Get SMILES from reaction
@@ -1171,10 +1263,6 @@ async def generate_unique_molecules_enhanced(
             validation_stats['passed_validation'] += 1
             validation_stats['total_generated'] += 1
         
-        # Update stagnation tracking
-        if top_molecules and 'score' in top_molecules[0]:
-            generator.update_stagnation(top_molecules[0]['score'])
-        
         await asyncio.sleep(0.01)
     
     state['generated_molecules'] = generated_names
@@ -1186,6 +1274,7 @@ async def generate_unique_molecules_enhanced(
         f"✅ Generated {len(unique_molecules)} valid molecules "
         f"(attempts: {attempts}, strategy: {strategy})"
         f"\n   Validation: {validation_stats['passed_validation']}/{validation_stats['total_generated']}"
+        f"\n   Skipped already scored: {validation_stats['skipped_already_scored']}"
         f"\n   Generator stats:"
         f"\n   - Total generated: {gen_stats['total_generated']}"
         f"\n   - Pop A size: {gen_stats['pop_a_size']}"
@@ -1262,6 +1351,17 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
             scored_molecules = await score_molecules_with_boltz_batched(
                 state, unique_molecules, batch_size=batch_size
             )
+
+            newly_scored_count = sum(
+                1 for m in scored_molecules
+                if m.get('boltz_score_source') != 'database'
+            )
+            if newly_scored_count < len(unique_molecules):
+                logger.info(
+                    f"   {newly_scored_count}/{len(unique_molecules)} molecules "
+                    f"required new Boltz scoring "
+                    f"({len(unique_molecules) - newly_scored_count} reused DB scores)"
+                )
             
             # Update generator with scores
             if 'enhanced_generator' in state and state['enhanced_generator'] is not None:
@@ -1290,6 +1390,14 @@ async def run_generation_and_scoring_loop_enhanced(state: Dict[str, Any]) -> Non
                     logger.info(
                         f"✅ Updated populations with {len(candidates)} scored molecules"
                     )
+
+            if state.get('enhanced_generator') is not None:
+                round_scores = [
+                    m.get('boltz_score') for m in scored_molecules
+                    if m.get('boltz_score') is not None and math.isfinite(m.get('boltz_score'))
+                ]
+                if round_scores:
+                    state['enhanced_generator'].update_stagnation(max(round_scores))
             
             # Find best molecule in this round
             best_in_round = None
@@ -1334,6 +1442,7 @@ async def main():
         'config': config,
         'startup_complete': False,
         'current_challenge_targets': [],
+        'current_challenge_targets_clip_interval': [],
         'current_challenge_antitargets': [],
         'rxn_id': HARDCODED_RXN_ID,
         'top_pool': pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"]),
@@ -1349,20 +1458,17 @@ async def main():
     }
     
     # Get target proteins from config
-    if hasattr(config, 'weekly_target'):
-        state['current_challenge_targets'] = [config.weekly_target]
-    elif isinstance(config, dict) and 'weekly_target' in config:
-        state['current_challenge_targets'] = [config['weekly_target']]
-    else:
-        logger.warning("No weekly_target found in config, using default")
-        state['current_challenge_targets'] = ['P31652']
-    
+    state['current_challenge_targets'] = config["small_molecule_target"]
+    state['current_challenge_targets_clip_interval'] = config["small_molecule_target_clip_interval"]
+        
     logger.info(f"🎯 Target protein: {state['current_challenge_targets'][0]}")
     
     # Initialize score_results database
     logger.info("💾 Initializing score_results database...")
     init_score_results_db()
-    logger.info(f"✅ Score results database initialized")
+    db_scored_names = load_scored_molecule_names_from_db(HARDCODED_RXN_ID)
+    state['generated_molecules'] = db_scored_names
+    logger.info(f"✅ Pre-loaded {len(db_scored_names)} scored molecule names from DB")
     
     # Import BoltzWrapper
     logger.info("🔬 Importing BoltzWrapper...")

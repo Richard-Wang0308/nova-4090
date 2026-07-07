@@ -457,6 +457,95 @@ class EnhancedMoleculeGenerator:
         self.stagnation_counter = 0
         self.last_best_score = float('-inf')
         self.generation_counter = 0
+
+    def seed_populations_from_molecules(self, molecules: List[Dict]) -> int:
+        """Warm-start DJA populations from scored seed molecules."""
+        if len(self.dja_manager.pop_a) >= 2:
+            return 0
+
+        seeded = 0
+        for mol in molecules:
+            name = mol.get('name', '')
+            if not name.startswith(f'rxn:{self.rxn_id}:'):
+                continue
+
+            parts = name.split(':')
+            if len(parts) not in (4, 5):
+                continue
+
+            try:
+                components = tuple(int(p) for p in parts[2:])
+            except ValueError:
+                continue
+
+            candidate = MoleculeCandidate(
+                name=name,
+                smiles=mol.get('smiles', ''),
+                components=components,
+                score=mol.get('score'),
+                generation_method='seed',
+            )
+            self.dja_manager.pop_a.append(candidate)
+            self.dja_manager.pop_b.append(candidate)
+            seeded += 1
+
+        if len(self.dja_manager.pop_a) > self.dja_manager.pop_a_size:
+            self.dja_manager.pop_a = sorted(
+                self.dja_manager.pop_a,
+                key=lambda m: m.score if m.score is not None else float('-inf'),
+                reverse=True,
+            )[:self.dja_manager.pop_a_size]
+
+        if len(self.dja_manager.pop_b) > self.dja_manager.pop_b_size:
+            self.dja_manager.pop_b = sorted(
+                self.dja_manager.pop_b,
+                key=lambda m: m.score if m.score is not None else float('-inf'),
+                reverse=True,
+            )[:self.dja_manager.pop_b_size]
+
+        if seeded:
+            logger.info(
+                f"[Seed] Warm-started populations with {seeded} molecules "
+                f"(pop_A={len(self.dja_manager.pop_a)}, "
+                f"pop_B={len(self.dja_manager.pop_b)})"
+            )
+        return seeded
+
+    def _generate_random_batch(self, count: int) -> List[MoleculeCandidate]:
+        """Sample random component combinations from the full building-block pools."""
+        candidates = []
+        pools = [self.component_ids_A, self.component_ids_B]
+        if self.component_ids_C:
+            pools.append(self.component_ids_C)
+
+        if not all(pools):
+            return candidates
+
+        for _ in range(count):
+            components = tuple(random.choice(pool) for pool in pools)
+            candidates.append(
+                MoleculeCandidate(
+                    name=self.dja_manager._make_reaction_name(list(components)),
+                    smiles='',
+                    components=components,
+                    generation_method='random',
+                )
+            )
+            self.generation_counter += 1
+
+        return candidates
+
+    def _generate_exploration_fallback(
+        self,
+        top_molecules: List[Dict],
+        count: int,
+    ) -> List[MoleculeCandidate]:
+        """Use global random sampling when populations are not yet seeded."""
+        if count <= 0:
+            return []
+        if len(self.dja_manager.pop_a) < 2:
+            return self._generate_random_batch(count)
+        return self._generate_crossover_batch(top_molecules, count)
     
     def generate_batch(
         self,
@@ -505,46 +594,57 @@ class EnhancedMoleculeGenerator:
                     self._generate_exploit_batch(top_molecules, exploit_count)
                 )
             else:
-                # Fallback to crossover if exploit not ready
                 candidates.extend(
-                    self._generate_crossover_batch(top_molecules, exploit_count)
+                    self._generate_exploration_fallback(top_molecules, exploit_count)
+                )
+
+            if len(candidates) < batch_size:
+                candidates.extend(
+                    self._generate_exploration_fallback(
+                        top_molecules,
+                        batch_size - len(candidates),
+                    )
                 )
         
         elif strategy == "dja":
             candidates = self._generate_dja_batch(top_molecules, batch_size)
-            # Fallback to crossover if DJA population not seeded
             if len(candidates) < batch_size // 2:
                 candidates.extend(
-                    self._generate_crossover_batch(
+                    self._generate_exploration_fallback(
                         top_molecules,
-                        batch_size - len(candidates)
+                        batch_size - len(candidates),
                     )
                 )
         
         elif strategy == "tabu":
             candidates = self._generate_tabu_batch(top_molecules, batch_size)
-            # Fallback to crossover if tabu population not seeded
             if len(candidates) < batch_size // 2:
                 candidates.extend(
-                    self._generate_crossover_batch(
+                    self._generate_exploration_fallback(
                         top_molecules,
-                        batch_size - len(candidates)
+                        batch_size - len(candidates),
                     )
                 )
         
         elif strategy == "exploit":
             candidates = self._generate_exploit_batch(top_molecules, batch_size)
-            # Fallback to crossover if exploit fails
             if len(candidates) < batch_size // 2:
                 candidates.extend(
-                    self._generate_crossover_batch(
+                    self._generate_exploration_fallback(
                         top_molecules,
-                        batch_size - len(candidates)
+                        batch_size - len(candidates),
                     )
                 )
         
         else:  # crossover (default)
             candidates = self._generate_crossover_batch(top_molecules, batch_size)
+            if len(candidates) < batch_size // 2:
+                candidates.extend(
+                    self._generate_exploration_fallback(
+                        top_molecules,
+                        batch_size - len(candidates),
+                    )
+                )
         
         return candidates
     
