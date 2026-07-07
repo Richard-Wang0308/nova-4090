@@ -1,0 +1,12 @@
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: APVRSLNCTLRDSQQKSLVMSGPYELKALHLQGQDMEQQVVFSMSFVQGEESNDKIPVALGLKEKNLYLSCVLKDDKPTLQLESVDPKNYPKKKMEKRFVFNKIEINNKLEFESAQFPNWYISTSQAENMPVFLGGTKGGQDITDFTMQFVSS
+    msa: /root/workspace/nova-4090/data/msa_files/P01584.a3m
+- ligand:
+    id: B
+    smiles: Cc1ccsc1C(O)C(O)CCn1cc(C2CCN(CC(C)C)CC2)nn1
+properties:
+- affinity:
+    binder: B

@@ -1233,8 +1233,8 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 continue
             
             # Get top 200 molecules (already sorted by score)
-            # top_200_df = molecules_df.head(200)
-            top_200_df = molecules_df[200:500]
+            top_200_df = molecules_df.head(200)
+            # top_200_df = molecules_df[200:500]
             # top_200_df = molecules_df[10:110]
             
             # Update state with new molecules

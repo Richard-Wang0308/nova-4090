@@ -130,6 +130,7 @@ class BoltzWrapper:
                 seed = 68,
                 affinity_mw_correction = self.config['affinity_mw_correction'],
                 override = self.config['override'],
+                no_kernels = self.config.get('no_kernels', True),
             )
             bt.logging.info(f"Boltz2 predictions complete")
 
@@ -162,6 +163,7 @@ class BoltzWrapper:
                 seed = self.base_seed,  
                 affinity_mw_correction = self.config['affinity_mw_correction'],
                 override = self.config['override'],
+                no_kernels = self.config.get('no_kernels', True),
                 num_workers = 0,
             )
             bt.logging.info(f"Boltz2 predictions complete")
