@@ -37,7 +37,7 @@ sys.path.append(BASE_DIR)
 
 # Database paths
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_2.sqlite")
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_1.sqlite")
 ADD_COLUMN_SCRIPT = os.path.join(BASE_DIR, "add_column.py")
 
 # ============================================================================
@@ -98,17 +98,18 @@ def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Opt
     try:
         return get_challenge_params_from_blockhash(
             block_hash=block_hash,
-            weekly_target=config.weekly_target,
-            num_antitargets=config.num_antitargets,
-            include_reaction=config.random_valid_reaction,
+            weekly_target=config['small_molecule_target'],
+            # num_antitargets=config.num_antitargets,
+            num_antitargets=1,
+            include_reaction=config['random_valid_reaction'],
         )
     except TypeError:
         return get_challenge_params_from_blockhash(
             block_hash=block_hash,
-            small_molecule_target=config.weekly_target,
-            nanobody_target=config.weekly_target,
-            num_antitargets=config.num_antitargets,
-            include_reaction=config.random_valid_reaction,
+            small_molecule_target=config['small_molecule_target'],
+            nanobody_target=config['nanobody_target'],
+            num_antitargets=config['num_antitargets'],
+            include_reaction=config['random_valid_reaction'],
         )
 
 
