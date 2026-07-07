@@ -91,26 +91,30 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Optional[Dict[str, Any]]:
     """
-    Handle both challenge helper signatures:
-    - weekly_target/num_antitargets (validator-style)
-    - small_molecule_target/nanobody_target/num_antitargets (challenge.py)
+    Resolve epoch challenge params using utils.challenge.get_challenge_params_from_blockhash.
     """
-    try:
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            weekly_target=config['small_molecule_target'],
-            # num_antitargets=config.num_antitargets,
-            num_antitargets=1,
-            include_reaction=config['random_valid_reaction'],
-        )
-    except TypeError:
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            small_molecule_target=config['small_molecule_target'],
-            nanobody_target=config['nanobody_target'],
-            num_antitargets=config['num_antitargets'],
-            include_reaction=config['random_valid_reaction'],
-        )
+    def _cfg(key: str, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    small_molecule_target = _cfg("small_molecule_target", "")
+    if isinstance(small_molecule_target, list):
+        small_molecule_target = small_molecule_target[0] if small_molecule_target else ""
+
+    nanobody_target = _cfg("nanobody_target", "")
+    if isinstance(nanobody_target, list):
+        nanobody_target = nanobody_target[0] if nanobody_target else ""
+
+    num_antitargets = _cfg("num_antitargets", 0) or 0
+
+    return get_challenge_params_from_blockhash(
+        block_hash=block_hash,
+        small_molecule_target=small_molecule_target,
+        nanobody_target=nanobody_target,
+        num_antitargets=num_antitargets,
+        include_reaction=_cfg("random_valid_reaction", True),
+    )
 
 
 # ============================================================================

@@ -60,26 +60,22 @@ def validate_rxn_only(allowed_reaction: str) -> bool:
 
 
 def resolve_challenge_params(block_hash: str, cfg: dict) -> dict:
-    """
-    Support both known helper signatures:
-    1) weekly_target/num_antitargets (utils.proteins)
-    2) small_molecule_target/nanobody_target/num_antitargets (utils.challenge)
-    """
-    try:
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            weekly_target=cfg.get("weekly_target"),
-            num_antitargets=cfg.get("num_antitargets", 0),
-            include_reaction=cfg.get("random_valid_reaction", True),
-        )
-    except TypeError:
-        return get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            small_molecule_target=cfg.get("weekly_target"),
-            nanobody_target=cfg.get("weekly_target"),
-            num_antitargets=cfg.get("num_antitargets", 0),
-            include_reaction=cfg.get("random_valid_reaction", True),
-        )
+    """Resolve challenge params using utils.challenge.get_challenge_params_from_blockhash."""
+    small_molecule_target = cfg.get("small_molecule_target", cfg.get("weekly_target", ""))
+    if isinstance(small_molecule_target, list):
+        small_molecule_target = small_molecule_target[0] if small_molecule_target else ""
+
+    nanobody_target = cfg.get("nanobody_target", small_molecule_target)
+    if isinstance(nanobody_target, list):
+        nanobody_target = nanobody_target[0] if nanobody_target else ""
+
+    return get_challenge_params_from_blockhash(
+        block_hash=block_hash,
+        small_molecule_target=small_molecule_target,
+        nanobody_target=nanobody_target,
+        num_antitargets=cfg.get("num_antitargets") or 0,
+        include_reaction=cfg.get("random_valid_reaction", True),
+    )
 
 
 async def main() -> None:

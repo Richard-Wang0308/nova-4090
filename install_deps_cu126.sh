@@ -34,6 +34,8 @@ python3 -m venv .venv && source .venv/bin/activate \
         && uv pip install maturin==1.8.3 \
         && uv pip install -e boltz-scoring/boltz
 
+pip install pytorch-lightning
+
 # Build timelock Python bindings (WASM)
 export PYO3_CROSS_PYTHON_VERSION="3.12" && cd timelock/wasm && ./wasm_build_py.sh && cd ../..
 
@@ -42,5 +44,7 @@ cd timelock/py && uv pip install --upgrade build && python3.12 -m build
 uv pip install timelock
 
 uv pip install async-substrate-interface==1.6.2
+
+pip install cuequivariance-torch cuequivariance-ops-cu12 cuequivariance-ops-torch-cu12
 
 echo "Installation complete."
