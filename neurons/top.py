@@ -849,6 +849,93 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
 # WARM START
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _top_pool_stats(
+    top_pool: pd.DataFrame,
+    num_molecules: int,
+) -> Tuple[float, float, Optional[str]]:
+    """Return (avg of top N, pool max score, best molecule name)."""
+    if top_pool.empty or 'score' not in top_pool.columns:
+        return 0.0, 0.0, None
+
+    scores = pd.to_numeric(top_pool['score'], errors='coerce').dropna()
+    if scores.empty:
+        return 0.0, 0.0, None
+
+    top_scores = pd.to_numeric(
+        top_pool.head(num_molecules)['score'], errors='coerce'
+    ).dropna()
+    pool_avg = float(top_scores.mean()) if not top_scores.empty else 0.0
+    pool_max = float(scores.max())
+    best_name = str(top_pool.iloc[0].get('name', '')) or None
+    return pool_avg, pool_max, best_name
+
+
+def _iteration_mode_str(
+    exploited_status: bool,
+    dpex: DPEXDJAState,
+    params: IterationParams,
+    early_exploit_used: bool = False,
+    exploit_attempted: bool = False,
+) -> str:
+    """Describe which generation strategy ran this iteration."""
+    if exploited_status:
+        return "EXPLOIT"
+
+    if not dpex.pop_A:
+        return "INIT(cold)"
+
+    base = "DJA+TABU" if params.synthon_lib is not None else "DJA"
+    if exploit_attempted:
+        base = f"EXPLOIT(failed)→{base}"
+    if early_exploit_used:
+        base = f"{base}+early-exploit"
+    return base
+
+
+def _log_pool_progress(
+    iteration: int,
+    pool_avg: float,
+    pool_max: float,
+    best_name: Optional[str],
+    prev_avg: Optional[float],
+    prev_max: Optional[float],
+    best_max_ever: float,
+    score_improvement_rate: float,
+    num_molecules: int,
+    mode: Optional[str] = None,
+) -> float:
+    """Log top-pool progress metrics; return updated all-time max."""
+    if pool_max > best_max_ever:
+        best_max_ever = pool_max
+
+    avg_delta = (pool_avg - prev_avg) if prev_avg is not None else None
+    max_delta = (pool_max - prev_max) if prev_max is not None else None
+
+    lines = [
+        "[PoolProgress] "
+        + (f"iter={iteration}" if iteration > 0 else "warm-start"),
+    ]
+    if mode:
+        lines.append(f"  mode             : {mode}")
+    lines.extend([
+        f"  top-{num_molecules} avg : {pool_avg:.6f}",
+        f"  pool max         : {pool_max:.6f}",
+    ])
+    if best_name:
+        lines.append(f"  best molecule    : {best_name}")
+    if avg_delta is not None:
+        lines.append(
+            f"  avg Δ            : {avg_delta:+.6f} "
+            f"({score_improvement_rate:+.2%} rel)"
+        )
+    if max_delta is not None:
+        lines.append(f"  max Δ            : {max_delta:+.6f}")
+    lines.append(f"  all-time max     : {best_max_ever:.6f}")
+
+    bt.logging.info("\n".join(lines))
+    return best_max_ever
+
+
 def warm_start(
     state:    Dict[str, Any],
     dpex:     DPEXDJAState,
@@ -964,11 +1051,14 @@ def warm_start(
 
     if not loaded_df.empty:
         scores = loaded_df['score'].dropna()
+        ws_avg, ws_max, ws_best = _top_pool_stats(top_pool, num_molecules)
         bt.logging.info(
             f"\n[WarmStart] ✅ Complete!\n"
             f"  Score range  : {scores.min():.6f} → {scores.max():.6f}\n"
             f"  Score mean   : {scores.mean():.6f}\n"
             f"  top_pool     : {len(top_pool)}\n"
+            f"  top_pool avg : {ws_avg:.6f} (top {num_molecules})\n"
+            f"  top_pool max : {ws_max:.6f}\n"
             f"  all_pool     : {len(all_pool)}\n"
             f"  pop_A        : {len(dpex.pop_A)}\n"
             f"  pop_B        : {len(dpex.pop_B)}\n"
@@ -978,6 +1068,11 @@ def warm_start(
             f"(rxn={RXN_ID} specific, balanced top+bottom+rand)\n"
             f"  Pipeline     : generate {GENERATE_MULTIPLIER}x "
             f"→ dedup → surrogate→{BOLTZ_BUDGET} → Boltz\n"
+        )
+        _log_pool_progress(
+            0, ws_avg, ws_max, ws_best,
+            None, None, ws_max, 0.0, num_molecules,
+            mode="WARM-START",
         )
     else:
         bt.logging.info(
@@ -1355,6 +1450,9 @@ async def find_solution(state: Dict[str, Any]) -> None:
         tanimoto_max_threshold=tanimoto_max_threshold,
     )
 
+    _, init_pool_max, _ = _top_pool_stats(top_pool, num_molecules)
+    best_max_ever = init_pool_max if not top_pool.empty else 0.0
+
     try:
         bt.logging.info("[Solution] Building synthon library...")
         t0 = time.time()
@@ -1485,6 +1583,8 @@ async def find_solution(state: Dict[str, Any]) -> None:
             data_early_exploit = pd.DataFrame(columns=["name", "smiles"])
             exploited_status   = False
             exploit_summary    = None
+            exploit_attempted  = False
+            current_mode       = "unknown"
 
             # ── Light early exploit (iter 1-20) ────────────────────────
             if not top_pool.empty and iteration <= 20:
@@ -1514,6 +1614,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
 
             # ── Full exploit mode ──────────────────────────────────────
             if params.use_exploit_mode and not top_pool.empty:
+                exploit_attempted = True
                 bt.logging.info(
                     "[Solution] Exploit: structure-guided deep search..."
                 )
@@ -1653,10 +1754,18 @@ async def find_solution(state: Dict[str, Any]) -> None:
                         ignore_index=True,
                     ).drop_duplicates(subset=["name"])
 
+            current_mode = _iteration_mode_str(
+                exploited_status=exploited_status,
+                dpex=dpex,
+                params=params,
+                early_exploit_used=not data_early_exploit.empty,
+                exploit_attempted=exploit_attempted,
+            )
+
             # ── Post-generation ────────────────────────────────────────
             bt.logging.info(
                 f"[Solution] {len(data)} candidates generated "
-                f"in {time.time()-iter_start:.2f}s"
+                f"({current_mode}) in {time.time()-iter_start:.2f}s"
             )
 
             if data.empty:
@@ -1841,10 +1950,11 @@ async def find_solution(state: Dict[str, Any]) -> None:
             )
 
             # ── InChIKey + pool update ─────────────────────────────────
-            prev_avg = (
-                top_pool.head(num_molecules)['score'].mean()
-                if not top_pool.empty else None
+            iter_prev_avg, iter_prev_max, _ = _top_pool_stats(
+                top_pool, num_molecules
             )
+            prev_avg = iter_prev_avg if not top_pool.empty else None
+            prev_max = iter_prev_max if not top_pool.empty else None
 
             scored_df["inchi"] = scored_df["smiles"].apply(
                 MoleculeUtils.generate_inchikey
@@ -1871,10 +1981,10 @@ async def find_solution(state: Dict[str, Any]) -> None:
             ).reset_index(drop=True)
 
             # ── Score improvement tracking ─────────────────────────────
-            current_avg = (
-                top_pool.head(num_molecules)['score'].mean()
-                if not top_pool.empty else None
+            pool_avg, pool_max, best_name = _top_pool_stats(
+                top_pool, num_molecules
             )
+            current_avg = pool_avg if not top_pool.empty else None
             if current_avg is not None and prev_avg is not None:
                 params.score_improvement_rate = (
                     (current_avg - prev_avg) / max(abs(prev_avg), 1e-6)
@@ -1917,27 +2027,10 @@ async def find_solution(state: Dict[str, Any]) -> None:
 
             # ── Iteration summary ──────────────────────────────────────
             iter_time = time.time() - iter_start
-            pool_avg  = (
-                top_pool.head(num_molecules)['score'].mean()
-                if not top_pool.empty else 0.0
-            )
-            pool_max  = (
-                top_pool['score'].max()
-                if not top_pool.empty else 0.0
-            )
-
-            if exploited_status:
-                mode_str = "EXPLOIT"
-            elif not dpex.pop_A:
-                mode_str = "INIT(cold)"
-            elif params.synthon_lib is not None:
-                mode_str = "DJA+TABU"
-            else:
-                mode_str = "DJA"
 
             bt.logging.info(
                 f"Iter {iteration:4d} | {iter_time:6.1f}s | "
-                f"Mode: {mode_str:12s} | rxn={RXN_ID} | "
+                f"Mode: {current_mode:24s} | rxn={RXN_ID} | "
                 f"popA={len(dpex.pop_A):4d} popB={len(dpex.pop_B):4d} | "
                 f"pool avg={pool_avg:.5f} max={pool_max:.5f} | "
                 f"Δ={params.score_improvement_rate:+.5f} | "
@@ -1946,11 +2039,22 @@ async def find_solution(state: Dict[str, Any]) -> None:
                 f"({surrogate.total_train_size} samples, rxn={RXN_ID})"
             )
 
+            best_max_ever = _log_pool_progress(
+                iteration,
+                pool_avg,
+                pool_max,
+                best_name,
+                prev_avg,
+                prev_max,
+                best_max_ever,
+                params.score_improvement_rate,
+                num_molecules,
+                mode=current_mode,
+            )
+
             if not top_pool.empty:
-                best = top_pool.iloc[0]
                 bt.logging.info(
-                    f"   🏆 Best: {best['name']} "
-                    f"(score={best['score']:.6f})"
+                    f"   🏆 Best: {best_name} (score={pool_max:.6f})"
                 )
 
             await asyncio.sleep(2)
@@ -1958,10 +2062,10 @@ async def find_solution(state: Dict[str, Any]) -> None:
     except KeyboardInterrupt:
         bt.logging.info(f"\n🛑 Stopping DPEX-DJA loop (rxn={RXN_ID})...")
         if not top_pool.empty:
-            best = top_pool.iloc[0]
+            _, final_max, final_best = _top_pool_stats(top_pool, num_molecules)
             bt.logging.info(
-                f"Final best: {best['name']} "
-                f"(score={best['score']:.6f})"
+                f"Final best: {final_best} (score={final_max:.6f}) | "
+                f"all-time max={best_max_ever:.6f}"
             )
         raise
 
