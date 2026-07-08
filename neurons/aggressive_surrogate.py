@@ -5,8 +5,14 @@ Pipeline per iteration:
   1. Generate  n_base_samples * GENERATE_MULTIPLIER (5)  candidates  (≈ 2000)
   2. Resolve SMILES
   3. Dedup against seen            → removes already-scored molecules FIRST
-  4. Surrogate filter              → top BOLTZ_BUDGET (100) from fresh only
-  5. Boltz score                   → 100 molecules with heavy model
+  4. Surrogate filter              → keeps top SURROGATE_KEEP_RATIO (20%)
+                                      of fresh candidates, ALWAYS applied
+                                      (every mode: DJA/TABU/EXPLOIT/cold),
+                                      but only once training data
+                                      >= SURROGATE_MIN_TRAIN_SIZE (6000).
+                                      Before that: hard-cap at BOLTZ_BUDGET
+                                      to protect Boltz.
+  5. Boltz score                   → whatever survives step 4 (heavy model)
 
 Surrogate is trained ONLY on rxn-specific data (rxn:{RXN_ID}:* rows).
 Balanced anchor sampling: top-33% + bottom-33% + random-10%
@@ -74,11 +80,22 @@ BOLTZ_AVAILABLE = False
 BoltzWrapper    = None
 
 # ── Surrogate pipeline constants ──────────────────────────────────────────
-# ✅ FIX 1: was accidentally set to 1 — must be 5 so surrogate has a large
-# diverse pool to filter from. With multiplier=1 barely enough fresh
-# candidates survive dedup to fill BOLTZ_BUDGET.
 GENERATE_MULTIPLIER = 5    # n_base_samples * 5  ≈ 2000
-BOLTZ_BUDGET        = 100  # hard cap sent to Boltz after surrogate filter
+
+# ✅ FIX: BOLTZ_BUDGET is now ONLY a pre-training safety cap. Once the
+# surrogate has enough data (SURROGATE_MIN_TRAIN_SIZE), the ratio-based
+# filter (SURROGATE_KEEP_RATIO) takes over and BOLTZ_BUDGET is ignored.
+BOLTZ_BUDGET = 600  # hard cap used ONLY while surrogate is not yet trained
+
+# ✅ NEW: surrogate keeps only this fraction of the fresh (deduped) pool
+# before sending to Boltz — applied in EVERY iteration mode (DJA/TABU/
+# EXPLOIT/cold), not just "normal" generation.
+SURROGATE_KEEP_RATIO = 0.90  # keep top 20%
+
+# ✅ NEW: surrogate is not considered "ready" until total training data
+# (anchors + live) reaches this size. Below this, fall back to
+# BOLTZ_BUDGET hard-cap (no ML-based ranking yet).
+SURROGATE_MIN_TRAIN_SIZE = 5000
 
 # ── fingerprint generators ────────────────────────────────────────────────
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(
@@ -125,7 +142,9 @@ def parse_args() -> int:
                 f"(surrogate: rxn:{RXN_ID} rows only)")
     logger.info(
         f"✅ Pipeline = generate {GENERATE_MULTIPLIER}x "
-        f"→ dedup → surrogate→{BOLTZ_BUDGET} → Boltz"
+        f"→ dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}%, "
+        f"active once ≥{SURROGATE_MIN_TRAIN_SIZE} samples, else hard-cap "
+        f"{BOLTZ_BUDGET}) → Boltz [ALL modes]"
     )
     return RXN_ID
 
@@ -312,14 +331,25 @@ class SurrogateModel:
       1. Trained ONLY on rxn:{RXN_ID} molecules — no cross-rxn noise.
       2. Balanced anchor sampling: top-33% + bottom-33% + random-10%
          → learns the good/bad BOUNDARY, not just what "good" looks like.
-         A model trained only on top-50% assigns high scores to everything
-         and cannot discriminate between mediocre and bad candidates.
       3. Live training data also balanced: top-40% + bottom-20% + recent-40%
       4. Anchor data (warm-start) is never evicted.
       5. Always filters AFTER dedup — input is only fresh unseen molecules.
+
+      ✅ FIX (ratio + always-on):
+      6. min_train_size = SURROGATE_MIN_TRAIN_SIZE (6000). Surrogate is
+         considered "usable" (is_trained=True) only once total training
+         data (anchors + live) reaches 6000 — this keeps the RF model
+         well-supported before it starts gatekeeping Boltz.
+      7. Once usable, the surrogate filter is applied in EVERY iteration
+         mode (DJA, TABU, EXPLOIT, cold-init) — Boltz is expensive, so
+         it should never see raw/unfiltered candidates once the surrogate
+         is ready. Filtering keeps only SURROGATE_KEEP_RATIO (20%) of the
+         fresh pool, regardless of mode.
+      8. Non-finite (inf/-inf/nan) scores are filtered out before ever
+         reaching anchor_y / y_train / model.fit().
     """
 
-    def __init__(self, max_training_samples: int = 6000):
+    def __init__(self, max_training_samples: int = 5000):
         self.model = RandomForestRegressor(
             n_estimators=100,
             max_depth=12,
@@ -333,7 +363,10 @@ class SurrogateModel:
         self.anchor_y: list       = []
         self.X_train: list        = []
         self.y_train: list        = []
-        self.min_train_size       = 80
+        # ✅ FIX: was 80 — now gated at SURROGATE_MIN_TRAIN_SIZE (6000) so
+        # the surrogate only activates once it has a large, reliable
+        # rxn-specific training set.
+        self.min_train_size       = SURROGATE_MIN_TRAIN_SIZE
         self.max_training_samples = max_training_samples
         self.last_train_iteration = 0
         self.train_interval       = 2
@@ -351,12 +384,8 @@ class SurrogateModel:
         """
         Add warm-start rxn-specific data as permanent anchors (never evicted).
 
-        ✅ FIX: Balanced sampling — top-33% + bottom-33% + random-10%.
-        The surrogate needs to know what BAD looks like to rank correctly.
-        Keeping only top-50% produces a model that gives high predicted
-        scores to almost everything and cannot filter effectively.
-
-        ✅ FIX: Drop non-finite (inf/-inf/nan) scores BEFORE any indexing
+        Balanced sampling — top-33% + bottom-33% + random-10%.
+        Drops non-finite (inf/-inf/nan) scores BEFORE any indexing
         or sampling — a single inf/nan value breaks RandomForestRegressor
         training downstream and must never reach anchor_y.
         """
@@ -369,7 +398,7 @@ class SurrogateModel:
         finite_mask = np.isfinite(scores_arr)
         n_dropped   = int((~finite_mask).sum())
         if n_dropped:
-            bt.logging.warning(
+            logger.warning(
                 f"[SURROGATE] add_anchor_data: dropping {n_dropped} "
                 f"non-finite (inf/-inf/nan) score(s) before anchoring"
             )
@@ -381,7 +410,7 @@ class SurrogateModel:
 
         n = len(scores_arr)
         if n == 0:
-            bt.logging.warning(
+            logger.warning(
                 "[SURROGATE] add_anchor_data: no finite scores left — "
                 "skipping anchor add"
             )
@@ -410,19 +439,18 @@ class SurrogateModel:
                 self.anchor_y.append(float(scores_arr[i]))
                 added += 1
 
-        bt.logging.info(
+        logger.info(
             f"[SURROGATE] Anchored {added} rxn-specific samples "
             f"(top={n_top} bottom={n_bottom} rand={n_rand} "
             f"from {n} finite total, {n_dropped} non-finite dropped, "
             f"never evicted)"
         )
 
-
     def add_training_data(self, smiles_list: list, scores: list):
         """
         Add live (evictable) training data — also balanced top+bottom+recent.
 
-        ✅ FIX: Drop non-finite (inf/-inf/nan) scores BEFORE subsampling
+        Drops non-finite (inf/-inf/nan) scores BEFORE subsampling
         or appending to X_train/y_train — prevents inf from poisoning
         the live training buffer and breaking model.fit() later.
         """
@@ -437,7 +465,7 @@ class SurrogateModel:
         finite_mask = np.isfinite(scores_arr)
         n_dropped   = int((~finite_mask).sum())
         if n_dropped:
-            bt.logging.warning(
+            logger.warning(
                 f"[SURROGATE] add_training_data: dropping {n_dropped} "
                 f"non-finite (inf/-inf/nan) score(s)"
             )
@@ -486,7 +514,6 @@ class SurrogateModel:
             self.X_train   = [self.X_train[i] for i in keep_indices]
             self.y_train   = [self.y_train[i]  for i in keep_indices]
 
-
     def train(self, iteration: int = 0):
         if self.is_trained and (
             iteration - self.last_train_iteration
@@ -502,13 +529,14 @@ class SurrogateModel:
             self.model.fit(np.array(X_all), np.array(y_all))
             self.is_trained           = True
             self.last_train_iteration = iteration
-            bt.logging.info(
+            logger.info(
                 f"[SURROGATE] Trained in {time.time()-t0:.2f}s on "
                 f"{len(self.anchor_X)} anchors + {len(self.X_train)} live "
-                f"= {len(X_all)} total (rxn={RXN_ID} only)"
+                f"= {len(X_all)} total (rxn={RXN_ID} only) | "
+                f"min_train_size={self.min_train_size}"
             )
         except Exception as e:
-            bt.logging.warning(f"Surrogate training failed: {e}")
+            logger.warning(f"Surrogate training failed: {e}")
             self.is_trained = False
 
     def predict(self, smiles_list: list) -> np.ndarray:
@@ -518,21 +546,36 @@ class SurrogateModel:
             fps = [self._safe_fp(s) for s in smiles_list]
             return self.model.predict(np.array(fps))
         except Exception as e:
-            bt.logging.warning(f"Surrogate prediction failed: {e}")
+            logger.warning(f"Surrogate prediction failed: {e}")
             return np.array([0.0] * len(smiles_list))
 
     def filter_candidates(
         self,
         data: pd.DataFrame,
-        n_keep: int,
+        keep_ratio: float = SURROGATE_KEEP_RATIO,
         smiles_col: str = "smiles",
+        min_keep: int = 1,
     ) -> pd.DataFrame:
         """
-        Keep top n_keep by predicted score.
+        Keep top `keep_ratio` fraction (e.g. 0.20 = top 20%) of `data`
+        by predicted score.
+
+        ✅ FIX: ratio-based instead of a fixed n_keep count — regardless
+        of how many fresh candidates survive dedup (could be 300 or
+        3000), only SURROGATE_KEEP_RATIO of them are sent onward to
+        Boltz. This keeps Boltz load proportional and predictable.
+
         Must be called AFTER dedup — input must be only fresh molecules.
+        Applies in EVERY iteration mode (DJA/TABU/EXPLOIT/cold) — the
+        caller no longer special-cases exploit mode.
         """
-        if not self.is_trained or data.empty or len(data) <= n_keep:
+        if not self.is_trained or data.empty:
             return data
+
+        n_keep = max(min_keep, int(round(len(data) * keep_ratio)))
+        if n_keep >= len(data):
+            return data
+
         pred = self.predict(data[smiles_col].tolist())
         data = data.copy()
         data["_pred"] = pred
@@ -541,9 +584,10 @@ class SurrogateModel:
             .head(n_keep)
             .drop(columns=["_pred"])
         )
-        bt.logging.info(
+        logger.info(
             f"[SURROGATE] {len(data)} → {len(filtered)} "
-            f"(dropped {len(data)-len(filtered)} low-quality before Boltz)"
+            f"(kept top {keep_ratio*100:.0f}%, "
+            f"dropped {len(data)-len(filtered)} low-quality before Boltz)"
         )
         return filtered.reset_index(drop=True)
 
@@ -573,8 +617,6 @@ def validate_molecule_heavy_atoms(
 ) -> Tuple[bool, str]:
     try:
         count     = get_heavy_atom_count(smiles)
-        # min_atoms = config["min_heavy_atoms"]
-        # max_atoms = config["max_heavy_atoms"]
         min_atoms = 10
         max_atoms = 40
         if count < min_atoms:
@@ -688,7 +730,6 @@ def write_scores_to_db(
             except (TypeError, ValueError):
                 skipped_non_finite += 1
                 continue
-            # ✅ FIX: reject inf / -inf / nan before persisting
             if not np.isfinite(score_f):
                 skipped_non_finite += 1
                 continue
@@ -772,6 +813,8 @@ def load_molecules_from_csv(csv_path: str, rxn_id: int) -> pd.DataFrame:
         result = df[['molecule_name', 'smiles', 'InChIKey', 'score']].copy()
         result = result.rename(columns={'molecule_name': 'name'})
         result['score'] = pd.to_numeric(result['score'], errors='coerce')
+        # ✅ FIX: reject inf/-inf alongside NaN
+        result.loc[~np.isfinite(result['score']), 'score'] = np.nan
         result = result.drop_duplicates(subset=['InChIKey'], keep='first')
         result = result.sort_values(
             by='score', ascending=False, na_position='last'
@@ -809,7 +852,6 @@ def load_molecules_from_db(db_path: str, rxn_id: int) -> pd.DataFrame:
         non_finite    = 0
         for mol_name, score in db_results:
             try:
-                # ✅ FIX: reject inf / -inf / nan rows read from disk
                 score_f = None
                 if score is not None:
                     score_f = float(score)
@@ -885,10 +927,7 @@ def load_molecules_combined(
 
 def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
     """
-    ✅ FIX: Load ONLY rxn-specific rows from mols.csv for surrogate training.
-    Cross-rxn data introduces noise — molecules from other reactions have
-    different scaffold distributions and score ranges, degrading the
-    surrogate's ability to rank candidates for THIS reaction accurately.
+    Load ONLY rxn-specific rows from mols.csv for surrogate training.
     """
     csv_path = TRAINING_CSV
     if not os.path.exists(csv_path):
@@ -903,7 +942,6 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
             df['molecule_name'].astype(str).str.strip().str.lstrip('\ufeff')
         )
 
-        # ✅ Filter to rxn-specific rows only
         prefix = f"rxn:{rxn_id}:"
         df     = df[
             df['molecule_name'].str.startswith(prefix, na=False)
@@ -923,6 +961,8 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
         df = df[df['smiles'].notna() & (df['smiles'] != '')]
         result = df[['smiles', 'score']].copy()
         result['score'] = pd.to_numeric(result['score'], errors='coerce')
+        # ✅ FIX: reject inf/-inf alongside NaN
+        result.loc[~np.isfinite(result['score']), 'score'] = np.nan
         result = result[result['score'].notna()]
         result = result.drop_duplicates(subset=['smiles']).reset_index(drop=True)
         logger.info(
@@ -1023,7 +1063,7 @@ def _log_pool_progress(
         lines.append(f"  max Δ            : {max_delta:+.6f}")
     lines.append(f"  all-time max     : {best_max_ever:.6f}")
 
-    bt.logging.info("\n".join(lines))
+    logger.info("\n".join(lines))
     return best_max_ever
 
 
@@ -1039,26 +1079,28 @@ def warm_start(
     tanimoto_max_threshold: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     config = state['config']
-    bt.logging.info(
+    logger.info(
         f"\n{'='*60}\n"
         f"[WarmStart] rxn={RXN_ID} | "
         f"pop-seed : rxn{RXN_ID}.csv + score_results_{RXN_ID}.sqlite\n"
         f"[WarmStart] surrogate: mols.csv filtered to rxn:{RXN_ID} only\n"
+        f"[WarmStart] surrogate activates once total training data "
+        f">= {SURROGATE_MIN_TRAIN_SIZE}\n"
         f"{'='*60}"
     )
 
     loaded_df = load_molecules_combined(RXN_ID, config)
 
     if loaded_df.empty:
-        bt.logging.warning("[WarmStart] No rxn-specific data — cold start")
+        logger.warning("[WarmStart] No rxn-specific data — cold start")
     else:
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] Rxn-specific: {len(loaded_df)} molecules loaded"
         )
         all_pool = loaded_df.rename(columns={'InChIKey': 'inchi'}).copy()
         ranker.update(loaded_df)
         ranker.warm_start_decay(n_historical_rounds=50)
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] ComponentRanker: "
             f"{len(ranker.q_A)} A | {len(ranker.q_B)} B "
             f"(EMA decayed 50 rounds)"
@@ -1067,7 +1109,7 @@ def warm_start(
         dpex.pop_A = top_for_A.rename(
             columns={'InChIKey': 'inchi'}
         ).to_dict('records')
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] pop_A: {len(dpex.pop_A)} | "
             f"best={top_for_A['score'].max():.6f} | "
             f"avg={top_for_A['score'].mean():.6f}"
@@ -1079,11 +1121,11 @@ def warm_start(
         dpex.pop_B = diverse_elites.rename(
             columns={'InChIKey': 'inchi'}
         ).to_dict('records')
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] pop_B: {len(dpex.pop_B)} diverse elites"
         )
         params.seen_molecules = set(loaded_df['name'].tolist())
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] seen_molecules: {len(params.seen_molecules)}"
         )
         top_pool = select_tanimoto_diverse(
@@ -1094,56 +1136,57 @@ def warm_start(
         ).reset_index(drop=True)
 
     # ── Surrogate: rxn-specific training only ─────────────────────────
-    # ✅ FIX: load_training_csv_for_surrogate now filters to rxn:{RXN_ID}
-    # Priority: loaded_df (CSV+DB combined) > mols.csv rxn rows
-    # loaded_df is always preferred as it is the most complete source.
-    bt.logging.info(
+    logger.info(
         f"[WarmStart] Loading surrogate anchors "
         f"(rxn={RXN_ID} specific only)..."
     )
 
     # Use loaded_df as primary anchor source (already rxn-specific)
-    if not loaded_df.empty and len(loaded_df) >= surrogate.min_train_size:
+    if not loaded_df.empty:
         surrogate.add_anchor_data(
             loaded_df['smiles'].tolist(),
             loaded_df['score'].tolist(),
         )
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] Surrogate anchors from loaded_df: "
-            f"{len(loaded_df)} rxn={RXN_ID} molecules"
+            f"{len(loaded_df)} rxn={RXN_ID} molecules "
+            f"(total anchors so far: {len(surrogate.anchor_X)})"
         )
-    else:
-        # Fallback: try mols.csv filtered to this rxn
-        training_df = load_training_csv_for_surrogate(RXN_ID)
-        if len(training_df) >= surrogate.min_train_size:
-            surrogate.add_anchor_data(
-                training_df['smiles'].tolist(),
-                training_df['score'].tolist(),
-            )
-            bt.logging.info(
-                f"[WarmStart] Surrogate anchors from mols.csv "
-                f"(rxn={RXN_ID} filtered): {len(training_df)} molecules"
-            )
-        else:
-            bt.logging.warning(
-                f"[WarmStart] Insufficient rxn-specific data for surrogate "
-                f"({max(len(loaded_df), 0)} loaded_df + "
-                f"mols.csv rows < {surrogate.min_train_size}) — "
-                f"will train after first scored batch"
-            )
 
-    if len(surrogate.anchor_X) >= surrogate.min_train_size:
+    # Also merge in mols.csv (additive — helps reach the 6000 threshold
+    # faster since loaded_df alone may not have enough rows).
+    training_df = load_training_csv_for_surrogate(RXN_ID)
+    if not training_df.empty:
+        surrogate.add_anchor_data(
+            training_df['smiles'].tolist(),
+            training_df['score'].tolist(),
+        )
+        logger.info(
+            f"[WarmStart] Surrogate anchors from mols.csv "
+            f"(rxn={RXN_ID} filtered): +{len(training_df)} molecules "
+            f"(total anchors so far: {len(surrogate.anchor_X)})"
+        )
+
+    if surrogate.total_train_size < surrogate.min_train_size:
+        logger.warning(
+            f"[WarmStart] Insufficient rxn-specific data for surrogate "
+            f"({surrogate.total_train_size} < {surrogate.min_train_size}) "
+            f"— will hard-cap at {BOLTZ_BUDGET} until enough live "
+            f"Boltz scores accumulate"
+        )
+
+    if surrogate.total_train_size >= surrogate.min_train_size:
         surrogate.train(iteration=0)
-        bt.logging.info(
+        logger.info(
             f"[WarmStart] Surrogate pre-trained: "
-            f"{len(surrogate.anchor_X)} anchors | "
+            f"{surrogate.total_train_size} samples | "
             f"trained={surrogate.is_trained}"
         )
 
     if not loaded_df.empty:
         scores = loaded_df['score'].dropna()
         ws_avg, ws_max, ws_best = _top_pool_stats(top_pool, num_molecules)
-        bt.logging.info(
+        logger.info(
             f"\n[WarmStart] ✅ Complete!\n"
             f"  Score range  : {scores.min():.6f} → {scores.max():.6f}\n"
             f"  Score mean   : {scores.mean():.6f}\n"
@@ -1155,10 +1198,12 @@ def warm_start(
             f"  pop_B        : {len(dpex.pop_B)}\n"
             f"  seen         : {len(params.seen_molecules)}\n"
             f"  Surrogate    : trained={surrogate.is_trained} "
-            f"anchors={len(surrogate.anchor_X)} "
-            f"(rxn={RXN_ID} specific, balanced top+bottom+rand)\n"
+            f"total_train_size={surrogate.total_train_size} "
+            f"(min={surrogate.min_train_size}, rxn={RXN_ID} specific)\n"
             f"  Pipeline     : generate {GENERATE_MULTIPLIER}x "
-            f"→ dedup → surrogate→{BOLTZ_BUDGET} → Boltz\n"
+            f"→ dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}% "
+            f"if trained, else hard-cap {BOLTZ_BUDGET}) → Boltz "
+            f"[ALL modes]\n"
         )
         _log_pool_progress(
             0, ws_avg, ws_max, ws_best,
@@ -1166,10 +1211,10 @@ def warm_start(
             mode="WARM-START",
         )
     else:
-        bt.logging.info(
+        logger.info(
             f"\n[WarmStart] ⚠️  Cold start.\n"
             f"  Surrogate: trained={surrogate.is_trained} "
-            f"anchors={len(surrogate.anchor_X)}\n"
+            f"total_train_size={surrogate.total_train_size}\n"
         )
 
     return top_pool, all_pool
@@ -1210,14 +1255,6 @@ async def score_molecules_with_boltz_batched(
 ) -> List[Dict[str, Any]]:
     """
     Score molecules using BoltzWrapper in batches.
-    
-    Args:
-        state: State dictionary
-        molecules: List of molecules to score
-        batch_size: Number of molecules per batch (default 10)
-        
-    Returns:
-        List of scored molecules
     """
     if state.get('boltz_wrapper') is None:
         logger.warning("BoltzWrapper not available, skipping scoring")
@@ -1233,9 +1270,7 @@ async def score_molecules_with_boltz_batched(
     all_scored_molecules = []
     total_batches = (len(molecules) + batch_size - 1) // batch_size
     
-    # Process molecules in batches
     for batch_idx in range(total_batches):
-        # Get batch
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, len(molecules))
         batch = molecules[start_idx:end_idx]
@@ -1245,7 +1280,6 @@ async def score_molecules_with_boltz_batched(
             f"Scoring {len(batch)} molecules"
         )
         
-        # Score this batch
         molecules_to_score = []
         molecules_with_db_scores = []
         molecules_in_hf = []
@@ -1258,7 +1292,6 @@ async def score_molecules_with_boltz_batched(
         
         logger.info(f"   Found {len(db_scores)} molecules already in database")
         
-        # Separate molecules by source
         for mol in batch:
             molecule_name = mol['name']
             smiles = mol.get('smiles')
@@ -1346,18 +1379,6 @@ async def score_molecules_with_boltz_batched(
                 }
                 
                 num_molecules_to_score = len(molecules_to_score)
-                # subnet_config = {
-                #     'weekly_target': primary_target,
-                #     'num_antitargets': len(antitarget_proteins),
-                #     'binding_pocket': getattr(config, 'binding_pocket', None),
-                #     'max_distance': getattr(config, 'max_distance', None),
-                #     'force': getattr(config, 'force', False),
-                #     'num_molecules_boltz': num_molecules_to_score,
-                #     'boltz_metric': getattr(config, 'boltz_metric', ['affinity_probability_binary', 'affinity_pred_value']),
-                #     'combination_strategy': getattr(config, 'combination_strategy', 'heavy_atom_normalization'),
-                #     'sample_selection': getattr(config, 'sample_selection', 'first'),
-                # }
-
 
                 subnet_config = {
                     'small_molecule_target': config['small_molecule_target'],
@@ -1390,7 +1411,6 @@ async def score_molecules_with_boltz_batched(
                 if primary_target and primary_target in final_scores:
                     smiles_to_score = final_scores[primary_target].copy()
                 elif final_scores:
-                    # Single-target fallback when key differs from primary_target string
                     smiles_to_score = next(iter(final_scores.values())).copy()
                 elif hasattr(boltz, 'per_molecule_metric') and uid in boltz.per_molecule_metric:
                     smiles_to_score = boltz.per_molecule_metric[uid].copy()
@@ -1439,7 +1459,6 @@ async def score_molecules_with_boltz_batched(
                 import traceback
                 logger.error(traceback.format_exc())
         
-        # Combine results from this batch
         batch_results = molecules_with_db_scores + newly_scored_molecules
         
         for mol in molecules_in_hf:
@@ -1456,7 +1475,6 @@ async def score_molecules_with_boltz_batched(
             f"{len(molecules_in_hf)} skipped"
         )
     
-    # Sort all results by score
     scored_molecules = sorted(
         all_scored_molecules,
         key=lambda m: m.get('boltz_score') if m.get('boltz_score') is not None else float('-inf'),
@@ -1500,8 +1518,14 @@ async def find_solution(state: Dict[str, Any]) -> None:
       1. generate  n_base_samples * GENERATE_MULTIPLIER  (≈ 2000)
       2. resolve SMILES
       3. dedup seen        ← FIRST: remove already-scored molecules
-      4. surrogate filter  ← SECOND: pick top BOLTZ_BUDGET from fresh pool
-      5. Boltz score       ← always receives ~BOLTZ_BUDGET molecules
+      4. surrogate filter  ← SECOND: keep top SURROGATE_KEEP_RATIO (20%)
+                              of the fresh pool. Applied in EVERY mode
+                              (DJA/TABU/EXPLOIT/cold), as long as the
+                              surrogate has >= SURROGATE_MIN_TRAIN_SIZE
+                              (6000) training samples. Below that
+                              threshold, falls back to a hard-cap at
+                              BOLTZ_BUDGET to protect Boltz.
+      5. Boltz score       ← receives whatever survives step 4
     """
     global molecule_manager
 
@@ -1519,7 +1543,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
     boltz_batch_size       = _cfg('boltz_batch_size', 10)
     LIMIT_PER_REACTANT     = _cfg('limit_per_reactant', 600)
 
-    surrogate       = SurrogateModel(max_training_samples=6000)
+    surrogate       = SurrogateModel(max_training_samples=5000)
     use_surrogate   = True
     exploit_counter = 0
     ranker          = ComponentRanker(decay=0.90)
@@ -1545,27 +1569,28 @@ async def find_solution(state: Dict[str, Any]) -> None:
     best_max_ever = init_pool_max if not top_pool.empty else 0.0
 
     try:
-        bt.logging.info("[Solution] Building synthon library...")
+        logger.info("[Solution] Building synthon library...")
         t0 = time.time()
         params.synthon_lib        = SynthonLibrary(molecule_manager=molecule_manager)
         params.use_synthon_search = True
-        bt.logging.info(
+        logger.info(
             f"[Solution] Synthon library ready in {time.time()-t0:.2f}s"
         )
     except Exception as e:
-        bt.logging.warning(f"[Solution] Synthon library failed: {e}")
+        logger.warning(f"[Solution] Synthon library failed: {e}")
         params.synthon_lib        = None
         params.use_synthon_search = False
 
-    bt.logging.info(
+    logger.info(
         f"🚀 DPEX-DJA loop | rxn={RXN_ID} | "
         f"A={len(molecule_manager.moles_A_id)} "
         f"B={len(molecule_manager.moles_B_id)} "
         f"C={len(molecule_manager.moles_C_id)} | "
         f"pipeline: generate {GENERATE_MULTIPLIER}x "
-        f"→ dedup → surrogate→{BOLTZ_BUDGET} → Boltz"
+        f"→ dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}% if "
+        f"trained, else hard-cap {BOLTZ_BUDGET}) → Boltz [ALL modes]"
     )
-    bt.logging.info("Press Ctrl+C to stop")
+    logger.info("Press Ctrl+C to stop")
 
     try:
         while True:
@@ -1574,8 +1599,8 @@ async def find_solution(state: Dict[str, Any]) -> None:
             dpex.iteration    = iteration
             iter_start        = time.time()
 
-            bt.logging.info(f"\n{'='*60}")
-            bt.logging.info(
+            logger.info(f"\n{'='*60}")
+            logger.info(
                 f"[Solution] --- Iteration {iteration} [rxn={RXN_ID}] ---"
             )
 
@@ -1595,13 +1620,11 @@ async def find_solution(state: Dict[str, Any]) -> None:
                         all_pool = all_pool.sort_values(
                             by='score', ascending=False, na_position='last'
                         ).drop_duplicates(subset=['inchi'], keep='first')
-                        bt.logging.info(
+                        logger.info(
                             f"[Solution] +{len(new_only)} new from disk "
                             f"(all_pool={len(all_pool)})"
                         )
                         # ── Also feed new rxn-specific scores to surrogate ──
-                        # These are real Boltz scores from disk — high quality
-                        # anchor data. Add as live training (evictable).
                         if surrogate.enabled and 'score' in new_only.columns:
                             valid_new = new_only[
                                 new_only['score'].notna() &
@@ -1612,18 +1635,21 @@ async def find_solution(state: Dict[str, Any]) -> None:
                                     valid_new['smiles'].tolist(),
                                     valid_new['score'].tolist(),
                                 )
-                                bt.logging.info(
+                                logger.info(
                                     f"[SURROGATE] +{len(valid_new)} "
-                                    f"new rxn-specific scores from disk"
+                                    f"new rxn-specific scores from disk "
+                                    f"(total_train_size="
+                                    f"{surrogate.total_train_size})"
                                 )
 
             # ── n_samples: always GENERATE_MULTIPLIER × base ──────────
             n_base_samples = params.get_nsamples_from_iteration(iteration)
             n_samples      = n_base_samples * GENERATE_MULTIPLIER
-            bt.logging.info(
+            logger.info(
                 f"[Solution] n_samples={n_samples} "
                 f"({n_base_samples}×{GENERATE_MULTIPLIER}) "
-                f"→ dedup → surrogate→{BOLTZ_BUDGET} → Boltz"
+                f"→ dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}% "
+                f"if trained, else hard-cap {BOLTZ_BUDGET}) → Boltz"
             )
 
             # ── Component weights ──────────────────────────────────────
@@ -1652,7 +1678,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
             if params.no_improvement_counter >= 2 and not params.use_exploit_mode:
                 params.use_exploit_mode       = True
                 params.no_improvement_counter = 0
-                bt.logging.info("[Solution] === EXPLOIT MODE ===")
+                logger.info("[Solution] === EXPLOIT MODE ===")
             elif params.no_improvement_counter >= 2 or exploit_counter >= 4:
                 params.use_exploit_mode       = False
                 exploit_counter               = 0
@@ -1695,18 +1721,18 @@ async def find_solution(state: Dict[str, Any]) -> None:
                         )
                         if early_results:
                             data_early_exploit = pd.DataFrame(early_results)
-                            bt.logging.info(
+                            logger.info(
                                 f"[Solution] Early exploit: "
                                 f"{len(data_early_exploit)} in "
                                 f"{time.time()-t0_ee:.1f}s"
                             )
                 except Exception as e:
-                    bt.logging.debug(f"[Solution] Early exploit skipped: {e}")
+                    logger.debug(f"[Solution] Early exploit skipped: {e}")
 
             # ── Full exploit mode ──────────────────────────────────────
             if params.use_exploit_mode and not top_pool.empty:
                 exploit_attempted = True
-                bt.logging.info(
+                logger.info(
                     "[Solution] Exploit: structure-guided deep search..."
                 )
                 try:
@@ -1724,7 +1750,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                             avoid_names=params.seen_molecules,
                             exploited_reactants=params.exploited_reactants,
                         )
-                        bt.logging.info(
+                        logger.info(
                             f"[Solution] Exploit: {len(exploit_results)} "
                             f"candidates in {time.time()-t0:.1f}s"
                         )
@@ -1736,13 +1762,13 @@ async def find_solution(state: Dict[str, Any]) -> None:
                     else:
                         raise Exception("No unexploited molecules.")
                 except Exception as e:
-                    bt.logging.warning(f"[Solution] Exploit skipped: {e}")
+                    logger.warning(f"[Solution] Exploit skipped: {e}")
                 exploit_counter += 1
 
             if not exploited_status:
                 if not dpex.pop_A:
                     # Cold fallback
-                    bt.logging.info(
+                    logger.info(
                         f"[Solution] Cold init: generating "
                         f"{params.n_samples_start} random molecules"
                     )
@@ -1759,7 +1785,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                     n_dja  = int(n_samples * 0.75)
                     n_tabu = n_samples - n_dja
 
-                    bt.logging.info(
+                    logger.info(
                         f"[Solution] DJA: {n_dja} candidates "
                         f"(pop_A={len(dpex.pop_A)})"
                     )
@@ -1773,7 +1799,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                         data_dja = molecule_manager.validate_molecules(
                             config, pd.DataFrame({"name": raw_dja})
                         )
-                        bt.logging.info(
+                        logger.info(
                             f"[Solution] DJA: {len(data_dja)} validated"
                         )
 
@@ -1788,7 +1814,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                         else:
                             n_per_elite = 50
 
-                        bt.logging.info(
+                        logger.info(
                             f"[Solution] Tabu: n_tabu≈{n_tabu} "
                             f"neighborhood={n_per_elite}"
                         )
@@ -1814,7 +1840,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                                         data_dja["name"].tolist()
                                     )
                                 ]
-                            bt.logging.info(
+                            logger.info(
                                 f"[Solution] Tabu: {len(data_tabu)} validated"
                             )
 
@@ -1854,13 +1880,13 @@ async def find_solution(state: Dict[str, Any]) -> None:
             )
 
             # ── Post-generation ────────────────────────────────────────
-            bt.logging.info(
+            logger.info(
                 f"[Solution] {len(data)} candidates generated "
                 f"({current_mode}) in {time.time()-iter_start:.2f}s"
             )
 
             if data.empty:
-                bt.logging.warning("[Solution] No candidates; skipping")
+                logger.warning("[Solution] No candidates; skipping")
                 await asyncio.sleep(5)
                 continue
 
@@ -1878,15 +1904,12 @@ async def find_solution(state: Dict[str, Any]) -> None:
             data = data[data['smiles'].notna() & (data['smiles'] != '')]
 
             if data.empty:
-                bt.logging.warning("[Solution] No valid SMILES; skipping")
+                logger.warning("[Solution] No valid SMILES; skipping")
                 await asyncio.sleep(5)
                 continue
 
             # ══════════════════════════════════════════════════════════
             # STEP 1 — Dedup against seen  (MUST come BEFORE surrogate)
-            # seen_molecules contains 5000+ warm-start molecules.
-            # Dedup first ensures surrogate picks BOLTZ_BUDGET from
-            # genuinely NEW candidates only.
             # ══════════════════════════════════════════════════════════
             pre_dedup = len(data)
             data      = data[
@@ -1894,7 +1917,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
             ].reset_index(drop=True)
 
             dup_ratio = (pre_dedup - len(data)) / max(1, pre_dedup)
-            bt.logging.info(
+            logger.info(
                 f"[Solution] Dedup: {pre_dedup} → {len(data)} "
                 f"({dup_ratio*100:.0f}% already seen)"
             )
@@ -1908,7 +1931,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                 params.mutation_prob = max(0.10, params.mutation_prob * 0.95)
 
             if data.empty:
-                bt.logging.error(
+                logger.error(
                     "[Solution] All duplicates after dedup; boosting diversity"
                 )
                 params.mutation_prob = min(0.95, params.mutation_prob * 2.0)
@@ -1918,40 +1941,58 @@ async def find_solution(state: Dict[str, Any]) -> None:
 
             # ══════════════════════════════════════════════════════════
             # STEP 2 — Surrogate filter  (AFTER dedup, on fresh pool)
-            # Surrogate is rxn-specific — picks top BOLTZ_BUDGET from
-            # fresh unseen candidates only.
-            # Exploit mode bypassed — exploit is already guided.
+            #
+            # ✅ FIX: Applied in EVERY mode now — including EXPLOIT.
+            # Boltz is expensive, so once the surrogate has enough data
+            # (>= SURROGATE_MIN_TRAIN_SIZE), it ALWAYS gatekeeps, keeping
+            # only SURROGATE_KEEP_RATIO (20%) of the fresh pool regardless
+            # of which generation strategy produced the candidates.
+            #
+            # Below SURROGATE_MIN_TRAIN_SIZE, fall back to a hard-cap at
+            # BOLTZ_BUDGET so Boltz never gets flooded while the
+            # surrogate is still accumulating training data.
             # ══════════════════════════════════════════════════════════
-            if use_surrogate and surrogate.is_trained and not exploited_status:
+            surrogate_ready = (
+                use_surrogate
+                and surrogate.enabled
+                and surrogate.is_trained
+                and surrogate.total_train_size >= surrogate.min_train_size
+            )
+
+            if surrogate_ready:
                 pre_sur = len(data)
                 data    = surrogate.filter_candidates(
                     data,
-                    n_keep=BOLTZ_BUDGET,
+                    keep_ratio=SURROGATE_KEEP_RATIO,
                     smiles_col="smiles",
                 )
-                bt.logging.info(
-                    f"[SURROGATE] iter={iteration} | "
+                logger.info(
+                    f"[SURROGATE] iter={iteration} mode={current_mode} | "
                     f"{pre_sur} fresh → {len(data)} "
-                    f"(dropped {pre_sur - len(data)} low-quality before Boltz)"
+                    f"(kept top {SURROGATE_KEEP_RATIO*100:.0f}%, "
+                    f"train_size={surrogate.total_train_size})"
                 )
-            elif not surrogate.is_trained:
-                # Not yet trained — hard-cap to protect Boltz
+            else:
+                # Not yet ready — hard-cap to protect Boltz
                 if len(data) > BOLTZ_BUDGET:
-                    data = data.head(BOLTZ_BUDGET)
-                    bt.logging.info(
-                        f"[Solution] Surrogate not trained yet — "
-                        f"hard-cap at {BOLTZ_BUDGET}"
+                    pre_cap = len(data)
+                    data    = data.head(BOLTZ_BUDGET)
+                    logger.info(
+                        f"[Solution] Surrogate not ready "
+                        f"(train_size={surrogate.total_train_size} < "
+                        f"{surrogate.min_train_size}) — hard-cap "
+                        f"{pre_cap} → {len(data)} at {BOLTZ_BUDGET}"
                     )
 
             if data.empty:
-                bt.logging.warning(
+                logger.warning(
                     "[Solution] No candidates after filter; skipping"
                 )
                 await asyncio.sleep(5)
                 continue
 
             # ── Boltz scoring ──────────────────────────────────────────
-            bt.logging.info(
+            logger.info(
                 f"[Solution] Scoring {len(data)} molecules with Boltz..."
             )
             t_score = time.time()
@@ -1960,7 +2001,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                 data.to_dict('records'),
                 batch_size=boltz_batch_size,
             )
-            bt.logging.info(
+            logger.info(
                 f"[Solution] Boltz done in {time.time()-t_score:.2f}s"
             )
 
@@ -1976,7 +2017,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
             ])
 
             if scored_df.empty:
-                bt.logging.warning("[Solution] No scores returned; skipping")
+                logger.warning("[Solution] No scores returned; skipping")
                 await asyncio.sleep(5)
                 continue
 
@@ -1994,7 +2035,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                     surrogate.train(iteration)
                     train_time = time.time() - t_train
                     if train_time > 10.0:
-                        bt.logging.warning(
+                        logger.warning(
                             f"[SURROGATE] Training slow "
                             f"({train_time:.2f}s) — disabling"
                         )
@@ -2031,7 +2072,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
             if iteration % dpex.T_ex == 0:
                 dpex_exchange(dpex)
 
-            bt.logging.debug(
+            logger.debug(
                 f"[DPEX] pop_A={len(dpex.pop_A)}  pop_B={len(dpex.pop_B)}"
             )
 
@@ -2093,7 +2134,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
             # ── Anti-plateau mutation boost ────────────────────────────
             if plateau_counter >= 5:
                 params.mutation_prob = min(0.85, params.mutation_prob * 2.0)
-                bt.logging.info(
+                logger.info(
                     f"[Solution] ANTI-PLATEAU: mutation_prob → "
                     f"{params.mutation_prob:.2f}"
                 )
@@ -2111,7 +2152,7 @@ async def find_solution(state: Dict[str, Any]) -> None:
                 params.exploited_reactants.update(
                     exploit_summary['exploited_reactant_ids']
                 )
-                bt.logging.info(
+                logger.info(
                     f"[Solution] Exploited reactants total: "
                     f"{len(params.exploited_reactants)}"
                 )
@@ -2119,15 +2160,16 @@ async def find_solution(state: Dict[str, Any]) -> None:
             # ── Iteration summary ──────────────────────────────────────
             iter_time = time.time() - iter_start
 
-            bt.logging.info(
+            logger.info(
                 f"Iter {iteration:4d} | {iter_time:6.1f}s | "
                 f"Mode: {current_mode:24s} | rxn={RXN_ID} | "
                 f"popA={len(dpex.pop_A):4d} popB={len(dpex.pop_B):4d} | "
                 f"pool avg={pool_avg:.5f} max={pool_max:.5f} | "
                 f"Δ={params.score_improvement_rate:+.5f} | "
                 f"no_improve={params.no_improvement_counter} | "
-                f"surrogate={'ON' if surrogate.is_trained else 'OFF'} "
-                f"({surrogate.total_train_size} samples, rxn={RXN_ID})"
+                f"surrogate={'ON' if surrogate_ready else 'OFF'} "
+                f"({surrogate.total_train_size}/{surrogate.min_train_size} "
+                f"samples, rxn={RXN_ID})"
             )
 
             best_max_ever = _log_pool_progress(
@@ -2144,17 +2186,17 @@ async def find_solution(state: Dict[str, Any]) -> None:
             )
 
             if not top_pool.empty:
-                bt.logging.info(
+                logger.info(
                     f"   🏆 Best: {best_name} (score={pool_max:.6f})"
                 )
 
             await asyncio.sleep(2)
 
     except KeyboardInterrupt:
-        bt.logging.info(f"\n🛑 Stopping DPEX-DJA loop (rxn={RXN_ID})...")
+        logger.info(f"\n🛑 Stopping DPEX-DJA loop (rxn={RXN_ID})...")
         if not top_pool.empty:
             _, final_max, final_best = _top_pool_stats(top_pool, num_molecules)
-            bt.logging.info(
+            logger.info(
                 f"Final best: {final_best} (score={final_max:.6f}) | "
                 f"all-time max={best_max_ever:.6f}"
             )
@@ -2223,3 +2265,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
