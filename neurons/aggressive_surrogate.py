@@ -90,7 +90,7 @@ BOLTZ_BUDGET = 600  # hard cap used ONLY while surrogate is not yet trained
 # ✅ NEW: surrogate keeps only this fraction of the fresh (deduped) pool
 # before sending to Boltz — applied in EVERY iteration mode (DJA/TABU/
 # EXPLOIT/cold), not just "normal" generation.
-SURROGATE_KEEP_RATIO = 0.90  # keep top 20%
+SURROGATE_KEEP_RATIO = 0.40  # keep top 20%
 
 # ✅ NEW: surrogate is not considered "ready" until total training data
 # (anchors + live) reaches this size. Below this, fall back to

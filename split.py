@@ -63,11 +63,11 @@ def split_csv(input_file):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python split.py <input_csv_file>")
-        sys.exit(1)
+    # if len(sys.argv) != 2:
+    #     print("Usage: python split.py <input_csv_file>")
+    #     sys.exit(1)
 
-    input_file = sys.argv[1]
+    input_file = sys.argv[1] if len(sys.argv) > 1 else 'data/mols.csv'
 
     if not os.path.exists(input_file):
         print(f"[ERROR] File not found: {input_file}")
