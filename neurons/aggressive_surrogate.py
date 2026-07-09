@@ -90,7 +90,7 @@ BOLTZ_BUDGET = 600  # hard cap used ONLY while surrogate is not yet trained
 # ✅ NEW: surrogate keeps only this fraction of the fresh (deduped) pool
 # before sending to Boltz — applied in EVERY iteration mode (DJA/TABU/
 # EXPLOIT/cold), not just "normal" generation.
-SURROGATE_KEEP_RATIO = 0.40  # keep top 20%
+SURROGATE_KEEP_RATIO = 0.20  # keep top 20%
 
 # ✅ NEW: surrogate is not considered "ready" until total training data
 # (anchors + live) reaches this size. Below this, fall back to
@@ -369,7 +369,7 @@ class SurrogateModel:
         self.min_train_size       = SURROGATE_MIN_TRAIN_SIZE
         self.max_training_samples = max_training_samples
         self.last_train_iteration = 0
-        self.train_interval       = 2
+        self.train_interval       = 1
         self.enabled              = True
 
     def _safe_fp(self, smiles: str) -> np.ndarray:
@@ -1467,13 +1467,31 @@ async def score_molecules_with_boltz_batched(
             batch_results.append(mol)
         
         all_scored_molecules.extend(batch_results)
-        
+
         logger.info(
             f"   ✅ Batch {batch_idx + 1} complete: "
             f"{len(molecules_with_db_scores)} from DB, "
             f"{len(newly_scored_molecules)} newly scored, "
             f"{len(molecules_in_hf)} skipped"
         )
+        if batch_results:
+            logger.info(f"   Batch {batch_idx + 1} molecule scores:")
+            for mol in sorted(
+                batch_results,
+                key=lambda m: (
+                    m.get('boltz_score')
+                    if m.get('boltz_score') is not None
+                    else float('-inf')
+                ),
+                reverse=True,
+            ):
+                name = mol.get('name', 'unknown')
+                score = mol.get('boltz_score')
+                source = mol.get('boltz_score_source', 'boltz')
+                if score is not None:
+                    logger.info(f"      {name}: {score:.6f} [{source}]")
+                else:
+                    logger.info(f"      {name}: skipped [{source}]")
     
     scored_molecules = sorted(
         all_scored_molecules,
