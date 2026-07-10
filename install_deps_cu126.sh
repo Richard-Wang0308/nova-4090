@@ -32,7 +32,7 @@ python3 -m venv .venv && source .venv/bin/activate \
         && uv pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
         && uv pip install patchelf \
         && uv pip install maturin==1.8.3 \
-        && uv pip install -e boltz-scoring/boltz
+        && uv pip install -e boltz
 
 pip install pytorch-lightning
 
