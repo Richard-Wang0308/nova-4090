@@ -45,8 +45,7 @@ DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None
 SCORE_RESULTS_DB = None
-RXN_CSV          = None
-TRAINING_CSV     = None   # mols.csv — filtered to rxn-specific rows only
+RXN_CSV          = None   # data/rxn{rxn_id}.csv — warm-seed + surrogate training
 
 # ── local imports ─────────────────────────────────────────────────────────
 from config.config_loader import load_config
@@ -90,12 +89,12 @@ BOLTZ_BUDGET = 600  # hard cap used ONLY while surrogate is not yet trained
 # ✅ NEW: surrogate keeps only this fraction of the fresh (deduped) pool
 # before sending to Boltz — applied in EVERY iteration mode (DJA/TABU/
 # EXPLOIT/cold), not just "normal" generation.
-SURROGATE_KEEP_RATIO = 0.20  # keep top 20%
+SURROGATE_KEEP_RATIO = 0.10  # keep top 20%
 
 # ✅ NEW: surrogate is not considered "ready" until total training data
 # (anchors + live) reaches this size. Below this, fall back to
 # BOLTZ_BUDGET hard-cap (no ML-based ranking yet).
-SURROGATE_MIN_TRAIN_SIZE = 5000
+SURROGATE_MIN_TRAIN_SIZE = 4000
 
 # ── fingerprint generators ────────────────────────────────────────────────
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(
@@ -119,7 +118,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> int:
-    global RXN_ID, SCORE_RESULTS_DB, RXN_CSV, TRAINING_CSV
+    global RXN_ID, SCORE_RESULTS_DB, RXN_CSV
 
     parser = argparse.ArgumentParser(
         description="DPEX-DJA Miner — single fixed reaction mode"
@@ -133,13 +132,10 @@ def parse_args() -> int:
     RXN_ID           = args.rxn_id
     SCORE_RESULTS_DB = os.path.join(BASE_DIR, f"score_results_{RXN_ID}.sqlite")
     RXN_CSV          = os.path.join(BASE_DIR, "data", f"rxn{RXN_ID}.csv")
-    TRAINING_CSV     = os.path.join(BASE_DIR, "data", "mols.csv")
 
     logger.info(f"✅ rxn_id           = {RXN_ID}")
     logger.info(f"✅ SCORE_RESULTS_DB  = {SCORE_RESULTS_DB}")
-    logger.info(f"✅ RXN_CSV           = {RXN_CSV}  (warm-seed population)")
-    logger.info(f"✅ TRAINING_CSV      = {TRAINING_CSV}  "
-                f"(surrogate: rxn:{RXN_ID} rows only)")
+    logger.info(f"✅ RXN_CSV           = {RXN_CSV}  (warm-seed + surrogate training)")
     logger.info(
         f"✅ Pipeline = generate {GENERATE_MULTIPLIER}x "
         f"→ dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}%, "
@@ -927,9 +923,10 @@ def load_molecules_combined(
 
 def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
     """
-    Load ONLY rxn-specific rows from mols.csv for surrogate training.
+    Load rxn-specific rows from data/rxn{rxn_id}.csv for surrogate training.
+    Unlike the warm-seed CSV load, this does not apply validation filters.
     """
-    csv_path = TRAINING_CSV
+    csv_path = RXN_CSV
     if not os.path.exists(csv_path):
         logger.warning(f"⚠️  Training CSV not found: {csv_path}")
         return pd.DataFrame(columns=["smiles", "score"])
@@ -949,7 +946,7 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
 
         if df.empty:
             logger.warning(
-                f"⚠️  mols.csv: no rows for rxn={rxn_id} "
+                f"⚠️  rxn{rxn_id}.csv: no rows for rxn={rxn_id} "
                 f"(prefix='{prefix}') — surrogate will cold-start"
             )
             return pd.DataFrame(columns=["smiles", "score"])
@@ -966,8 +963,8 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
         result = result[result['score'].notna()]
         result = result.drop_duplicates(subset=['smiles']).reset_index(drop=True)
         logger.info(
-            f"✅ Surrogate training [mols.csv rxn={rxn_id}]: "
-            f"{len(result)} molecules loaded (rxn-specific only)"
+            f"✅ Surrogate training [rxn{rxn_id}.csv]: "
+            f"{len(result)} molecules loaded"
         )
         return result
     except Exception as e:
@@ -1083,7 +1080,7 @@ def warm_start(
         f"\n{'='*60}\n"
         f"[WarmStart] rxn={RXN_ID} | "
         f"pop-seed : rxn{RXN_ID}.csv + score_results_{RXN_ID}.sqlite\n"
-        f"[WarmStart] surrogate: mols.csv filtered to rxn:{RXN_ID} only\n"
+        f"[WarmStart] surrogate: rxn{RXN_ID}.csv (no validation filter)\n"
         f"[WarmStart] surrogate activates once total training data "
         f">= {SURROGATE_MIN_TRAIN_SIZE}\n"
         f"{'='*60}"
@@ -1153,8 +1150,7 @@ def warm_start(
             f"(total anchors so far: {len(surrogate.anchor_X)})"
         )
 
-    # Also merge in mols.csv (additive — helps reach the 6000 threshold
-    # faster since loaded_df alone may not have enough rows).
+    # Also merge in rxn{rxn_id}.csv without validation filter (additive anchors).
     training_df = load_training_csv_for_surrogate(RXN_ID)
     if not training_df.empty:
         surrogate.add_anchor_data(
@@ -1162,8 +1158,8 @@ def warm_start(
             training_df['score'].tolist(),
         )
         logger.info(
-            f"[WarmStart] Surrogate anchors from mols.csv "
-            f"(rxn={RXN_ID} filtered): +{len(training_df)} molecules "
+            f"[WarmStart] Surrogate anchors from rxn{RXN_ID}.csv "
+            f"(no validation filter): +{len(training_df)} molecules "
             f"(total anchors so far: {len(surrogate.anchor_X)})"
         )
 
