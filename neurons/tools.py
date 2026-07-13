@@ -55,7 +55,7 @@ class IterationParams:
 
         allowed = config.get("allowed_reaction")
         if allowed is None:
-            self.n_samples_start = self.base_samples * 3
+            self.n_samples_start = self.base_samples * 6
         else:
             self.n_samples_start = (
                 self.base_samples * 3
@@ -72,9 +72,9 @@ class IterationParams:
         Mild decay: reduce slightly as populations mature.
         """
         # Stagnation: boost samples to escape local optima
-        if self.no_improvement_counter >= 5:
+        if self.no_improvement_counter >= 6:
             return int(self.base_samples * 1.20)
-        if self.no_improvement_counter >= 3:
+        if self.no_improvement_counter >= 4:
             return int(self.base_samples * 1.10)
 
         # Mild decay by iteration
