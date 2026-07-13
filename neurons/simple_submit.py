@@ -3,9 +3,12 @@
 SIMPLE MOLECULE SUBMISSION SCRIPT
 
 Simple workflow:
-1. Load molecules from molecule.json (array of molecule entries)
-2. Check each molecule for uniqueness in HuggingFace
-3. Submit one molecule per wallet/hotkey pair
+1. Monitor blockchain for epoch boundaries
+2. On startup and whenever the epoch changes, determine allowed reaction
+3. Submit only when the allowed reaction is rxn:2
+4. Load molecules from molecule.json (array of molecule entries)
+5. Check each molecule for uniqueness in HuggingFace
+6. Submit one molecule per wallet/hotkey pair
 """
 
 import os
@@ -18,7 +21,8 @@ import tempfile
 import traceback
 import base64
 import hashlib
-from typing import Any, Dict, List, Tuple
+import signal
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 import bittensor as bt
@@ -52,7 +56,58 @@ WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
 ]
 # ============================================================================
 
-SUBMISSION_DELAY = 0.5  # Seconds between each hotkey submission
+SUBMISSION_DELAY = 0.5       # Seconds between each hotkey submission
+REQUIRED_ALLOWED_REACTION = "rxn:2"
+EPOCH_LENGTH = 361           # Blocks per epoch
+STATUS_LOG_INTERVAL = 60     # Log status every N seconds
+POLL_INTERVAL = 6            # Seconds between block polls
+
+
+# ============================================================================
+# SIGNAL HANDLING
+# ============================================================================
+
+shutdown_event = asyncio.Event()
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    bt.logging.info(f"Received signal {signum}. Initiating graceful shutdown...")
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ============================================================================
+# CHALLENGE PARAM COMPAT
+# ============================================================================
+
+def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Optional[Dict[str, Any]]:
+    """Resolve epoch challenge params, including allowed_reaction."""
+    def _cfg(key: str, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    small_molecule_target = _cfg("small_molecule_target", "")
+    if isinstance(small_molecule_target, list):
+        small_molecule_target = small_molecule_target[0] if small_molecule_target else ""
+
+    nanobody_target = _cfg("nanobody_target", "")
+    if isinstance(nanobody_target, list):
+        nanobody_target = nanobody_target[0] if nanobody_target else ""
+
+    num_antitargets = _cfg("num_antitargets", 0) or 0
+
+    return get_challenge_params_from_blockhash(
+        block_hash=block_hash,
+        small_molecule_target=small_molecule_target,
+        nanobody_target=nanobody_target,
+        num_antitargets=num_antitargets,
+        include_reaction=_cfg("random_valid_reaction", True),
+    )
 
 
 # ============================================================================
@@ -112,6 +167,10 @@ def setup_logging(config: argparse.Namespace) -> None:
     """Sets up Bittensor logging."""
     bt.logging(config=config, logging_dir=config.full_path)
     bt.logging.info(f"Running simple_submit for subnet: {config.netuid}")
+    bt.logging.info(f"Required allowed reaction: {REQUIRED_ALLOWED_REACTION}")
+    bt.logging.info(f"Epoch length: {EPOCH_LENGTH} blocks")
+    bt.logging.info(f"Trigger: immediately on startup, then on every epoch change")
+    bt.logging.info(f"Poll interval: {POLL_INTERVAL}s")
     bt.logging.info(f"Wallet/hotkey pairs: {len(WALLET_HOTKEY_PAIRS)}")
     for idx, (wallet_name, hotkey_name) in enumerate(WALLET_HOTKEY_PAIRS, 1):
         bt.logging.info(f"   {idx}. wallet={wallet_name}  hotkey={hotkey_name}")
@@ -123,7 +182,7 @@ async def setup_bittensor_objects(
     """Initializes multiple wallets, subtensor, and metagraph."""
     bt.logging.info("Setting up Bittensor objects.")
 
-    epoch_length = 361
+    epoch_length = EPOCH_LENGTH
     subtensor = bt.async_subtensor(network=config.network)
 
     async with subtensor:
@@ -350,54 +409,62 @@ async def submit_response(
 
 
 # ============================================================================
-# MAIN SUBMISSION LOGIC
+# EPOCH SUBMISSION
 # ============================================================================
 
-async def run_simple_submit(config: argparse.Namespace) -> None:
-    """Load molecules, validate uniqueness, and submit one per wallet/hotkey."""
-    wallets, subtensor, metagraph, miner_uids, epoch_length = await setup_bittensor_objects(config)
+async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None:
+    """Submit molecules from molecule.json when the epoch allows rxn:2."""
+    config = state['config']
+    subtensor = state['subtensor']
+    epoch_length = state['epoch_length']
 
-    state: Dict[str, Any] = {
-        'config': config,
-        'github_path': load_github_path(),
-        'wallets': wallets,
-        'miner_uids': miner_uids,
-        'subtensor': subtensor,
-        'metagraph': metagraph,
-        'epoch_length': epoch_length,
-        'bdt': QuicknetBittensorDrandTimelock(),
-        'current_challenge_targets': [],
-    }
-
-    bt.logging.info("Starting simple submission process...")
+    bt.logging.info("=" * 70)
+    bt.logging.info(f"SUBMITTING FOR EPOCH {current_epoch}")
+    bt.logging.info("=" * 70)
 
     try:
         current_block = await subtensor.get_current_block()
-        last_boundary = (current_block // epoch_length) * epoch_length
-        block_hash = await subtensor.determine_block_hash(last_boundary)
-        startup_proteins = get_challenge_params_from_blockhash(
-            block_hash=block_hash,
-            weekly_target=config.weekly_target,
-            num_antitargets=config.num_antitargets
-        )
+        start_block = current_epoch * epoch_length
+        start_block_hash = await subtensor.determine_block_hash(start_block)
+        challenge_params = resolve_challenge_params(config, start_block_hash)
 
-        if not startup_proteins:
-            bt.logging.error("Failed to get challenge targets from blockhash")
+        if not challenge_params:
+            bt.logging.error("Failed to get challenge params from blockhash")
             return
 
-        state['current_challenge_targets'] = startup_proteins["targets"]
+        allowed_reaction = challenge_params.get("allowed_reaction")
+        bt.logging.info(f"Current block: {current_block}")
+        bt.logging.info(f"Current epoch: {current_epoch}")
+        bt.logging.info(f"Allowed reaction this epoch: {allowed_reaction}")
+
+        if allowed_reaction != REQUIRED_ALLOWED_REACTION:
+            bt.logging.warning(
+                f"Allowed reaction is {allowed_reaction}, not {REQUIRED_ALLOWED_REACTION}. "
+                "Skipping submission for this epoch."
+            )
+            return
+
+        small_molecule_target = challenge_params.get("small_molecule_target")
+        if not small_molecule_target:
+            bt.logging.error("No small_molecule_target in challenge params")
+            return
+
+        state['current_challenge_targets'] = [small_molecule_target]
         bt.logging.info(
-            f"Targets: {startup_proteins['targets']}, "
-            f"Antitargets: {startup_proteins['antitargets']}"
+            f"Target: {small_molecule_target}, "
+            f"Antitargets: {challenge_params.get('antitargets', [])}"
         )
 
         molecules = load_molecules_from_json(MOLECULE_JSON_PATH)
     except Exception as e:
-        bt.logging.error(f"Failed during startup: {e}")
+        bt.logging.error(f"Failed during epoch {current_epoch} setup: {e}")
         bt.logging.error(traceback.format_exc())
         return
 
+    wallets = state['wallets']
+    miner_uids = state['miner_uids']
     num_pairs = len(wallets)
+
     if len(molecules) > num_pairs:
         bt.logging.warning(
             f"More molecules ({len(molecules)}) than wallet/hotkey pairs ({num_pairs}). "
@@ -417,6 +484,13 @@ async def run_simple_submit(config: argparse.Namespace) -> None:
         molecule_smiles = molecule['smiles']
 
         bt.logging.info(f"Checking molecule {idx}/{len(submissions)}: {molecule_name}")
+
+        if not molecule_name.startswith(f"{REQUIRED_ALLOWED_REACTION}:"):
+            bt.logging.warning(
+                f"Molecule {molecule_name} does not use {REQUIRED_ALLOWED_REACTION}. Skipping."
+            )
+            results.append(False)
+            continue
 
         if not validate_molecule(config, molecule_name, molecule_smiles):
             results.append(False)
@@ -447,17 +521,105 @@ async def run_simple_submit(config: argparse.Namespace) -> None:
 
     success_count = sum(1 for result in results if result)
     bt.logging.info(
-        f"Submission complete: {success_count}/{len(results)} successful"
+        f"Epoch {current_epoch} submission complete: {success_count}/{len(results)} successful"
     )
+
+
+async def run_epoch_loop(state: Dict[str, Any]) -> None:
+    """
+    Monitor blockchain and submit immediately on startup and on epoch change.
+    """
+    bt.logging.info("Starting epoch monitoring loop...")
+
+    last_acted_epoch = None
+    last_status_log = datetime.datetime.now()
+
+    while not shutdown_event.is_set():
+        try:
+            current_block = await state['subtensor'].get_current_block()
+            current_epoch = current_block // state['epoch_length']
+            epoch_start_block = current_epoch * state['epoch_length']
+            blocks_into_epoch = current_block - epoch_start_block
+
+            now = datetime.datetime.now()
+            if (now - last_status_log).total_seconds() >= STATUS_LOG_INTERVAL:
+                bt.logging.info(
+                    f"Status | Block: {current_block} | Epoch: {current_epoch} | "
+                    f"Blocks into epoch: {blocks_into_epoch} | "
+                    f"Last acted epoch: {last_acted_epoch}"
+                )
+                last_status_log = now
+
+            if current_epoch != last_acted_epoch:
+                if last_acted_epoch is None:
+                    bt.logging.info(
+                        f"First run detected — submitting immediately "
+                        f"for current epoch {current_epoch}"
+                    )
+                else:
+                    bt.logging.info(
+                        f"Epoch changed ({last_acted_epoch} -> {current_epoch}) "
+                        f"— submitting immediately"
+                    )
+
+                await do_epoch_submission(state, current_epoch)
+                last_acted_epoch = current_epoch
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+        except Exception as e:
+            bt.logging.error(f"Error in epoch loop: {e}")
+            bt.logging.error(traceback.format_exc())
+            await asyncio.sleep(10)
+
+    bt.logging.info("Epoch loop terminated by shutdown signal")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+async def run_simple_submit(config: argparse.Namespace) -> None:
+    """Set up Bittensor objects and run the epoch monitoring loop."""
+    wallets, subtensor, metagraph, miner_uids, epoch_length = await setup_bittensor_objects(config)
+
+    state: Dict[str, Any] = {
+        'config': config,
+        'github_path': load_github_path(),
+        'wallets': wallets,
+        'miner_uids': miner_uids,
+        'subtensor': subtensor,
+        'metagraph': metagraph,
+        'epoch_length': epoch_length,
+        'bdt': QuicknetBittensorDrandTimelock(),
+        'current_challenge_targets': [],
+    }
+
+    try:
+        await run_epoch_loop(state)
+    finally:
+        try:
+            await subtensor.close()
+            bt.logging.info("Subtensor connection closed")
+        except Exception:
+            pass
 
 
 async def main() -> None:
     """Main entry point."""
     config = parse_arguments()
     setup_logging(config)
-    await run_simple_submit(config)
+    try:
+        await run_simple_submit(config)
+    except KeyboardInterrupt:
+        bt.logging.info("Interrupted by user")
 
 
 if __name__ == "__main__":
     load_dotenv()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
