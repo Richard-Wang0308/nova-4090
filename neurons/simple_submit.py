@@ -51,8 +51,8 @@ MOLECULE_JSON_PATH = os.path.join(BASE_DIR, "molecule.json")
 # One molecule is submitted per pair, in order.
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova", "nota"),
-    ("nova", "notb"),
+    ("nova", "notc"),
+    ("nova", "notd"),
 ]
 # ============================================================================
 
