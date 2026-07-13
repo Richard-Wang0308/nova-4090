@@ -44,7 +44,7 @@ class IterationParams:
         self.seen_molecules         = set()
         self.use_synthon_search     = False
         self.use_exploit_mode       = False
-        self.base_samples           = 400
+        self.base_samples           = 350
         self.no_improvement_counter = 0
         self.score_improvement_rate = 0.0
         self.mutation_prob          = 0.40
@@ -55,10 +55,10 @@ class IterationParams:
 
         allowed = config.get("allowed_reaction")
         if allowed is None:
-            self.n_samples_start = self.base_samples * 6
+            self.n_samples_start = self.base_samples * 3
         else:
             self.n_samples_start = (
-                self.base_samples * 2
+                self.base_samples * 3
                 if allowed == "rxn:5"
                 else self.base_samples * 4
             )
