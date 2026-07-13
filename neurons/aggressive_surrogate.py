@@ -414,7 +414,7 @@ class SurrogateModel:
 
         n_top    = max(1, n // 3)
         n_bottom = max(1, n // 3)
-        n_rand   = max(1, n // 10)
+        n_rand   = max(1, n*3 // 10)
 
         top_idx    = set(np.argsort(scores_arr)[-n_top:].tolist())
         bottom_idx = set(np.argsort(scores_arr)[:n_bottom].tolist())
