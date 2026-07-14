@@ -3,8 +3,8 @@ component_exhaust.py — Exhaustive single-component search with surrogate
 pre-filtering + Boltz scoring, for a fixed reaction (2 or 3 reactants).
 
 2-reactant (A:B) usage:
-    python component_exhaust.py --rxn_id 2 --fix A --value 137228 --n 200
-    python component_exhaust.py --rxn_id 2 --fix B --value 171540 --n 200
+    python component_exhaust.py --rxn_id 2 --fix A --value 73951 --n 1000
+    python component_exhaust.py --rxn_id 2 --fix B --value 171540 --n 1000
 
 3-reactant (A:B:C) usage:
     python component_exhaust.py --rxn_id 3 --fix A,B --value 55,120 --n 150
@@ -19,8 +19,10 @@ Pipeline:
   3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
   4. Surrogate pre-score the full valid set
   5. Keep top-n by predicted score
-  6. Boltz-score the top-n survivors
-  7. Write results into score_results_{rxn_id}.sqlite
+  6. Boltz-score the top-n survivors IN BATCHES, merging each batch
+     into score_results_{rxn_id}.sqlite immediately (every
+     --boltz_batch_size molecules, default 10) — no waiting until
+     the whole run finishes.
 """
 import os
 import sys
@@ -29,10 +31,9 @@ import asyncio
 import logging
 import sqlite3
 import argparse
-import shutil
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from sklearn.ensemble import RandomForestRegressor
 from rdkit import Chem
 from rdkit.Chem import Descriptors
@@ -58,13 +59,8 @@ MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize
 _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
-<<<<<<< HEAD
-SURROGATE_TOP_N = 3000
-SURROGATE_BOTTOM_N = 3000
-=======
 SURROGATE_TOP_N = 5000
 SURROGATE_BOTTOM_N = 1000
->>>>>>> 86fc71ea20a062b23492e3103d404699a648a006
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -143,6 +139,7 @@ def get_already_scored_names(db_path: str, names: List[str]) -> set:
 
 
 def write_scores_to_db(db_path: str, records: List[Dict]) -> int:
+    """Merge a batch of {'name','boltz_score'} records into the DB."""
     if not records:
         return 0
     conn = sqlite3.connect(db_path)
@@ -271,10 +268,7 @@ def validate_smiles(smiles: str, config: Dict) -> bool:
     return True
 
 
-def build_and_validate(
-    names: List[str],
-    config: Dict,
-) -> pd.DataFrame:
+def build_and_validate(names: List[str], config: Dict) -> pd.DataFrame:
     df = pd.DataFrame({"name": names})
     df["smiles"] = df["name"].apply(MoleculeUtils.get_smiles_from_reaction_cached)
     df = df[df["smiles"].notna() & (df["smiles"] != "")]
@@ -402,7 +396,7 @@ async def score_with_boltz(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Generic exhaustive-search runner
+# Generic exhaustive-search runner (with incremental DB merging)
 # ═══════════════════════════════════════════════════════════════════════════
 async def run_component_exhaust(
     rxn_id: int,
@@ -471,19 +465,32 @@ async def run_component_exhaust(
     top_df = valid_df.head(n).reset_index(drop=True)
     logger.info(f"[Exhaust] Selected top {len(top_df)} for Boltz scoring")
 
-    # ── 6. Boltz score in batches ───────────────────────────────────────
+    # ── 6. Boltz score in batches, MERGING INTO DB AFTER EVERY BATCH ────
     all_scored = []
     total_batches = (len(top_df) + boltz_batch_size - 1) // boltz_batch_size
+    total_written = 0
+
     for b in range(total_batches):
         batch = top_df.iloc[b * boltz_batch_size : (b + 1) * boltz_batch_size]
         mols = batch[["name", "smiles"]].to_dict("records")
         logger.info(f"[Exhaust] Boltz batch {b+1}/{total_batches} ({len(mols)} mols)")
+
         scored = await score_with_boltz(boltz, config, target_proteins, mols)
         all_scored.extend(scored)
 
-    # ── 7. Write to DB ───────────────────────────────────────────────────
-    n_written = write_scores_to_db(db_path, all_scored)
-    logger.info(f"[Exhaust] ✅ Wrote {n_written} new scores → {db_path}")
+        # ✅ Merge this batch into score_results_{rxn_id}.sqlite immediately
+        n_written = write_scores_to_db(db_path, scored)
+        total_written += n_written
+        logger.info(
+            f"[Exhaust] 💾 Merged batch {b+1}/{total_batches} "
+            f"({n_written} rows) → {db_path} "
+            f"(running total: {total_written})"
+        )
+
+    logger.info(
+        f"[Exhaust] ✅ Finished. Total {total_written} new scores "
+        f"written → {db_path}"
+    )
 
     result_df = pd.DataFrame(all_scored)
     if not result_df.empty:
@@ -497,34 +504,34 @@ async def run_component_exhaust(
 # ═══════════════════════════════════════════════════════════════════════════
 async def function_change_A(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
-    fixed: Dict[str, int], n: int,
+    fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
 ) -> pd.DataFrame:
     """Fix B (and C if 3-component); vary A over all valid molecules."""
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="A", fixed=fixed, n=n,
+        vary_role="A", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
     )
 
 
 async def function_change_B(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
-    fixed: Dict[str, int], n: int,
+    fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
 ) -> pd.DataFrame:
     """Fix A (and C if 3-component); vary B over all valid molecules."""
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="B", fixed=fixed, n=n,
+        vary_role="B", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
     )
 
 
 async def function_change_C(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
-    fixed: Dict[str, int], n: int,
+    fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
 ) -> pd.DataFrame:
     """Fix A and B; vary C over all valid molecules (3-component only)."""
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="C", fixed=fixed, n=n,
+        vary_role="C", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
     )
 
 
@@ -548,7 +555,10 @@ def parse_args():
         help="Fixed component id(s), comma-separated, matching --fix order.",
     )
     parser.add_argument("--n", type=int, required=True, help="Top-n to Boltz-score")
-    parser.add_argument("--boltz_batch_size", type=int, default=10)
+    parser.add_argument(
+        "--boltz_batch_size", type=int, default=10,
+        help="Merge into DB every this-many molecules (default 10).",
+    )
     parser.add_argument(
         "--rescore_seen", action="store_true",
         help="If set, do NOT skip molecules already scored in the DB.",
@@ -618,14 +628,15 @@ async def main():
 
     result_df = await fn(
         rxn_id, manager, cfg, surrogate, boltz, target_proteins,
-        fixed=fixed, n=args.n,
+        fixed=fixed, n=args.n, boltz_batch_size=args.boltz_batch_size,
     )
 
     if result_df is None or result_df.empty:
         logger.warning("No results produced.")
     else:
-        logger.info(f"✅ Done. {len(result_df)} molecules scored and written to {db_path}")
-
+        logger.info(
+            f"✅ Done. {len(result_df)} molecules scored and written to {db_path}"
+        )
 
 
 if __name__ == "__main__":
