@@ -59,8 +59,8 @@ MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize
 _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
-SURROGATE_TOP_N = 5000
-SURROGATE_BOTTOM_N = 1000
+SURROGATE_TOP_N = 4000
+SURROGATE_BOTTOM_N = 4000
 
 
 # ═══════════════════════════════════════════════════════════════════════════
