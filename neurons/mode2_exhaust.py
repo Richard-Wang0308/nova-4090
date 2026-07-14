@@ -12,6 +12,12 @@ Traversal:
   3-reactant: single top molecule (A1,B1,C1), 3 round-robin chains
               (A→B→C, B→C→A, C→A→B), each a 3-step chain of 150-cand rounds.
 
+✅ CHANGE (this version): Surrogate model is now seeded EXACTLY with the
+top-3000 + bottom-1500 scored molecules read directly from
+score_results_{rxn_id}.sqlite (e.g. score_results_2.sqlite for rxn_id=2),
+bypassing SurrogateModel.add_anchor_data()'s internal top/bottom/random
+resampling so the exact 3000/1500 split is preserved.
+
 ASSUMPTIONS (confirm with user if wrong):
   - "top 2 A/B" = top-2 DISTINCT component VALUES appearing in ranked
     top molecules (not top-2 rows) — confirmed by user.
@@ -23,6 +29,7 @@ ASSUMPTIONS (confirm with user if wrong):
 
 import os
 import time
+import sqlite3
 import asyncio
 import argparse
 import itertools
@@ -41,8 +48,117 @@ from common import (
 from config.config_loader import load_config
 
 N_TOP_ANCHORS_2R = 2     # top-2 A and top-2 B component values (2-reactant)
-KEEP_A_2R        = 200   # function_change_A/B keep-N for 2-reactant
+KEEP_A_2R        = 300   # function_change_A/B keep-N for 2-reactant
 KEEP_ABC_3R      = 150   # function_change_A/B/C keep-N for 3-reactant
+
+# ✅ NEW: exact surrogate seed-set sizes, pulled from score_results_{rxn_id}.sqlite
+SURROGATE_SEED_TOP_N    = 3000
+SURROGATE_SEED_BOTTOM_N = 1500
+SURROGATE_MIN_TRAIN_SIZE_EXHAUST = SURROGATE_SEED_TOP_N + SURROGATE_SEED_BOTTOM_N  # 4500
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ✅ NEW: Load exact top-N / bottom-N scored molecules from the score DB
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_top_bottom_from_score_db(
+    rxn_id: int,
+    n_top: int = SURROGATE_SEED_TOP_N,
+    n_bottom: int = SURROGATE_SEED_BOTTOM_N,
+) -> pd.DataFrame:
+    """
+    Read score_results_{rxn_id}.sqlite directly (e.g. score_results_2.sqlite
+    for rxn_id=2), sort ALL scored molecules by score descending, and return
+    exactly the top-`n_top` + bottom-`n_bottom` rows (with SMILES resolved),
+    with no overlap between the two slices.
+
+    This does NOT go through SurrogateModel.add_anchor_data()'s internal
+    resampling — the caller is expected to seed the surrogate directly
+    (see seed_surrogate_top_bottom below) to preserve the exact split.
+    """
+    db_path = os.path.join(common.BASE_DIR, f"score_results_{rxn_id}.sqlite")
+    if not os.path.exists(db_path):
+        logger.warning(f"[Exhaust] Score DB not found: {db_path}")
+        return pd.DataFrame(columns=["name", "smiles", "score"])
+
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(
+            "SELECT molecule_name AS name, score FROM scored_molecules "
+            "WHERE score IS NOT NULL",
+            conn,
+        )
+        conn.close()
+    except Exception as e:
+        logger.error(f"[Exhaust] Failed to read {db_path}: {e}")
+        return pd.DataFrame(columns=["name", "smiles", "score"])
+
+    if df.empty:
+        logger.warning(f"[Exhaust] {db_path} has no scored molecules")
+        return df
+
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df[np.isfinite(df["score"])].reset_index(drop=True)
+
+    if df.empty:
+        logger.warning(f"[Exhaust] {db_path} has no finite scores")
+        return df
+
+    df = df.sort_values(by="score", ascending=False).reset_index(drop=True)
+
+    n = len(df)
+    top_df = df.head(min(n_top, n))
+    n_used_by_top = len(top_df)
+    remaining = n - n_used_by_top
+    bottom_df = (
+        df.tail(min(n_bottom, remaining)) if remaining > 0
+        else pd.DataFrame(columns=df.columns)
+    )
+
+    combined = pd.concat([top_df, bottom_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["name"]).reset_index(drop=True)
+
+    combined["smiles"] = combined["name"].apply(
+        MoleculeUtils.get_smiles_from_reaction_cached
+    )
+    combined = combined[
+        combined["smiles"].notna() & (combined["smiles"] != "")
+    ].reset_index(drop=True)
+
+    logger.info(
+        f"[Exhaust] Loaded exactly {len(top_df)} top + {len(bottom_df)} bottom "
+        f"= {len(combined)} valid anchors from {os.path.basename(db_path)} "
+        f"(pool size={n} total scored)"
+    )
+    return combined
+
+
+def seed_surrogate_top_bottom(
+    surrogate: SurrogateModel,
+    smiles_list: List[str],
+    scores: List[float],
+) -> int:
+    """
+    Directly seed surrogate.anchor_X / anchor_y with EXACTLY the given
+    smiles+scores, bypassing SurrogateModel.add_anchor_data()'s internal
+    top-1/3 / bottom-1/3 / random-10% resampling — which would otherwise
+    shrink our precisely-selected top-3000 + bottom-1500 set into
+    something smaller and re-shuffled.
+
+    Non-finite scores are skipped defensively (should already be filtered
+    by load_top_bottom_from_score_db, but double-checked here).
+    """
+    added = 0
+    for smi, score in zip(smiles_list, scores):
+        if score is None or not np.isfinite(score):
+            continue
+        fp = surrogate._safe_fp(smi)   # SurrogateModel's own fp helper
+        if fp is None:
+            continue
+        surrogate.anchor_X.append(fp)
+        surrogate.anchor_y.append(float(score))
+        added += 1
+    return added
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -133,7 +249,7 @@ async def function_change_role(
         config = state['config']
         df = manager.validate_molecules(config, df)
     except Exception as e:
-        logger.debug(f"[Exhaust] validate_molecules skipped: {e}")
+        logger.warning(f"[Exhaust] validate_molecules skipped: {e}")
 
     if df.empty:
         return pd.DataFrame(columns=["name", "smiles", "score"])
@@ -168,7 +284,8 @@ async def function_change_role(
 
 def get_top_component_values(df: pd.DataFrame, role_idx: int, n: int) -> List[int]:
     """
-    df must have a 'name' column ranked by score (descending).
+    df must have a 'name' column, and is sorted by score (descending)
+    by the caller before this is invoked.
     role_idx: 0 for A, 1 for B, 2 for C.
     Returns top-n DISTINCT component values seen at that role position,
     in order of first (best) appearance.
@@ -192,6 +309,15 @@ def get_top_molecule_ids(df: pd.DataFrame) -> Optional[Tuple[int, ...]]:
     return parse_molecule_name(df.iloc[0]["name"])
 
 
+def _find_partner_ids(df: pd.DataFrame, role_idx: int, value: int) -> Optional[Tuple[int, ...]]:
+    """Exact-position match on a parsed molecule name (safer than substring matching)."""
+    for name in df["name"]:
+        ids = parse_molecule_name(name)
+        if ids and len(ids) > role_idx and ids[role_idx] == value:
+            return ids
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 2-reactant Exhaust chain
 # ═══════════════════════════════════════════════════════════════════════════
@@ -201,6 +327,7 @@ async def run_exhaust_2reactant(state, manager, surrogate, rxn_id: int, boltz_ba
     if current.empty:
         logger.warning("[Exhaust] No scored molecules yet — cannot select top anchors. Skipping pass.")
         return
+    current = current.sort_values(by="score", ascending=False).reset_index(drop=True)
 
     top_A_vals = get_top_component_values(current, role_idx=0, n=N_TOP_ANCHORS_2R)
     top_B_vals = get_top_component_values(current, role_idx=1, n=N_TOP_ANCHORS_2R)
@@ -209,9 +336,6 @@ async def run_exhaust_2reactant(state, manager, surrogate, rxn_id: int, boltz_ba
     # ── Chains anchored on top-A values: B→A→B ─────────────────────────
     for a_val in top_A_vals:
         logger.info(f"[Exhaust] === Chain (anchor A={a_val}): change_B → change_A → change_B ===")
-        # need a starting B — use best known B partner for this A, else first B in pool
-        partner_row = current[current["name"].str.contains(f":{a_val}:", regex=False)]
-        b_start = parse_molecule_name(partner_row.iloc[0]["name"])[1] if not partner_row.empty else manager.moles_B_id[0]
 
         r1 = await function_change_role(state, manager, surrogate, rxn_id, "B", {"A": a_val}, KEEP_A_2R, boltz_batch_size)
         if r1.empty:
@@ -223,13 +347,15 @@ async def run_exhaust_2reactant(state, manager, surrogate, rxn_id: int, boltz_ba
             continue
         a_star = parse_molecule_name(r2.iloc[0]["name"])[0]
 
+        if a_star == a_val:
+            logger.info(f"[Exhaust] A unchanged ({a_val}) — skipping redundant final B-scan")
+            continue
+
         await function_change_role(state, manager, surrogate, rxn_id, "B", {"A": a_star}, KEEP_A_2R, boltz_batch_size)
 
     # ── Chains anchored on top-B values: A→B→A ─────────────────────────
     for b_val in top_B_vals:
         logger.info(f"[Exhaust] === Chain (anchor B={b_val}): change_A → change_B → change_A ===")
-        partner_row = current[current["name"].str.endswith(f":{b_val}")]
-        a_start = parse_molecule_name(partner_row.iloc[0]["name"])[0] if not partner_row.empty else manager.moles_A_id[0]
 
         r1 = await function_change_role(state, manager, surrogate, rxn_id, "A", {"B": b_val}, KEEP_A_2R, boltz_batch_size)
         if r1.empty:
@@ -240,6 +366,10 @@ async def run_exhaust_2reactant(state, manager, surrogate, rxn_id: int, boltz_ba
         if r2.empty:
             continue
         b_star = parse_molecule_name(r2.iloc[0]["name"])[1]
+
+        if b_star == b_val:
+            logger.info(f"[Exhaust] B unchanged ({b_val}) — skipping redundant final A-scan")
+            continue
 
         await function_change_role(state, manager, surrogate, rxn_id, "A", {"B": b_star}, KEEP_A_2R, boltz_batch_size)
 
@@ -253,6 +383,7 @@ async def run_exhaust_3reactant(state, manager, surrogate, rxn_id: int, boltz_ba
     if current.empty:
         logger.warning("[Exhaust] No scored molecules yet — cannot select top molecule. Skipping pass.")
         return
+    current = current.sort_values(by="score", ascending=False).reset_index(drop=True)
 
     top_ids = get_top_molecule_ids(current)
     if top_ids is None or len(top_ids) < 3:
@@ -268,6 +399,7 @@ async def run_exhaust_3reactant(state, manager, surrogate, rxn_id: int, boltz_ba
     ]
 
     fixed_base = {"A": A1, "B": B1, "C": C1}
+    role_order = ["A", "B", "C"]
 
     for chain_idx, (r1, r2, r3) in enumerate(chains, start=1):
         logger.info(f"[Exhaust] === Chain {chain_idx}: change_{r1} → change_{r2} → change_{r3} ===")
@@ -276,7 +408,6 @@ async def run_exhaust_3reactant(state, manager, surrogate, rxn_id: int, boltz_ba
         if res1.empty:
             continue
         ids1 = parse_molecule_name(res1.iloc[0]["name"])
-        role_order = ["A", "B", "C"]
         val1 = ids1[role_order.index(r1)]
 
         fixed2 = dict(fixed_base)
@@ -308,14 +439,38 @@ async def run_exhaust_loop(state, rxn_id: int):
     )
 
     surrogate = SurrogateModel(max_training_samples=5000)
-    loaded_df = load_molecules_combined(rxn_id)
-    if not loaded_df.empty:
-        surrogate.add_anchor_data(loaded_df['smiles'].tolist(), loaded_df['score'].tolist())
-    training_df = load_training_csv_for_surrogate(rxn_id)
-    if not training_df.empty:
-        surrogate.add_anchor_data(training_df['smiles'].tolist(), training_df['score'].tolist())
+
+    # ✅ CHANGED: seed surrogate with EXACTLY top-3000 + bottom-1500 rows
+    # read directly from score_results_{rxn_id}.sqlite (e.g.
+    # score_results_2.sqlite for rxn_id=2) — bypasses add_anchor_data()'s
+    # internal resampling so the exact split is preserved.
+    surrogate.min_train_size = SURROGATE_MIN_TRAIN_SIZE_EXHAUST  # 4500
+
+    anchor_df = load_top_bottom_from_score_db(
+        rxn_id,
+        n_top=SURROGATE_SEED_TOP_N,
+        n_bottom=SURROGATE_SEED_BOTTOM_N,
+    )
+    if not anchor_df.empty:
+        n_added = seed_surrogate_top_bottom(
+            surrogate,
+            anchor_df["smiles"].tolist(),
+            anchor_df["score"].tolist(),
+        )
+        logger.info(
+            f"[Exhaust] Seeded surrogate with exactly {n_added} anchors "
+            f"(target: top-{SURROGATE_SEED_TOP_N} + bottom-{SURROGATE_SEED_BOTTOM_N} "
+            f"from score_results_{rxn_id}.sqlite)"
+        )
+    else:
+        logger.warning(
+            f"[Exhaust] No anchors loaded from score_results_{rxn_id}.sqlite "
+            f"— surrogate will cold-start (need >= "
+            f"{SURROGATE_MIN_TRAIN_SIZE_EXHAUST} scored molecules on disk)"
+        )
+
     if surrogate.total_train_size >= surrogate.min_train_size:
-        surrogate.train(iteration=0, force=True)
+        surrogate.train(iteration=0)
     logger.info(f"[Exhaust] Surrogate ready={surrogate.is_trained} (train_size={surrogate.total_train_size})")
 
     is_three = manager.is_three_component
@@ -329,6 +484,17 @@ async def run_exhaust_loop(state, rxn_id: int):
                 await run_exhaust_3reactant(state, manager, surrogate, rxn_id, boltz_batch_size)
             else:
                 await run_exhaust_2reactant(state, manager, surrogate, rxn_id, boltz_batch_size)
+
+            # ✅ NEW: retrain periodically with the live Boltz results
+            # accumulated during this pass (previously the surrogate was
+            # only ever fit once, at startup, and never updated again).
+            if surrogate.enabled and surrogate.total_train_size >= surrogate.min_train_size:
+                surrogate.train(iteration=pass_num)
+                logger.info(
+                    f"[Exhaust] Surrogate retrained after pass {pass_num} "
+                    f"(train_size={surrogate.total_train_size})"
+                )
+
             logger.info(f"[Exhaust] PASS {pass_num} complete in {time.time()-t0:.1f}s")
             await asyncio.sleep(2)
     except KeyboardInterrupt:
