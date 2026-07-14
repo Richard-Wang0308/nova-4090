@@ -33,8 +33,8 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Continuously collect training data from competition API and split by reaction type"
     )
-    parser.add_argument('--start_epoch', type=int, default=23724, help='Starting epoch number to collect from')
-    parser.add_argument('--end_epoch', type=int, default=23751, help='Ending epoch number to collect to')
+    parser.add_argument('--start_epoch', type=int, default=23863, help='Starting epoch number to collect from')
+    parser.add_argument('--end_epoch', type=int, default=23865, help='Ending epoch number to collect to')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
     parser.add_argument('--output_dir', type=str, default='data', help='Output directory for rxn{1..5}.csv files')
     parser.add_argument('--time', type=int, default=1,
