@@ -12,7 +12,7 @@ pre-filtering + Boltz scoring, for a fixed reaction (2 or 3 reactants).
     python component_exhaust.py --rxn_id 3 --fix B,C --value 120,9 --n 150
 
 Pipeline:
-  1. Train surrogate on top-5000 + bottom-1000 scored molecules
+  1. Train surrogate on top-4000 + bottom-4000 scored molecules
      (rxn-specific, from score_results_{rxn_id}.sqlite)
   2. Fix the given component(s); enumerate ALL valid molecules by
      varying the remaining (free) component
@@ -20,9 +20,9 @@ Pipeline:
   4. Surrogate pre-score the full valid set
   5. Keep top-n by predicted score
   6. Boltz-score the top-n survivors IN BATCHES, merging each batch
-     into score_results_{rxn_id}.sqlite immediately (every
-     --boltz_batch_size molecules, default 10) — no waiting until
-     the whole run finishes.
+     into score_results_{rxn_id}.sqlite immediately AND printing the
+     batch's results table to the terminal (every --boltz_batch_size
+     molecules, default 10) — no waiting until the whole run finishes.
 """
 import os
 import sys
@@ -168,7 +168,7 @@ def write_scores_to_db(db_path: str, records: List[Dict]) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Surrogate model (top-5000 + bottom-1000 training)
+# Surrogate model (top-4000 + bottom-4000 training)
 # ═══════════════════════════════════════════════════════════════════════════
 class SurrogateModel:
     def __init__(self):
@@ -396,7 +396,7 @@ async def score_with_boltz(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Generic exhaustive-search runner (with incremental DB merging)
+# Generic exhaustive-search runner (incremental DB merge + terminal print)
 # ═══════════════════════════════════════════════════════════════════════════
 async def run_component_exhaust(
     rxn_id: int,
@@ -465,7 +465,7 @@ async def run_component_exhaust(
     top_df = valid_df.head(n).reset_index(drop=True)
     logger.info(f"[Exhaust] Selected top {len(top_df)} for Boltz scoring")
 
-    # ── 6. Boltz score in batches, MERGING INTO DB AFTER EVERY BATCH ────
+    # ── 6. Boltz score in batches — PRINT + MERGE after EVERY batch ────
     all_scored = []
     total_batches = (len(top_df) + boltz_batch_size - 1) // boltz_batch_size
     total_written = 0
@@ -477,6 +477,20 @@ async def run_component_exhaust(
 
         scored = await score_with_boltz(boltz, config, target_proteins, mols)
         all_scored.extend(scored)
+
+        # ── Print this batch's results to the terminal right now ───────
+        batch_df = pd.DataFrame(scored)
+        if not batch_df.empty:
+            batch_df = batch_df.sort_values(
+                "boltz_score", ascending=False, na_position="last"
+            )
+            print(
+                f"\n{'='*70}\n"
+                f"BATCH {b+1}/{total_batches} — {len(scored)} new molecules scored\n"
+                f"{'='*70}"
+            )
+            print(batch_df[["name", "boltz_score"]].to_string(index=False))
+            print(f"{'='*70}\n")
 
         # ✅ Merge this batch into score_results_{rxn_id}.sqlite immediately
         n_written = write_scores_to_db(db_path, scored)
@@ -495,7 +509,9 @@ async def run_component_exhaust(
     result_df = pd.DataFrame(all_scored)
     if not result_df.empty:
         result_df = result_df.sort_values("boltz_score", ascending=False, na_position="last")
-        logger.info("\n[Exhaust] Top results:\n" + result_df.to_string(index=False))
+        print(f"\n{'#'*70}\nFINAL RANKED RESULTS ({len(result_df)} molecules)\n{'#'*70}")
+        print(result_df[["name", "boltz_score"]].to_string(index=False))
+        print(f"{'#'*70}\n")
     return result_df
 
 
@@ -557,7 +573,7 @@ def parse_args():
     parser.add_argument("--n", type=int, required=True, help="Top-n to Boltz-score")
     parser.add_argument(
         "--boltz_batch_size", type=int, default=10,
-        help="Merge into DB every this-many molecules (default 10).",
+        help="Print + merge into DB every this-many molecules (default 10).",
     )
     parser.add_argument(
         "--rescore_seen", action="store_true",
@@ -605,7 +621,7 @@ async def main():
     db_path = score_db_path(rxn_id)
     init_score_results_db(db_path)
 
-    # ── Train surrogate on top-5000 + bottom-1000 ────────────────────────
+    # ── Train surrogate on top-4000 + bottom-4000 ────────────────────────
     surrogate = SurrogateModel()
     surrogate.train_from_db(rxn_id, db_path)
 
