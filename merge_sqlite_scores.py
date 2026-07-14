@@ -90,7 +90,7 @@ def ensure_output_schema(conn_out: sqlite3.Connection) -> None:
         CREATE TABLE {TABLE_NAME} (
             molecule_name TEXT PRIMARY KEY,
             score REAL,
-            scored_at TIMESTAMP,
+            scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             available BOOLEAN
         )
         """
