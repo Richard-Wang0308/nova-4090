@@ -8,6 +8,7 @@ import sqlite3
 import argparse
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
 from pathlib import Path
 from rdkit import Chem
@@ -637,7 +638,11 @@ def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float
 
 
 def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
-    """Write scored molecules to the database."""
+    """Write scored molecules to the database.
+
+    scored_at is always set explicitly so inserts stay non-NULL even when the
+    table was recreated without DEFAULT CURRENT_TIMESTAMP (e.g. after merge).
+    """
     if db_path is None:
         db_path = SCORE_RESULTS_DB
 
@@ -648,17 +653,18 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         to_insert = []
         for mol in molecules:
             molecule_name = mol.get('name')
             score = mol.get('boltz_score')
 
             if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score), True))
+                to_insert.append((molecule_name, float(score), now, True))
 
         if to_insert:
             cursor.executemany(
-                "INSERT INTO scored_molecules (molecule_name, score, available) VALUES (?, ?, ?)",
+                "INSERT INTO scored_molecules (molecule_name, score, scored_at, available) VALUES (?, ?, ?, ?)",
                 to_insert
             )
             conn.commit()
