@@ -17,9 +17,11 @@ Pipeline:
   2. Fix the given component(s); enumerate ALL valid molecules by
      varying the remaining (free) component
   3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
-  4. Surrogate pre-score the full valid set
-  5. Keep top-n by predicted score
-  6. Boltz-score the top-n survivors IN BATCHES, merging each batch
+  4. Drop molecules already in HuggingFace Submission-Archive
+     (they do NOT count toward the top-n generated budget)
+  5. Surrogate pre-score the full valid set
+  6. Keep top-n by predicted score
+  7. Boltz-score the top-n survivors IN BATCHES, merging each batch
      into score_results_{rxn_id}.sqlite immediately AND printing the
      batch's results table to the terminal (every --boltz_batch_size
      molecules, default 10) — no waiting until the whole run finishes.
@@ -45,7 +47,7 @@ sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 
 from config.config_loader import load_config
-from utils import get_heavy_atom_count, contains_atom_type
+from utils import get_heavy_atom_count, contains_atom_type, molecule_unique_for_protein_hf
 from molecules import MoleculeManager, MoleculeUtils
 
 logging.basicConfig(
@@ -86,7 +88,7 @@ def get_morgan_fingerprint(smiles: str, n_bits: int = 2048) -> Optional[np.ndarr
 # Score DB helpers
 # ═══════════════════════════════════════════════════════════════════════════
 def score_db_path(rxn_id: int) -> str:
-    return os.path.join(BASE_DIR, f"score_results_{rxn_id}.sqlite")
+    return os.path.join(BASE_DIR, f"scrore_{rxn_id}.sqlite")
 
 
 def init_score_results_db(db_path: str) -> None:
@@ -444,7 +446,33 @@ async def run_component_exhaust(
         logger.warning("[Exhaust] All candidates already scored — nothing to do")
         return pd.DataFrame()
 
-    # ── 4. Surrogate pre-score ALL valid candidates ─────────────────────
+    # ── 4. Skip molecules already in HuggingFace (do not count as generated)
+    primary_target = target_proteins[0] if target_proteins else None
+    if primary_target:
+        pre = len(valid_df)
+        unique_mask = valid_df["smiles"].apply(
+            lambda s: molecule_unique_for_protein_hf(primary_target, s)
+        )
+        valid_df = valid_df[unique_mask].reset_index(drop=True)
+        n_hf_skipped = pre - len(valid_df)
+        if n_hf_skipped:
+            logger.info(
+                f"[Exhaust] Skipped {n_hf_skipped} molecules already in "
+                f"HuggingFace for {primary_target} "
+                f"(not counted toward top-{n})"
+            )
+    else:
+        logger.warning(
+            "[Exhaust] No target protein — skipping HuggingFace uniqueness check"
+        )
+
+    if valid_df.empty:
+        logger.warning(
+            "[Exhaust] All candidates already in HuggingFace — nothing to do"
+        )
+        return pd.DataFrame()
+
+    # ── 5. Surrogate pre-score ALL valid (non-HF) candidates ────────────
     if surrogate.is_trained:
         t0 = time.time()
         preds = surrogate.predict(valid_df["smiles"].tolist())
@@ -461,11 +489,11 @@ async def run_component_exhaust(
         )
         valid_df = valid_df.sample(frac=1.0, random_state=42)
 
-    # ── 5. Keep top n ────────────────────────────────────────────────────
+    # ── 6. Keep top n (HF molecules already excluded above) ─────────────
     top_df = valid_df.head(n).reset_index(drop=True)
     logger.info(f"[Exhaust] Selected top {len(top_df)} for Boltz scoring")
 
-    # ── 6. Boltz score in batches — PRINT + MERGE after EVERY batch ────
+    # ── 7. Boltz score in batches — PRINT + MERGE after EVERY batch ────
     all_scored = []
     total_batches = (len(top_df) + boltz_batch_size - 1) // boltz_batch_size
     total_written = 0
