@@ -362,7 +362,8 @@ def get_reaction_score_db_path(allowed_reaction: str) -> Optional[str]:
         )
         return None
 
-    return os.path.join(BASE_DIR, f"score_results_{reaction_id}.sqlite")
+    # return os.path.join(BASE_DIR, f"score_results_{reaction_id}.sqlite")
+    return os.path.join(BASE_DIR, f"score_{reaction_id}.sqlite")
 
 
 def get_top_n_molecules_from_db(
