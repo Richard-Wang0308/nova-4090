@@ -61,8 +61,8 @@ MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize
 _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
-SURROGATE_TOP_N = 2000
-SURROGATE_BOTTOM_N = 2000
+SURROGATE_TOP_N = 2500
+SURROGATE_BOTTOM_N = 2500
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -88,7 +88,7 @@ def get_morgan_fingerprint(smiles: str, n_bits: int = 2048) -> Optional[np.ndarr
 # Score DB helpers
 # ═══════════════════════════════════════════════════════════════════════════
 def score_db_path(rxn_id: int) -> str:
-    return os.path.join(BASE_DIR, f"scrore_{rxn_id}.sqlite")
+    return os.path.join(BASE_DIR, f"score_results_{rxn_id}.sqlite")
 
 
 def init_score_results_db(db_path: str) -> None:
