@@ -317,8 +317,14 @@ def generate_valid_random_molecules(
     seen_molecules: set = None,
     component_weights: dict = None,
 ) -> List[str]:
-    """Generate random valid molecule names from component pools."""
-    seen   = seen_molecules or set()
+    """Generate random valid molecule names from component pools.
+
+    Uses a local copy of ``seen_molecules`` for within-batch uniqueness.
+    Must NOT mutate the caller's set — otherwise newly generated names are
+    added to ``seen`` before scoring, and a later dedup step drops them all.
+    """
+    # Copy so we never mutate the caller's seen set (scored-only).
+    seen   = set(seen_molecules) if seen_molecules else set()
     sub    = molecule_manager
     pool_A = sub.moles_A_id
     pool_B = sub.moles_B_id
