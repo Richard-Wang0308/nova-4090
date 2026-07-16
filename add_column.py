@@ -451,3 +451,4 @@ if __name__ == "__main__":
             db_path=args.db_path,
         )
     )
+#python3 add_column.py --db-path score_results_2.sqlite --force
