@@ -17,11 +17,12 @@ Pipeline:
   2. Fix the given component(s); enumerate ALL valid molecules by
      varying the remaining (free) component
   3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
-  4. Drop molecules already in HuggingFace Submission-Archive
+  4. Drop molecules already in score_results_{rxn_id}.sqlite or data/rxn{rxn_id}.csv
+  5. Drop molecules already in HuggingFace Submission-Archive
      (they do NOT count toward the top-n generated budget)
-  5. Surrogate pre-score the full valid set
-  6. Keep top-n by predicted score
-  7. Boltz-score the top-n survivors IN BATCHES, merging each batch
+  6. Surrogate pre-score the full valid set
+  7. Keep top-n by predicted score
+  8. Boltz-score the top-n survivors IN BATCHES, merging each batch
      into score_results_{rxn_id}.sqlite immediately AND printing the
      batch's results table to the terminal (every --boltz_batch_size
      molecules, default 10) — no waiting until the whole run finishes.
@@ -91,6 +92,37 @@ def score_db_path(rxn_id: int) -> str:
     return os.path.join(BASE_DIR, f"score_results_{rxn_id}.sqlite")
 
 
+def rxn_csv_path(rxn_id: int) -> str:
+    return os.path.join(BASE_DIR, "data", f"rxn{rxn_id}.csv")
+
+
+def get_scored_names_from_csv(rxn_id: int) -> set:
+    """Return molecule names listed in data/rxn{rxn_id}.csv for this reaction."""
+    csv_path = rxn_csv_path(rxn_id)
+    if not os.path.exists(csv_path):
+        return set()
+    try:
+        df = pd.read_csv(csv_path, header=0)
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "molecule_name" not in df.columns:
+            logger.warning(
+                f"[Exhaust] {os.path.basename(csv_path)}: "
+                f"no molecule_name column — skipping CSV dedup"
+            )
+            return set()
+        df["molecule_name"] = (
+            df["molecule_name"].astype(str).str.strip().str.lstrip("\ufeff")
+        )
+        prefix = f"rxn:{rxn_id}:"
+        names = df[
+            df["molecule_name"].str.startswith(prefix, na=False)
+        ]["molecule_name"].tolist()
+        return set(names)
+    except Exception as e:
+        logger.warning(f"[Exhaust] Failed to read {csv_path}: {e}")
+        return set()
+
+
 def init_score_results_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -125,18 +157,32 @@ def load_all_scored(db_path: str, rxn_id: int) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def get_already_scored_names(db_path: str, names: List[str]) -> set:
-    if not names or not os.path.exists(db_path):
+def get_already_scored_names(
+    db_path: str,
+    rxn_id: int,
+    names: List[str],
+) -> set:
+    """Return names already present in sqlite and/or data/rxn{rxn_id}.csv."""
+    if not names:
         return set()
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    placeholders = ",".join("?" * len(names))
-    cur.execute(
-        f"SELECT molecule_name FROM scored_molecules WHERE molecule_name IN ({placeholders})",
-        names,
-    )
-    found = {r[0] for r in cur.fetchall()}
-    conn.close()
+
+    name_set = set(names)
+    found: set = set()
+
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        placeholders = ",".join("?" * len(names))
+        cur.execute(
+            f"SELECT molecule_name FROM scored_molecules "
+            f"WHERE molecule_name IN ({placeholders})",
+            names,
+        )
+        found |= {r[0] for r in cur.fetchall()}
+        conn.close()
+
+    csv_names = get_scored_names_from_csv(rxn_id)
+    found |= name_set & csv_names
     return found
 
 
@@ -432,14 +478,18 @@ async def run_component_exhaust(
         logger.warning("[Exhaust] No valid molecules — aborting")
         return pd.DataFrame()
 
-    # ── 3. Optionally skip already-scored ───────────────────────────────
+    # ── 3. Optionally skip already-scored (sqlite + rxn CSV) ───────────
     if skip_already_scored:
-        already = get_already_scored_names(db_path, valid_df["name"].tolist())
+        already = get_already_scored_names(
+            db_path, rxn_id, valid_df["name"].tolist(),
+        )
         if already:
             pre = len(valid_df)
             valid_df = valid_df[~valid_df["name"].isin(already)].reset_index(drop=True)
+            csv_path = rxn_csv_path(rxn_id)
             logger.info(
-                f"[Exhaust] Skipped {pre - len(valid_df)} already-scored molecules"
+                f"[Exhaust] Skipped {pre - len(valid_df)} already-scored molecules "
+                f"(checked sqlite + {os.path.basename(csv_path)})"
             )
 
     if valid_df.empty:
@@ -605,7 +655,7 @@ def parse_args():
     )
     parser.add_argument(
         "--rescore_seen", action="store_true",
-        help="If set, do NOT skip molecules already scored in the DB.",
+        help="If set, do NOT skip molecules already in sqlite or rxn CSV.",
     )
     return parser.parse_args()
 
