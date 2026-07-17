@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import time
 from typing import Dict, Any
 import bittensor as bt
 from combinatorial_db.reactions import get_smiles_from_reaction
@@ -189,7 +190,9 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         force_recalculate: If True, recalculate all molecules. If False, only process TRUE values.
     """
     try:
+        t0 = time.perf_counter()
         conn = sqlite3.connect(db_path)
+        bt.logging.info(f"⏱️  DB connect: {time.perf_counter() - t0:.3f}s ({db_path})")
         cursor = conn.cursor()
 
         if not scored_molecules_table_exists(cursor):
@@ -223,6 +226,10 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         error_count = 0
         updated_to_false = 0
         updated_to_true = 0
+        uniqueness_checks = 0
+        uniqueness_batch_time = 0.0
+        uniqueness_total_time = 0.0
+        overall_start = time.perf_counter()
         
         for idx, (molecule_name,) in enumerate(molecules, 1):
             try:
@@ -236,7 +243,12 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                     error_count += 1
                 else:
                     # Check if molecule is unique
+                    t_unique = time.perf_counter()
                     available = await check_molecule_unique(target_protein, molecule_name, smiles)
+                    unique_elapsed = time.perf_counter() - t_unique
+                    uniqueness_checks += 1
+                    uniqueness_batch_time += unique_elapsed
+                    uniqueness_total_time += unique_elapsed
                     
                     if available:
                         updated_to_true += 1
@@ -250,6 +262,15 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                     "UPDATE scored_molecules SET available = ? WHERE molecule_name = ?",
                     (available, molecule_name)
                 )
+                
+                if uniqueness_checks > 0 and uniqueness_checks % 1000 == 0:
+                    bt.logging.info(
+                        f"⏱️  Uniqueness check: last 1000 rows took {uniqueness_batch_time:.3f}s "
+                        f"({uniqueness_batch_time / 1000:.4f}s/row) | "
+                        f"total uniqueness so far: {uniqueness_total_time:.3f}s "
+                        f"over {uniqueness_checks} checks"
+                    )
+                    uniqueness_batch_time = 0.0
                 
                 if idx % 100 == 0:
                     conn.commit()
@@ -269,13 +290,34 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                 )
                 updated_to_false += 1
         
+        # Report remaining uniqueness checks that didn't fill a full 1000-row batch
+        remainder = uniqueness_checks % 1000
+        if remainder > 0:
+            bt.logging.info(
+                f"⏱️  Uniqueness check: last {remainder} rows took {uniqueness_batch_time:.3f}s "
+                f"({uniqueness_batch_time / remainder:.4f}s/row) | "
+                f"total uniqueness: {uniqueness_total_time:.3f}s "
+                f"over {uniqueness_checks} checks"
+            )
+        
         conn.commit()
         conn.close()
         
+        overall_elapsed = time.perf_counter() - overall_start
         bt.logging.info("=" * 70)
         bt.logging.info(f"✅ Successfully processed {total} molecules")
         bt.logging.info(f"   Success: {success_count} | Errors: {error_count}")
         bt.logging.info(f"   Updated to TRUE: {updated_to_true} | Updated to FALSE: {updated_to_false}")
+        bt.logging.info(
+            f"⏱️  Timing summary: overall={overall_elapsed:.3f}s | "
+            f"uniqueness_total={uniqueness_total_time:.3f}s "
+            f"({uniqueness_checks} checks"
+            + (
+                f", avg {uniqueness_total_time / uniqueness_checks:.4f}s/row)"
+                if uniqueness_checks
+                else ")"
+            )
+        )
         bt.logging.info("=" * 70)
         
     except Exception as e:
@@ -420,6 +462,9 @@ async def main(
 if __name__ == "__main__":
     import asyncio
     import argparse
+
+    # bt.logging defaults to WARNING; enable INFO so progress/timing logs are visible
+    bt.logging.enable_info()
 
     parser = argparse.ArgumentParser(
         description="Fix/refresh the 'available' column in a score_results SQLite DB."

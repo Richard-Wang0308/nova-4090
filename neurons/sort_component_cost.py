@@ -265,21 +265,13 @@ def parse_args():
     parser.add_argument(
         "--surrogate_top_n",
         type=int,
-<<<<<<< HEAD
         default=5500,
-=======
-        default=4000,
->>>>>>> 2788d819ed1a705736a259057b23a621ca1a911e
         help="Top-N scored molecules used to train surrogate. Default 4000.",
     )
     parser.add_argument(
         "--surrogate_bottom_n",
         type=int,
-<<<<<<< HEAD
         default=5500,
-=======
-        default=4000,
->>>>>>> 2788d819ed1a705736a259057b23a621ca1a911e
         help="Bottom-N scored molecules used to train surrogate. Default 4000.",
     )
 
