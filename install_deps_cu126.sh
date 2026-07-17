@@ -28,13 +28,10 @@ cd ..
 python3 -m venv .venv && source .venv/bin/activate \
         && uv pip install -r requirements/requirements.txt \
         && uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 \
-        && uv pip install torch-geometric==2.6.1 \
-        && uv pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
         && uv pip install patchelf \
         && uv pip install maturin==1.8.3 \
         && uv pip install -e boltz
 
-pip install pytorch-lightning
 
 # Build timelock Python bindings (WASM)
 export PYO3_CROSS_PYTHON_VERSION="3.12" && cd timelock/wasm && ./wasm_build_py.sh && cd ../..
@@ -43,8 +40,9 @@ export PYO3_CROSS_PYTHON_VERSION="3.12" && cd timelock/wasm && ./wasm_build_py.s
 cd timelock/py && uv pip install --upgrade build && python3.12 -m build
 uv pip install timelock
 
-uv pip install async-substrate-interface==1.6.2
+uv pip install cuequivariance-torch cuequivariance-ops-cu12 cuequivariance-ops-torch-cu12
 
-pip install cuequivariance-torch cuequivariance-ops-cu12 cuequivariance-ops-torch-cu12
+pip uninstall scalecodec cyscale -y
+pip install -U cyscale --force-reinstall
 
 echo "Installation complete."

@@ -142,12 +142,18 @@ def parse_arguments() -> argparse.Namespace:
         help="The chain subnet uid"
     )
 
-    bt.subtensor.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
+    bt.Wallet.add_args(parser)
 
-    config = bt.config(parser)
+    # bt.Config drops custom top-level args on bittensor>=10; capture them first.
+    args = parser.parse_args()
+    config = bt.Config(parser)
     config.update(load_config())
+    config.netuid = args.netuid
+    config.network = args.network
+    if getattr(config, "subtensor", None) is not None:
+        config.subtensor.network = args.network
 
     # Use first wallet name for logging path (representative)
     primary_wallet_name = WALLET_HOTKEY_PAIRS[0][0] if WALLET_HOTKEY_PAIRS else "multi_wallet"
@@ -236,7 +242,7 @@ async def setup_bittensor_objects(
                 f"   Attempting connection (attempt {attempt + 1}/{max_retries})..."
             )
 
-            subtensor = bt.async_subtensor(network=config.network)
+            subtensor = bt.AsyncSubtensor(network=config.network)
 
             async with subtensor:
                 metagraph = await subtensor.metagraph(config.netuid)
@@ -253,7 +259,7 @@ async def setup_bittensor_objects(
                 for idx, (wallet_name, hotkey_name) in enumerate(WALLET_HOTKEY_PAIRS, 1):
                     label = f"{wallet_name}/{hotkey_name}"
                     try:
-                        wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
+                        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
 
                         # Verify the hotkey exists on disk before querying metagraph
                         _ = wallet.hotkey  # raises if key file missing
@@ -298,7 +304,7 @@ async def setup_bittensor_objects(
                 )
 
             # Reinitialize subtensor for main loop
-            subtensor = bt.async_subtensor(network=config.network)
+            subtensor = bt.AsyncSubtensor(network=config.network)
             await subtensor.initialize()
 
             return wallets, subtensor, metagraph, miner_uids, EPOCH_LENGTH
