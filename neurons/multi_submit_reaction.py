@@ -530,7 +530,7 @@ async def get_verified_top_n_molecules(
     """
     Fast path for epoch submission:
     1. Load only the top `candidate_pool` molecules by score that are still
-        marked available (or never checked).
+        marked available (available = TRUE).
     2. Re-check HuggingFace uniqueness for those candidates only.
     3. Stop as soon as `n` verified-available molecules are found.
     4. Persist updated available flags for every candidate checked.
@@ -552,7 +552,7 @@ async def get_verified_top_n_molecules(
             """
             SELECT molecule_name, score
             FROM   scored_molecules
-            WHERE  available IS NULL OR available = TRUE
+            WHERE  available = TRUE
             ORDER  BY score DESC
             LIMIT  ?
             """,

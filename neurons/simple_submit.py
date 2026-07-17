@@ -9,6 +9,7 @@ Simple workflow:
 4. Load molecules from molecule.json (array of molecule entries)
 5. Check each molecule for uniqueness in HuggingFace
 6. Submit one molecule per wallet/hotkey pair
+7. Exit after that submission attempt completes
 """
 
 import os
@@ -51,8 +52,7 @@ MOLECULE_JSON_PATH = os.path.join(BASE_DIR, "molecule.json")
 # One molecule is submitted per pair, in order.
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova", "notc"),
-    ("nova", "notd"),
+    ("nova", "notd")
 ]
 # ============================================================================
 
@@ -117,14 +117,38 @@ def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Opt
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--network', default=os.getenv('SUBTENSOR_NETWORK'), help='Network to use')
+    parser.add_argument(
+        '--network',
+        default=os.getenv('SUBTENSOR_NETWORK', 'finney'),
+        help='Network to use',
+    )
     parser.add_argument('--netuid', type=int, default=68, help="The chain subnet uid.")
-    bt.subtensor.add_args(parser)
+    bt.Subtensor.add_args(parser)
     bt.logging.add_args(parser)
-    bt.wallet.add_args(parser)
+    bt.Wallet.add_args(parser)
 
-    config = bt.config(parser)
+    # bt.Config on bittensor>=10 drops custom args and nested store_true
+    # flags (e.g. --logging.debug). Capture from argparse and write back.
+    args = parser.parse_args()
+    config = bt.Config(parser)
     config.update(load_config())
+    config.netuid = args.netuid
+    config.network = args.network
+    if getattr(config, "subtensor", None) is not None:
+        config.subtensor.network = args.network
+
+    args_dict = vars(args)
+    for key in (
+        "logging.debug",
+        "logging.trace",
+        "logging.info",
+        "logging.record_log",
+        "logging.enable_third_party_loggers",
+    ):
+        if key in args_dict and getattr(config, "logging", None) is not None:
+            setattr(config.logging, key.split(".", 1)[1], args_dict[key])
+    if "logging.logging_dir" in args_dict and getattr(config, "logging", None) is not None:
+        config.logging.logging_dir = args_dict["logging.logging_dir"]
 
     primary_wallet_name = WALLET_HOTKEY_PAIRS[0][0] if WALLET_HOTKEY_PAIRS else config.wallet.name
 
@@ -183,7 +207,7 @@ async def setup_bittensor_objects(
     bt.logging.info("Setting up Bittensor objects.")
 
     epoch_length = EPOCH_LENGTH
-    subtensor = bt.async_subtensor(network=config.network)
+    subtensor = bt.AsyncSubtensor(network=config.network)
 
     async with subtensor:
         metagraph = await subtensor.metagraph(config.netuid)
@@ -196,7 +220,7 @@ async def setup_bittensor_objects(
         for idx, (wallet_name, hotkey_name) in enumerate(WALLET_HOTKEY_PAIRS, 1):
             label = f"{wallet_name}/{hotkey_name}"
             try:
-                wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
+                wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
                 _ = wallet.hotkey
 
                 miner_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
@@ -220,7 +244,7 @@ async def setup_bittensor_objects(
                 "Check WALLET_HOTKEY_PAIRS configuration."
             )
 
-    subtensor = bt.async_subtensor(network=config.network)
+    subtensor = bt.AsyncSubtensor(network=config.network)
     await subtensor.initialize()
 
     bt.logging.info(f"Epoch length: {epoch_length} blocks")
@@ -412,8 +436,14 @@ async def submit_response(
 # EPOCH SUBMISSION
 # ============================================================================
 
-async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None:
-    """Submit molecules from molecule.json when the epoch allows rxn:2."""
+async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> bool:
+    """
+    Submit molecules from molecule.json when the epoch allows rxn:2.
+
+    Returns:
+        True if a submission attempt was made for the required reaction,
+        False if this epoch was skipped (wrong reaction / setup failure).
+    """
     config = state['config']
     subtensor = state['subtensor']
     epoch_length = state['epoch_length']
@@ -430,7 +460,7 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
 
         if not challenge_params:
             bt.logging.error("Failed to get challenge params from blockhash")
-            return
+            return False
 
         allowed_reaction = challenge_params.get("allowed_reaction")
         bt.logging.info(f"Current block: {current_block}")
@@ -442,12 +472,12 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
                 f"Allowed reaction is {allowed_reaction}, not {REQUIRED_ALLOWED_REACTION}. "
                 "Skipping submission for this epoch."
             )
-            return
+            return False
 
         small_molecule_target = challenge_params.get("small_molecule_target")
         if not small_molecule_target:
             bt.logging.error("No small_molecule_target in challenge params")
-            return
+            return False
 
         state['current_challenge_targets'] = [small_molecule_target]
         bt.logging.info(
@@ -459,7 +489,7 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
     except Exception as e:
         bt.logging.error(f"Failed during epoch {current_epoch} setup: {e}")
         bt.logging.error(traceback.format_exc())
-        return
+        return False
 
     wallets = state['wallets']
     miner_uids = state['miner_uids']
@@ -523,11 +553,13 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
     bt.logging.info(
         f"Epoch {current_epoch} submission complete: {success_count}/{len(results)} successful"
     )
+    return True
 
 
 async def run_epoch_loop(state: Dict[str, Any]) -> None:
     """
-    Monitor blockchain and submit immediately on startup and on epoch change.
+    Monitor blockchain and submit when the epoch allows the required reaction.
+    Exits after that submission attempt completes.
     """
     bt.logging.info("Starting epoch monitoring loop...")
 
@@ -562,10 +594,11 @@ async def run_epoch_loop(state: Dict[str, Any]) -> None:
                         f"— submitting immediately"
                     )
 
-                await do_epoch_submission(state, current_epoch)
+                submitted = await do_epoch_submission(state, current_epoch)
                 last_acted_epoch = current_epoch
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+                if submitted:
+                    bt.logging.info("Submission finished — exiting.")
+                    return
 
             await asyncio.sleep(POLL_INTERVAL)
 
