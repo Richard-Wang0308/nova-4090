@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 TABLE_NAME = "scored_molecules"
 
@@ -24,17 +25,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge two SQLite score databases.")
     parser.add_argument(
         "--db1",
-        default="score_results_2.sqlite",
+        default=str(BASE_DIR / "score_results_2.sqlite"),
         help="Path to first SQLite database.",
     )
     parser.add_argument(
         "--db2",
-        default="score_results_2_2769.sqlite",
+        default=str(BASE_DIR / "score_results_2_2769.sqlite"),
         help="Path to second SQLite database.",
     )
     parser.add_argument(
         "--out",
-        default="merged.sqlite",
+        default=str(BASE_DIR / "merged.sqlite"),
         help="Path to output merged SQLite database.",
     )
     return parser.parse_args()
@@ -147,9 +148,16 @@ def merge_databases(db1: Path, db2: Path, out_db: Path) -> int:
 
 def main() -> None:
     args = parse_args()
-    db1 = Path(args.db1).expanduser().resolve()
-    db2 = Path(args.db2).expanduser().resolve()
-    out_db = Path(args.out).expanduser().resolve()
+
+    def resolve_db_path(path: str) -> Path:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return p.resolve()
+
+    db1 = resolve_db_path(args.db1)
+    db2 = resolve_db_path(args.db2)
+    out_db = resolve_db_path(args.out)
 
     merged_count = merge_databases(db1, db2, out_db)
     print(f"Merged {merged_count} unique molecules into: {out_db}")

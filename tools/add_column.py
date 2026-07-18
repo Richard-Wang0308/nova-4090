@@ -1,7 +1,12 @@
 import sqlite3
 import os
+import sys
 import time
 from typing import Dict, Any
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(BASE_DIR)
+
 import bittensor as bt
 from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
@@ -427,7 +432,10 @@ async def main(
         force_recalculate: If True, recalculate all molecules. If False, only process TRUE values.
         skip_column_fix: If True, skip the column type fix (useful for subsequent runs)
     """
-    db_path = os.path.abspath(os.path.expanduser(db_path))
+    db_path = os.path.expanduser(db_path)
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(BASE_DIR, db_path)
+    db_path = os.path.abspath(db_path)
     if not os.path.exists(db_path):
         bt.logging.warning(
             f"⚠️  Database file does not exist: {db_path}. Skipping update."
@@ -481,7 +489,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--db-path",
-        default=os.path.join(os.path.dirname(__file__), "score_results_1.sqlite"),
+        default=os.path.join(BASE_DIR, "score_results_1.sqlite"),
         help="Path to target SQLite database",
     )
     args = parser.parse_args()
@@ -496,4 +504,4 @@ if __name__ == "__main__":
             db_path=args.db_path,
         )
     )
-#python3 add_column.py --db-path score_results_2.sqlite --force
+#python3 tools/add_column.py --db-path score_results_2.sqlite --force

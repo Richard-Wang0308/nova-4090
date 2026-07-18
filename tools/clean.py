@@ -1,6 +1,10 @@
 import sqlite3
 import math
 import glob
+import os
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 
 def clean_inf_scores(db_path: str):
     conn = sqlite3.connect(db_path)
@@ -22,6 +26,6 @@ def clean_inf_scores(db_path: str):
     conn.execute("VACUUM")
     conn.close()
 
-# run against all rxn score DBs
-for db in glob.glob("score_results_*.sqlite"):
+# run against all rxn score DBs in the project root
+for db in glob.glob(os.path.join(BASE_DIR, "score_results_*.sqlite")):
     clean_inf_scores(db)

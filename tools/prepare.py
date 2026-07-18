@@ -15,9 +15,8 @@ import sys
 import logging
 from typing import Optional, Dict, List
 
-# Add BASE_DIR (nova-4090) to path
-base_dir = os.path.join(os.path.dirname(__file__), '..')
-sys.path.insert(0, base_dir)
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, BASE_DIR)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -36,7 +35,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--start_epoch', type=int, default=23863, help='Starting epoch number to collect from')
     parser.add_argument('--end_epoch', type=int, default=23865, help='Ending epoch number to collect to')
     parser.add_argument('--metric', type=str, default='boltz', help='Metric type')
-    parser.add_argument('--output_dir', type=str, default='data', help='Output directory for rxn{1..5}.csv files')
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default=os.path.join(BASE_DIR, 'data'),
+        help='Output directory for rxn{1..5}.csv files',
+    )
     parser.add_argument('--time', type=int, default=1,
                        help='Remaining time in seconds until first collection. If None, collect immediately.')
 
@@ -365,6 +369,9 @@ async def main_async(config: argparse.Namespace):
 
 def main():
     args = parse_arguments()
+    if not os.path.isabs(args.output_dir):
+        args.output_dir = os.path.join(BASE_DIR, args.output_dir)
+    args.output_dir = os.path.abspath(args.output_dir)
     asyncio.run(main_async(args))
 
 

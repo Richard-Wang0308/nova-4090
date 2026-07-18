@@ -2,9 +2,11 @@ import sqlite3
 import csv
 import os
 
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 # ── Config ──────────────────────────────────────────────
-SQLITE_FILE = "score_results_5.sqlite"   # <-- change this
-OUTPUT_CSV  = "data/rxn5.csv"   # <-- change this (optional)
+SQLITE_FILE = os.path.join(BASE_DIR, "score_results_5.sqlite")   # <-- change this
+OUTPUT_CSV  = os.path.join(BASE_DIR, "data", "rxn5.csv")   # <-- change this (optional)
 TABLE_NAME  = "scored_molecules"
 COLUMNS     = ["molecule_name", "score"]
 SORT_ORDER  = "DESC"   # "DESC" = highest score first | "ASC" = lowest first
@@ -13,6 +15,8 @@ SORT_ORDER  = "DESC"   # "DESC" = highest score first | "ASC" = lowest first
 def sqlite_to_csv(sqlite_path: str, csv_path: str) -> None:
     if not os.path.exists(sqlite_path):
         raise FileNotFoundError(f"SQLite file not found: {sqlite_path}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
 
     with sqlite3.connect(sqlite_path) as conn:
         cursor = conn.cursor()

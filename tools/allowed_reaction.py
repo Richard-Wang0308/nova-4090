@@ -11,10 +11,10 @@ import asyncio
 import os
 import sys
 
-import bittensor as bt
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
+
+import bittensor as bt
 
 from config.config_loader import load_config
 from utils import get_challenge_params_from_blockhash, get_total_reactions

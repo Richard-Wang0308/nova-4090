@@ -2,6 +2,10 @@ import os
 import asyncio
 import sys
 from typing import Set, List, Dict, Any
+
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(BASE_DIR)
+
 import pandas as pd
 import bittensor as bt
 from combinatorial_db.reactions import get_smiles_from_reaction
@@ -327,7 +331,7 @@ async def main(mode: str = "check", batch_size: int = 100):
             - "stats": Only show statistics
         batch_size: Number of molecules to process before logging progress
     """
-    csv_path = "data/b.csv"
+    csv_path = os.path.join(BASE_DIR, "data", "b.csv")
     
     if not os.path.exists(csv_path):
         bt.logging.error(f"CSV file not found: {csv_path}")
@@ -421,9 +425,9 @@ Usage:
   python script.py --stats            # Show statistics only
   python script.py --batch-size 500   # Use custom batch size
 
-Input:  data/data.csv
-Output: data/data.csv (with 'available' column added)
-Backup: data/data.csv.backup (created automatically)
+Input:  <project>/data/b.csv
+Output: <project>/data/b.csv (with 'available' column added)
+Backup: <project>/data/b.csv.backup (created automatically)
 
 """)
     

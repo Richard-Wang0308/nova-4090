@@ -19,8 +19,18 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 
 ScoreStats = Dict[str, List[float]]  # reactant_id -> list of scores
+
+
+def resolve_path(path: str) -> str:
+    """Resolve relative paths against the project root (nova-4090)."""
+    path = os.path.expanduser(path)
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -226,7 +236,7 @@ def write_report(
 
 def main() -> None:
     args = parse_args()
-    csv_path = args.csv_path
+    csv_path = resolve_path(args.csv_path)
 
     if not os.path.isfile(csv_path):
         raise SystemExit(f"File not found: {csv_path}")
@@ -235,7 +245,7 @@ def main() -> None:
     if row_count == 0:
         raise SystemExit("No valid molecule rows found in CSV")
 
-    output_path = args.output or default_output_path(csv_path)
+    output_path = resolve_path(args.output) if args.output else default_output_path(csv_path)
     write_report(position_stats, output_path, csv_path, row_count)
 
     print(f"Analyzed {row_count} molecules" + (f" (skipped {skipped})" if skipped else ""))
