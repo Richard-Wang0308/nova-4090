@@ -47,9 +47,8 @@ sys.path.append(BASE_DIR)
 # Add as many wallets/hotkeys as needed.
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova",   "note"),
     ("nova",   "notb"),
-    ("nova",   "nota")
+    ("nova",   "nota"),
     # ("nova",   "notd")
     # ("alpha",  "hotkey1"),
     # ("beta",   "hotkey1"),
