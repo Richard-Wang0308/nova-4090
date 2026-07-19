@@ -41,7 +41,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "csv_path",
+        "--csv_path",
+        required=True,
         help="Path to input CSV (columns: molecule_name, score/final_score, ...)",
     )
     parser.add_argument(
