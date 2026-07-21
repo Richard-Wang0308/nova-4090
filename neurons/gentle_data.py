@@ -17,11 +17,11 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-HARDCODED_RXN_ID = 1
-STARTING_EPOCH = 22608
+HARDCODED_RXN_ID = 5
+STARTING_EPOCH = 23891
 # STARTING_EPOCH = 21801
-REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn1.csv')
-SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_1.sqlite")
+REACTION_TRAIN_CSV = os.path.join(BASE_DIR, 'data', 'rxn5.csv')
+SCORE_RESULTS_DB = os.path.join(BASE_DIR, "score_results_5.sqlite")
 
 from config.config_loader import load_config
 from utils import (

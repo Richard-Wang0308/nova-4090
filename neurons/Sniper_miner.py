@@ -85,7 +85,7 @@ BOLTZ_BUDGET = 600
 
 # Surrogate keep ratio.
 # NOTE: 0.10 means top 10%, not 20%.
-SURROGATE_KEEP_RATIO = 0.10
+SURROGATE_KEEP_RATIO = 0.30
 
 # Surrogate activation threshold.
 SURROGATE_MIN_TRAIN_SIZE = 4000
