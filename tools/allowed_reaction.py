@@ -84,7 +84,7 @@ async def main() -> None:
 
     epoch_start_block = args.epoch * args.epoch_length
 
-    subtensor = bt.async_subtensor(network=args.network)
+    subtensor = bt.AsyncSubtensor(network=args.network)
     await subtensor.initialize()
     try:
         start_block_hash = await subtensor.determine_block_hash(epoch_start_block)

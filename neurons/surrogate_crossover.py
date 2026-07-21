@@ -48,7 +48,7 @@ BoltzWrapper = None
 #   trained) → Boltz. Below the min-train-size threshold, fall back to a
 #   hard BOLTZ_BUDGET cap so Boltz never gets flooded.
 GENERATE_MULTIPLIER      = 1      # generate 1x the desired batch size
-BOLTZ_BUDGET             = 600    # hard cap while surrogate is not trained
+BOLTZ_BUDGET             = 1500    # hard cap while surrogate is not trained
 SURROGATE_KEEP_RATIO     = 0.1   # keep top 20% once surrogate is trained
 SURROGATE_MIN_TRAIN_SIZE = 4000   # min samples before surrogate activates
 
