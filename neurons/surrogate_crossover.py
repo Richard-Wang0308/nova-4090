@@ -21,7 +21,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-STARTING_EPOCH = 23970
+STARTING_EPOCH = 23980
 
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None

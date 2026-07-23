@@ -1,31 +1,28 @@
 """
-component_exhaust.py — Exhaustive single-component search with surrogate
+component_exhaust.py — Iterative component search with surrogate
 pre-filtering + Boltz scoring, for a fixed reaction (2 or 3 reactants).
 
-2-reactant (A:B) usage:
-    python component_exhaust.py --rxn_id 2 --fix A --value 73951 --n 1000
-    python component_exhaust.py --rxn_id 2 --fix B --value 171540 --n 1000
+2-reactant (A:B) usage — fix 1, vary 1:
+    python component_exhaust.py --rxn_id 2 --fix A --value 73951 --n 100 --iterations 10
+    python component_exhaust.py --rxn_id 2 --fix B --value 171540 --n 100 --iterations 10
 
-3-reactant (A:B:C) usage:
-    python component_exhaust.py --rxn_id 3 --fix A,B --value 55,120 --n 150
-    python component_exhaust.py --rxn_id 3 --fix A,C --value 55,9   --n 150
-    python component_exhaust.py --rxn_id 3 --fix B,C --value 120,9 --n 150
+3-reactant (A:B:C) usage — fix 1, vary 2:
+    python component_exhaust.py --rxn_id 3 --fix A --value 55  --n 100 --iterations 20
+    python component_exhaust.py --rxn_id 3 --fix B --value 120 --n 100 --iterations 20
+    python component_exhaust.py --rxn_id 3 --fix C --value 9   --n 100 --iterations 20
 
-Pipeline:
-  1. Train surrogate on top-4000 + bottom-4000 scored molecules
+Pipeline (repeated for --iterations rounds):
+  1. Train / retrain surrogate on top-4000 + bottom-4000 scored molecules
      (rxn-specific, from score_results_{rxn_id}.sqlite)
-  2. Fix the given component(s); enumerate ALL valid molecules by
-     varying the remaining (free) component
+  2. Sample up to --sample_size candidates (max 10000) from the free
+     component space — never materialize the full cartesian product
   3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
-  4. Drop molecules already in score_results_{rxn_id}.sqlite or data/rxn{rxn_id}.csv
+  4. Drop molecules already scored (sqlite / rxn CSV) or already sampled
   5. Drop molecules already in HuggingFace Submission-Archive
-     (they do NOT count toward the top-n generated budget)
-  6. Surrogate pre-score the full valid set
-  7. Keep top-n by predicted score
-  8. Boltz-score the top-n survivors IN BATCHES, merging each batch
-     into score_results_{rxn_id}.sqlite immediately AND printing the
-     batch's results table to the terminal (every --boltz_batch_size
-     molecules, default 10) — no waiting until the whole run finishes.
+  6. Surrogate pre-score the sampled valid set; keep top-n
+  7. Boltz-score top-n in batches, merging each batch into
+     score_results_{rxn_id}.sqlite immediately
+  8. Retrain surrogate on updated DB before the next iteration
 """
 import os
 import sys
@@ -36,11 +33,14 @@ import sqlite3
 import argparse
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from sklearn.ensemble import RandomForestRegressor
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 from rdkit.Chem import rdFingerprintGenerator
+
+# Max candidates considered per iteration (hard cap)
+MAX_SAMPLE_PER_ITER = 10_000
 
 # ── project root ──────────────────────────────────────────────────────────
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -62,8 +62,8 @@ MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize
 _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
-SURROGATE_TOP_N = 2500
-SURROGATE_BOTTOM_N = 2500
+SURROGATE_TOP_N = 6000
+SURROGATE_BOTTOM_N = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -172,13 +172,17 @@ def get_already_scored_names(
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        placeholders = ",".join("?" * len(names))
-        cur.execute(
-            f"SELECT molecule_name FROM scored_molecules "
-            f"WHERE molecule_name IN ({placeholders})",
-            names,
-        )
-        found |= {r[0] for r in cur.fetchall()}
+        # Chunk to stay under SQLite variable limits
+        chunk_size = 900
+        for i in range(0, len(names), chunk_size):
+            chunk = names[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            cur.execute(
+                f"SELECT molecule_name FROM scored_molecules "
+                f"WHERE molecule_name IN ({placeholders})",
+                chunk,
+            )
+            found |= {r[0] for r in cur.fetchall()}
         conn.close()
 
     csv_names = get_scored_names_from_csv(rxn_id)
@@ -326,34 +330,128 @@ def build_and_validate(names: List[str], config: Dict) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Candidate enumeration (generic — works for 2 or 3 component reactions)
+# Candidate sampling (never materializes the full cartesian product)
 # ═══════════════════════════════════════════════════════════════════════════
-def build_candidate_names(
-    rxn_id: int,
+def _vary_pools(
     manager: MoleculeManager,
-    vary_role: str,
-    fixed: Dict[str, int],
-) -> List[str]:
-    """
-    vary_role: 'A', 'B', or 'C' — the component to enumerate over ALL ids
-    fixed: dict of the OTHER component(s) held constant, e.g. {'B': 171540}
-           or {'B': 171540, 'C': 9} for 3-component reactions
-    """
+    vary_roles: List[str],
+) -> List[List[int]]:
     pool_map = {
         "A": manager.moles_A_id,
         "B": manager.moles_B_id,
         "C": manager.moles_C_id,
     }
-    vary_pool = pool_map[vary_role]
+    if not vary_roles:
+        raise ValueError("vary_roles must be non-empty")
+    pools = []
+    for role in vary_roles:
+        if role not in pool_map:
+            raise ValueError(f"Invalid vary_role={role}")
+        pools.append([int(x) for x in pool_map[role]])
+    return pools
+
+
+def candidate_space_size(manager: MoleculeManager, vary_roles: List[str]) -> int:
+    pools = _vary_pools(manager, vary_roles)
+    total = 1
+    for p in pools:
+        total *= max(len(p), 0)
+    return int(total)
+
+
+def _decode_flat_index(
+    idx: int,
+    vary_roles: List[str],
+    pools: List[List[int]],
+    sizes: List[int],
+) -> Dict[str, int]:
+    """Decode a flat product index into role→id (same order as itertools.product)."""
+    parts: Dict[str, int] = {}
+    rem = int(idx)
+    coords = []
+    for size in reversed(sizes):
+        coords.append(rem % size)
+        rem //= size
+    coords.reverse()
+    for role, pool, coord in zip(vary_roles, pools, coords):
+        parts[role] = pool[coord]
+    return parts
+
+
+def _format_name(
+    rxn_id: int,
+    parts: Dict[str, int],
+    is_three: bool,
+) -> str:
+    if is_three:
+        return f"rxn:{rxn_id}:{parts['A']}:{parts['B']}:{parts['C']}"
+    return f"rxn:{rxn_id}:{parts['A']}:{parts['B']}"
+
+
+def sample_candidate_names(
+    rxn_id: int,
+    manager: MoleculeManager,
+    vary_roles: List[str],
+    fixed: Dict[str, int],
+    sample_size: int,
+    rng: np.random.Generator,
+    exclude: Optional[Set[str]] = None,
+) -> List[str]:
+    """
+    Sample up to `sample_size` unique molecule names from the free-role
+    cartesian product without enumerating the full space.
+
+    exclude: names already considered / scored — skipped when drawn.
+    """
+    pools = _vary_pools(manager, vary_roles)
+    sizes = [len(p) for p in pools]
+    if any(s == 0 for s in sizes):
+        return []
+
+    total = 1
+    for s in sizes:
+        total *= s
+
+    want = min(int(sample_size), total, MAX_SAMPLE_PER_ITER)
+    if want <= 0:
+        return []
 
     is_three = manager.is_three_component
-    names = []
-    for vid in vary_pool:
-        parts = {**fixed, vary_role: vid}
-        if is_three:
-            names.append(f"rxn:{rxn_id}:{parts['A']}:{parts['B']}:{parts['C']}")
-        else:
-            names.append(f"rxn:{rxn_id}:{parts['A']}:{parts['B']}")
+    exclude = exclude or set()
+    names: List[str] = []
+    seen_idx: Set[int] = set()
+
+    # When the space is small enough, draw without replacement in one shot
+    if total <= MAX_SAMPLE_PER_ITER * 5:
+        all_idx = rng.permutation(total)
+        for idx in all_idx:
+            idx = int(idx)
+            if idx in seen_idx:
+                continue
+            seen_idx.add(idx)
+            parts = {**fixed, **_decode_flat_index(idx, vary_roles, pools, sizes)}
+            name = _format_name(rxn_id, parts, is_three)
+            if name in exclude:
+                continue
+            names.append(name)
+            if len(names) >= want:
+                break
+        return names
+
+    # Large space: rejection-sample flat indices
+    max_attempts = want * 50
+    attempts = 0
+    while len(names) < want and attempts < max_attempts:
+        attempts += 1
+        idx = int(rng.integers(0, total))
+        if idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        parts = {**fixed, **_decode_flat_index(idx, vary_roles, pools, sizes)}
+        name = _format_name(rxn_id, parts, is_three)
+        if name in exclude:
+            continue
+        names.append(name)
     return names
 
 
@@ -444,119 +542,32 @@ async def score_with_boltz(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Generic exhaustive-search runner (incremental DB merge + terminal print)
+# Iterative search runner (sample → filter → Boltz → retrain)
 # ═══════════════════════════════════════════════════════════════════════════
-async def run_component_exhaust(
-    rxn_id: int,
-    manager: MoleculeManager,
-    config: Dict,
-    surrogate: SurrogateModel,
+async def _boltz_score_batches(
     boltz,
+    config: Dict,
     target_proteins: List[str],
-    vary_role: str,
-    fixed: Dict[str, int],
-    n: int,
-    skip_already_scored: bool = True,
-    boltz_batch_size: int = 10,
-) -> pd.DataFrame:
-    db_path = score_db_path(rxn_id)
-    init_score_results_db(db_path)
-
-    logger.info(
-        f"[Exhaust] rxn={rxn_id} | vary={vary_role} | fixed={fixed} | top_n={n}"
-    )
-
-    # ── 1. Enumerate ALL candidates for the varying component ───────────
-    all_names = build_candidate_names(rxn_id, manager, vary_role, fixed)
-    logger.info(f"[Exhaust] Enumerated {len(all_names)} raw candidates")
-
-    # ── 2. Validate ────────────────────────────────────────────────────
-    valid_df = build_and_validate(all_names, config)
-    logger.info(f"[Exhaust] {len(valid_df)} valid molecules after filtering")
-
-    if valid_df.empty:
-        logger.warning("[Exhaust] No valid molecules — aborting")
-        return pd.DataFrame()
-
-    # ── 3. Optionally skip already-scored (sqlite + rxn CSV) ───────────
-    if skip_already_scored:
-        already = get_already_scored_names(
-            db_path, rxn_id, valid_df["name"].tolist(),
-        )
-        if already:
-            pre = len(valid_df)
-            valid_df = valid_df[~valid_df["name"].isin(already)].reset_index(drop=True)
-            csv_path = rxn_csv_path(rxn_id)
-            logger.info(
-                f"[Exhaust] Skipped {pre - len(valid_df)} already-scored molecules "
-                f"(checked sqlite + {os.path.basename(csv_path)})"
-            )
-
-    if valid_df.empty:
-        logger.warning("[Exhaust] All candidates already scored — nothing to do")
-        return pd.DataFrame()
-
-    # ── 4. Skip molecules already in HuggingFace (do not count as generated)
-    primary_target = target_proteins[0] if target_proteins else None
-    if primary_target:
-        pre = len(valid_df)
-        unique_mask = valid_df["smiles"].apply(
-            lambda s: molecule_unique_for_protein_hf(primary_target, s)
-        )
-        valid_df = valid_df[unique_mask].reset_index(drop=True)
-        n_hf_skipped = pre - len(valid_df)
-        if n_hf_skipped:
-            logger.info(
-                f"[Exhaust] Skipped {n_hf_skipped} molecules already in "
-                f"HuggingFace for {primary_target} "
-                f"(not counted toward top-{n})"
-            )
-    else:
-        logger.warning(
-            "[Exhaust] No target protein — skipping HuggingFace uniqueness check"
-        )
-
-    if valid_df.empty:
-        logger.warning(
-            "[Exhaust] All candidates already in HuggingFace — nothing to do"
-        )
-        return pd.DataFrame()
-
-    # ── 5. Surrogate pre-score ALL valid (non-HF) candidates ────────────
-    if surrogate.is_trained:
-        t0 = time.time()
-        preds = surrogate.predict(valid_df["smiles"].tolist())
-        valid_df = valid_df.copy()
-        valid_df["surrogate_score"] = preds
-        valid_df = valid_df.sort_values("surrogate_score", ascending=False)
-        logger.info(
-            f"[Exhaust] Surrogate pre-scored {len(valid_df)} molecules "
-            f"in {time.time()-t0:.2f}s"
-        )
-    else:
-        logger.warning(
-            "[Exhaust] Surrogate NOT trained — falling back to random order"
-        )
-        valid_df = valid_df.sample(frac=1.0, random_state=42)
-
-    # ── 6. Keep top n (HF molecules already excluded above) ─────────────
-    top_df = valid_df.head(n).reset_index(drop=True)
-    logger.info(f"[Exhaust] Selected top {len(top_df)} for Boltz scoring")
-
-    # ── 7. Boltz score in batches — PRINT + MERGE after EVERY batch ────
-    all_scored = []
-    total_batches = (len(top_df) + boltz_batch_size - 1) // boltz_batch_size
+    top_df: pd.DataFrame,
+    db_path: str,
+    boltz_batch_size: int,
+    iter_label: str,
+) -> Tuple[List[Dict], int]:
+    """Boltz-score top_df in batches; merge each batch into DB. Returns (scored, n_written)."""
+    all_scored: List[Dict] = []
     total_written = 0
+    total_batches = (len(top_df) + boltz_batch_size - 1) // boltz_batch_size
 
     for b in range(total_batches):
         batch = top_df.iloc[b * boltz_batch_size : (b + 1) * boltz_batch_size]
         mols = batch[["name", "smiles"]].to_dict("records")
-        logger.info(f"[Exhaust] Boltz batch {b+1}/{total_batches} ({len(mols)} mols)")
+        logger.info(
+            f"[Exhaust] {iter_label} Boltz batch {b+1}/{total_batches} ({len(mols)} mols)"
+        )
 
         scored = await score_with_boltz(boltz, config, target_proteins, mols)
         all_scored.extend(scored)
 
-        # ── Print this batch's results to the terminal right now ───────
         batch_df = pd.DataFrame(scored)
         if not batch_df.empty:
             batch_df = batch_df.sort_values(
@@ -564,68 +575,244 @@ async def run_component_exhaust(
             )
             print(
                 f"\n{'='*70}\n"
-                f"BATCH {b+1}/{total_batches} — {len(scored)} new molecules scored\n"
+                f"{iter_label} BATCH {b+1}/{total_batches} — "
+                f"{len(scored)} new molecules scored\n"
                 f"{'='*70}"
             )
             print(batch_df[["name", "boltz_score"]].to_string(index=False))
             print(f"{'='*70}\n")
 
-        # ✅ Merge this batch into score_results_{rxn_id}.sqlite immediately
         n_written = write_scores_to_db(db_path, scored)
         total_written += n_written
         logger.info(
-            f"[Exhaust] 💾 Merged batch {b+1}/{total_batches} "
-            f"({n_written} rows) → {db_path} "
-            f"(running total: {total_written})"
+            f"[Exhaust] 💾 {iter_label} merged batch {b+1}/{total_batches} "
+            f"({n_written} rows) → {db_path}"
+        )
+
+    return all_scored, total_written
+
+
+async def run_component_exhaust(
+    rxn_id: int,
+    manager: MoleculeManager,
+    config: Dict,
+    surrogate: SurrogateModel,
+    boltz,
+    target_proteins: List[str],
+    vary_roles: List[str],
+    fixed: Dict[str, int],
+    n: int,
+    iterations: int = 1,
+    sample_size: int = MAX_SAMPLE_PER_ITER,
+    skip_already_scored: bool = True,
+    boltz_batch_size: int = 10,
+    seed: int = 42,
+) -> pd.DataFrame:
+    db_path = score_db_path(rxn_id)
+    init_score_results_db(db_path)
+
+    sample_size = max(1, min(int(sample_size), MAX_SAMPLE_PER_ITER))
+    space_size = candidate_space_size(manager, vary_roles)
+    rng = np.random.default_rng(seed)
+
+    logger.info(
+        f"[Exhaust] rxn={rxn_id} | vary={vary_roles} | fixed={fixed} | "
+        f"top_n={n} | iterations={iterations} | sample_size={sample_size} | "
+        f"search_space={space_size:,}"
+    )
+
+    primary_target = target_proteins[0] if target_proteins else None
+    if not primary_target:
+        logger.warning(
+            "[Exhaust] No target protein — skipping HuggingFace uniqueness check"
+        )
+
+    # Names already considered this run (avoid re-sampling across iterations)
+    seen_names: Set[str] = set()
+    all_scored: List[Dict] = []
+    total_written = 0
+
+    for it in range(1, iterations + 1):
+        iter_label = f"iter {it}/{iterations}"
+        logger.info(f"[Exhaust] ── {iter_label} START ──")
+
+        # ── 1. Sample ≤ sample_size candidates (no full enumeration) ───
+        raw_names = sample_candidate_names(
+            rxn_id, manager, vary_roles, fixed,
+            sample_size=sample_size, rng=rng, exclude=seen_names,
+        )
+        if not raw_names:
+            logger.warning(
+                f"[Exhaust] {iter_label}: no new candidates left to sample — stopping"
+            )
+            break
+
+        seen_names.update(raw_names)
+        logger.info(
+            f"[Exhaust] {iter_label}: sampled {len(raw_names)} candidates "
+            f"(seen_total={len(seen_names):,} / space={space_size:,})"
+        )
+
+        # ── 2. Validate ────────────────────────────────────────────────
+        valid_df = build_and_validate(raw_names, config)
+        logger.info(
+            f"[Exhaust] {iter_label}: {len(valid_df)} valid after filtering"
+        )
+        if valid_df.empty:
+            logger.warning(f"[Exhaust] {iter_label}: no valid molecules — next iter")
+            continue
+
+        # ── 3. Skip already-scored (sqlite + rxn CSV) ───────────────────
+        if skip_already_scored:
+            already = get_already_scored_names(
+                db_path, rxn_id, valid_df["name"].tolist(),
+            )
+            if already:
+                pre = len(valid_df)
+                valid_df = valid_df[~valid_df["name"].isin(already)].reset_index(drop=True)
+                logger.info(
+                    f"[Exhaust] {iter_label}: skipped {pre - len(valid_df)} "
+                    f"already-scored"
+                )
+
+        if valid_df.empty:
+            logger.warning(
+                f"[Exhaust] {iter_label}: all sampled candidates already scored"
+            )
+            continue
+
+        # ── 4. Skip HuggingFace duplicates ─────────────────────────────
+        if primary_target:
+            pre = len(valid_df)
+            unique_mask = valid_df["smiles"].apply(
+                lambda s: molecule_unique_for_protein_hf(primary_target, s)
+            )
+            valid_df = valid_df[unique_mask].reset_index(drop=True)
+            n_hf = pre - len(valid_df)
+            if n_hf:
+                logger.info(
+                    f"[Exhaust] {iter_label}: skipped {n_hf} already in "
+                    f"HuggingFace for {primary_target}"
+                )
+
+        if valid_df.empty:
+            logger.warning(
+                f"[Exhaust] {iter_label}: all remaining candidates already in HF"
+            )
+            continue
+
+        # ── 5. Surrogate pre-score → keep top-n ─────────────────────────
+        if surrogate.is_trained:
+            t0 = time.time()
+            preds = surrogate.predict(valid_df["smiles"].tolist())
+            valid_df = valid_df.copy()
+            valid_df["surrogate_score"] = preds
+            valid_df = valid_df.sort_values("surrogate_score", ascending=False)
+            logger.info(
+                f"[Exhaust] {iter_label}: surrogate scored {len(valid_df)} "
+                f"in {time.time()-t0:.2f}s"
+            )
+        else:
+            logger.warning(
+                f"[Exhaust] {iter_label}: surrogate NOT trained — random order"
+            )
+            valid_df = valid_df.sample(frac=1.0, random_state=int(rng.integers(0, 2**31)))
+
+        top_df = valid_df.head(n).reset_index(drop=True)
+        logger.info(
+            f"[Exhaust] {iter_label}: selected top {len(top_df)} for Boltz"
+        )
+
+        # ── 6. Boltz score + merge into DB ─────────────────────────────
+        scored, n_written = await _boltz_score_batches(
+            boltz, config, target_proteins, top_df, db_path,
+            boltz_batch_size, iter_label,
+        )
+        all_scored.extend(scored)
+        total_written += n_written
+
+        # ── 7. Retrain surrogate on updated DB for next iteration ──────
+        if it < iterations:
+            logger.info(
+                f"[Exhaust] {iter_label}: retraining surrogate on updated DB…"
+            )
+            surrogate.train_from_db(rxn_id, db_path)
+            if not surrogate.is_trained:
+                logger.warning(
+                    f"[Exhaust] {iter_label}: retrain failed / insufficient data"
+                )
+
+        logger.info(
+            f"[Exhaust] ── {iter_label} DONE "
+            f"(+{n_written} written, run_total={total_written}) ──"
         )
 
     logger.info(
-        f"[Exhaust] ✅ Finished. Total {total_written} new scores "
-        f"written → {db_path}"
+        f"[Exhaust] ✅ Finished {iterations} iteration(s). "
+        f"Total {total_written} new scores → {db_path}"
     )
 
     result_df = pd.DataFrame(all_scored)
     if not result_df.empty:
-        result_df = result_df.sort_values("boltz_score", ascending=False, na_position="last")
-        print(f"\n{'#'*70}\nFINAL RANKED RESULTS ({len(result_df)} molecules)\n{'#'*70}")
+        result_df = result_df.sort_values(
+            "boltz_score", ascending=False, na_position="last"
+        )
+        print(
+            f"\n{'#'*70}\n"
+            f"FINAL RANKED RESULTS ({len(result_df)} molecules across all iterations)\n"
+            f"{'#'*70}"
+        )
         print(result_df[["name", "boltz_score"]].to_string(index=False))
         print(f"{'#'*70}\n")
     return result_df
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Public API — function_change_A / B / C
+# Public API — fix one role, vary the rest
 # ═══════════════════════════════════════════════════════════════════════════
-async def function_change_A(
+async def function_fix_A(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
     fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
+    iterations: int = 1, sample_size: int = MAX_SAMPLE_PER_ITER,
 ) -> pd.DataFrame:
-    """Fix B (and C if 3-component); vary A over all valid molecules."""
+    """Fix A; vary B (2-component) or B×C (3-component)."""
+    vary_roles = ["B", "C"] if manager.is_three_component else ["B"]
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="A", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
+        vary_roles=vary_roles, fixed=fixed, n=n,
+        iterations=iterations, sample_size=sample_size,
+        boltz_batch_size=boltz_batch_size,
     )
 
 
-async def function_change_B(
+async def function_fix_B(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
     fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
+    iterations: int = 1, sample_size: int = MAX_SAMPLE_PER_ITER,
 ) -> pd.DataFrame:
-    """Fix A (and C if 3-component); vary B over all valid molecules."""
+    """Fix B; vary A (2-component) or A×C (3-component)."""
+    vary_roles = ["A", "C"] if manager.is_three_component else ["A"]
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="B", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
+        vary_roles=vary_roles, fixed=fixed, n=n,
+        iterations=iterations, sample_size=sample_size,
+        boltz_batch_size=boltz_batch_size,
     )
 
 
-async def function_change_C(
+async def function_fix_C(
     rxn_id, manager, config, surrogate, boltz, target_proteins,
     fixed: Dict[str, int], n: int, boltz_batch_size: int = 10,
+    iterations: int = 1, sample_size: int = MAX_SAMPLE_PER_ITER,
 ) -> pd.DataFrame:
-    """Fix A and B; vary C over all valid molecules (3-component only)."""
+    """Fix C; vary A×B (3-component only)."""
+    if not manager.is_three_component:
+        raise ValueError("function_fix_C requires a 3-component reaction")
     return await run_component_exhaust(
         rxn_id, manager, config, surrogate, boltz, target_proteins,
-        vary_role="C", fixed=fixed, n=n, boltz_batch_size=boltz_batch_size,
+        vary_roles=["A", "B"], fixed=fixed, n=n,
+        iterations=iterations, sample_size=sample_size,
+        boltz_batch_size=boltz_batch_size,
     )
 
 
@@ -634,24 +821,40 @@ async def function_change_C(
 # ═══════════════════════════════════════════════════════════════════════════
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Exhaustive single-component search with surrogate + Boltz"
+        description="Iterative component search with surrogate + Boltz "
+                    "(fix 1 reactant; sample+vary the rest each iteration)"
     )
     parser.add_argument("--rxn_id", type=int, required=True)
     parser.add_argument(
         "--fix", type=str, required=True,
-        help="Component(s) to fix, comma-separated. "
-             "'B' for 2-reactant (fix B, vary A), "
-             "'A' for 2-reactant (fix A, vary B), "
-             "'B,C' for 3-reactant (fix B & C, vary A), etc.",
+        help="Single component to fix. "
+             "'A' / 'B' for 2-reactant (vary the other), "
+             "'A' / 'B' / 'C' for 3-reactant (vary the other two).",
     )
     parser.add_argument(
         "--value", type=str, required=True,
-        help="Fixed component id(s), comma-separated, matching --fix order.",
+        help="Fixed component id matching --fix.",
     )
-    parser.add_argument("--n", type=int, required=True, help="Top-n to Boltz-score")
+    parser.add_argument(
+        "--n", type=int, required=True,
+        help="Top-n from each iteration's sample to Boltz-score.",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=10,
+        help="Number of sample → score → retrain rounds (default 10).",
+    )
+    parser.add_argument(
+        "--sample_size", type=int, default=MAX_SAMPLE_PER_ITER,
+        help=f"Candidates to sample per iteration "
+             f"(default {MAX_SAMPLE_PER_ITER}, hard max {MAX_SAMPLE_PER_ITER}).",
+    )
     parser.add_argument(
         "--boltz_batch_size", type=int, default=10,
         help="Print + merge into DB every this-many molecules (default 10).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="RNG seed for candidate sampling (default 42).",
     )
     parser.add_argument(
         "--rescore_seen", action="store_true",
@@ -664,12 +867,23 @@ async def main():
     args = parse_args()
     rxn_id = args.rxn_id
 
-    fix_roles = [r.strip().upper() for r in args.fix.split(",")]
-    fix_values = [int(v.strip()) for v in args.value.split(",")]
+    fix_roles = [r.strip().upper() for r in args.fix.split(",") if r.strip()]
+    fix_values = [int(v.strip()) for v in args.value.split(",") if v.strip()]
     if len(fix_roles) != len(fix_values):
         raise ValueError("--fix and --value must have the same number of entries")
+    if len(fix_roles) != 1:
+        raise ValueError(
+            f"Expected exactly 1 fixed role (fix one reactant, vary the rest), "
+            f"got {len(fix_roles)}: {fix_roles}"
+        )
 
     fixed = dict(zip(fix_roles, fix_values))
+    fix_role = fix_roles[0]
+
+    if args.iterations < 1:
+        raise ValueError("--iterations must be >= 1")
+    if args.n < 1:
+        raise ValueError("--n must be >= 1")
 
     config = load_config()
     cfg = dict(config) if isinstance(config, dict) else vars(config).copy()
@@ -680,26 +894,26 @@ async def main():
     is_three = manager.is_three_component
     all_roles = {"A", "B", "C"} if is_three else {"A", "B"}
 
-    expected_fixed_count = 2 if is_three else 1
-    if len(fix_roles) != expected_fixed_count:
+    if fix_role not in all_roles:
         raise ValueError(
-            f"rxn={rxn_id} is {'3' if is_three else '2'}-component — "
-            f"expected {expected_fixed_count} fixed role(s), got {len(fix_roles)}"
+            f"Invalid --fix={fix_role} for "
+            f"{'3' if is_three else '2'}-component rxn={rxn_id} "
+            f"(valid roles: {sorted(all_roles)})"
         )
 
-    vary_candidates = all_roles - set(fix_roles)
-    if len(vary_candidates) != 1:
+    vary_roles = sorted(all_roles - {fix_role})
+    expected_vary = 2 if is_three else 1
+    if len(vary_roles) != expected_vary:
         raise ValueError(
-            f"Could not resolve a single varying role from --fix={args.fix} "
+            f"Could not resolve vary roles from --fix={args.fix} "
             f"(rxn={rxn_id} is {'3' if is_three else '2'}-component, "
-            f"all_roles={all_roles})"
+            f"expected {expected_vary} free role(s), got {vary_roles})"
         )
-    vary_role = vary_candidates.pop()
 
     db_path = score_db_path(rxn_id)
     init_score_results_db(db_path)
 
-    # ── Train surrogate on top-4000 + bottom-4000 ────────────────────────
+    # ── Initial surrogate train on top-4000 + bottom-4000 ────────────────
     surrogate = SurrogateModel()
     surrogate.train_from_db(rxn_id, db_path)
 
@@ -713,16 +927,14 @@ async def main():
         logger.error("❌ BoltzWrapper unavailable — cannot score. Aborting.")
         return
 
-    dispatch = {
-        "A": function_change_A,
-        "B": function_change_B,
-        "C": function_change_C,
-    }
-    fn = dispatch[vary_role]
-
-    result_df = await fn(
+    result_df = await run_component_exhaust(
         rxn_id, manager, cfg, surrogate, boltz, target_proteins,
-        fixed=fixed, n=args.n, boltz_batch_size=args.boltz_batch_size,
+        vary_roles=vary_roles, fixed=fixed, n=args.n,
+        iterations=args.iterations,
+        sample_size=args.sample_size,
+        skip_already_scored=not args.rescore_seen,
+        boltz_batch_size=args.boltz_batch_size,
+        seed=args.seed,
     )
 
     if result_df is None or result_df.empty:
