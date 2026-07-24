@@ -21,7 +21,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-STARTING_EPOCH = 24010
+STARTING_EPOCH = 24020
 
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None
@@ -49,7 +49,7 @@ BoltzWrapper = None
 #   hard BOLTZ_BUDGET cap so Boltz never gets flooded.
 GENERATE_MULTIPLIER      = 1      # generate 1x the desired batch size
 BOLTZ_BUDGET             = 1500    # hard cap while surrogate is not trained
-SURROGATE_KEEP_RATIO     = 0.5   # keep top 20% once surrogate is trained
+SURROGATE_KEEP_RATIO     = 0.2   # keep top 20% once surrogate is trained
 SURROGATE_MIN_TRAIN_SIZE = 4000   # min samples before surrogate activates
 
 # Setup logging
