@@ -21,12 +21,12 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-STARTING_EPOCH = 24000
+STARTING_EPOCH = 24030
 
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None
-SCORE_RESULTS_DB = None
-RXN_CSV          = None   # data/rxn{rxn_id}.csv — warm-seed + surrogate training
+SCORE_RESULTS_DB = None   # score_results_{rxn_id}.sqlite — surrogate training ONLY
+RXN_CSV          = None   # data/rxn{rxn_id}.csv — top pool (generation) + surrogate training
 
 from config.config_loader import load_config
 from utils import (
@@ -69,7 +69,10 @@ def parse_args() -> int:
     global RXN_ID, SCORE_RESULTS_DB, RXN_CSV
 
     parser = argparse.ArgumentParser(
-        description="Surrogate crossover miner — single fixed reaction mode"
+        description=(
+            "Crossover miner — CSV top-pool for generation; "
+            "SQLite score_results used only for surrogate training"
+        )
     )
     parser.add_argument(
         "--rxn_id", type=int, required=True,
@@ -82,8 +85,8 @@ def parse_args() -> int:
     RXN_CSV          = os.path.join(BASE_DIR, "data", f"rxn{RXN_ID}.csv")
 
     logger.info(f"✅ rxn_id           = {RXN_ID}")
-    logger.info(f"✅ SCORE_RESULTS_DB  = {SCORE_RESULTS_DB}")
-    logger.info(f"✅ RXN_CSV           = {RXN_CSV}  (warm-seed + surrogate training)")
+    logger.info(f"✅ SCORE_RESULTS_DB  = {SCORE_RESULTS_DB}  (surrogate training ONLY)")
+    logger.info(f"✅ RXN_CSV           = {RXN_CSV}  (top pool + surrogate training)")
     return RXN_ID
 
 
@@ -130,7 +133,8 @@ class SurrogateModel:
     """
     Random Forest surrogate for rxn-specific molecule scoring.
 
-      1. Anchors (never evicted) come from warm-start (CSV+DB combined pool).
+      1. Anchors (never evicted) come from warm-start (CSV top-pool scores
+         + SQLite score_results — DB is training-only, never a generation parent).
       2. Live training data (evictable, capped) comes from fresh Boltz scores.
       3. Balanced sampling (top/bottom/random) teaches the good/bad boundary.
       4. Only activates (is_trained + gatekeeps Boltz) once total training
@@ -965,81 +969,55 @@ def load_molecules_from_csv_with_validation(
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
 
-def load_molecules_combined(
-    csv_path: str,
+def load_surrogate_training_pool(
+    csv_df: pd.DataFrame,
     db_path: str,
-    target_proteins: List[str],
-    starting_epoch: int,
     rxn_id: int,
     config: Dict[str, Any] = None
 ) -> pd.DataFrame:
     """
-    Load molecules from both CSV and database, merge them, and deduplicate.
-    When duplicates exist (by InChIKey), prefer the one with the higher score.
+    Build the surrogate-training pool from CSV scores + SQLite score_results.
+
+    Unlike surrogate_crossover.load_molecules_combined, this pool is NEVER
+    used as the genetic top pool — SQLite rows are training anchors only.
     """
     if config is None:
         config = {}
 
-    logger.info(f"🔄 Loading molecules from CSV and database...")
+    logger.info("🔄 Loading SQLite molecules for surrogate training only...")
 
-    csv_df = load_molecules_from_csv_with_validation(
-        csv_path, target_proteins, starting_epoch, rxn_id, config
-    )
+    db_df = load_molecules_from_db_with_validation(db_path, rxn_id, config)
 
-    db_df = load_molecules_from_db_with_validation(
-        # db_path, rxn_id, config
-        db_path, 6, config
-    )
+    frames = []
+    if csv_df is not None and not csv_df.empty:
+        frames.append(csv_df.assign(source='csv'))
+    if db_df is not None and not db_df.empty:
+        frames.append(db_df.assign(source='database'))
 
-    if csv_df.empty and db_df.empty:
-        logger.warning("No molecules loaded from either CSV or database")
+    if not frames:
+        logger.warning("No molecules available for surrogate training pool")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
 
-    if csv_df.empty:
-        logger.info("No molecules from CSV, using database only")
-        return db_df
-
-    if db_df.empty:
-        logger.info("No molecules from database, using CSV only")
-        return csv_df
-
-    csv_df['source'] = 'csv'
-    db_df['source'] = 'database'
-
-    combined_df = pd.concat([csv_df, db_df], ignore_index=True)
-
+    combined_df = pd.concat(frames, ignore_index=True)
     combined_df = combined_df.sort_values(
         by=['score', 'source'],
         ascending=[False, True],
         na_position='last'
     )
-
     combined_df = combined_df.drop_duplicates(subset=['InChIKey'], keep='first')
-
     combined_df = combined_df.drop(columns=['source'])
-
-    combined_df = combined_df.sort_values(by='score', ascending=False, na_position='last')
-
-    csv_count = len(csv_df)
-    db_count = len(db_df)
-    combined_count = len(combined_df)
-    duplicates_removed = csv_count + db_count - combined_count
-
-    logger.info(
-        f"✅ Combined loading complete: "
-        f"{csv_count} from CSV, {db_count} from database, "
-        f"{combined_count} unique molecules after deduplication "
-        f"({duplicates_removed} duplicates removed)"
+    combined_df = combined_df.sort_values(
+        by='score', ascending=False, na_position='last'
     )
 
-    if combined_count > 0:
-        scores = combined_df['score'].dropna()
-        if len(scores) > 0:
-            logger.info(
-                f"   Combined score range: {scores.min():.6f} to {scores.max():.6f} "
-                f"(top 3: {scores.head(3).tolist()})"
-            )
-
+    csv_count = 0 if csv_df is None or csv_df.empty else len(csv_df)
+    db_count = 0 if db_df is None or db_df.empty else len(db_df)
+    logger.info(
+        f"✅ Surrogate training pool: "
+        f"{csv_count} from CSV, {db_count} from SQLite, "
+        f"{len(combined_df)} unique after dedup "
+        f"(SQLite is training-only — not used as generation parents)"
+    )
     return combined_df
 
 
@@ -1395,7 +1373,7 @@ async def generate_unique_molecules_from_top200(
     ga_operator = GeneticAlgorithmOperator(state['rxn_id'], DB_PATH)
     all_names = top_200_df['name'].tolist()
 
-    pool_sizes = [100, 150, 200]
+    pool_sizes = [200, 350, 500]
     current_pool_size_idx = 0
     current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
 
@@ -1517,17 +1495,19 @@ async def generate_unique_molecules_from_top200(
     return unique_molecules
 
 
-def warm_start_surrogate(surrogate: "SurrogateModel", molecules_df: pd.DataFrame) -> None:
+def warm_start_surrogate(surrogate: "SurrogateModel", training_df: pd.DataFrame) -> None:
     """
-    Seed the surrogate with permanent anchors from the combined CSV+DB pool.
-    Mirrors miner.py's warm_start() anchor-seeding logic. Called once, on
-    round 1, before the surrogate is expected to gatekeep anything.
+    Seed the surrogate with permanent anchors from the training pool
+    (CSV scores + SQLite score_results). SQLite rows are training-only —
+    they are never used as crossover parents / top-pool members.
+
+    Called once, on round 1, before the surrogate is expected to gatekeep.
     """
-    if molecules_df.empty:
-        logger.warning("[SURROGATE] warm_start: molecules_df is empty — skipping anchor seed")
+    if training_df.empty:
+        logger.warning("[SURROGATE] warm_start: training_df is empty — skipping anchor seed")
     else:
-        valid = molecules_df[
-            molecules_df['score'].notna() & molecules_df['smiles'].notna()
+        valid = training_df[
+            training_df['score'].notna() & training_df['smiles'].notna()
         ]
         if valid.empty:
             logger.warning("[SURROGATE] warm_start: no rows with valid score+smiles — skipping")
@@ -1537,19 +1517,20 @@ def warm_start_surrogate(surrogate: "SurrogateModel", molecules_df: pd.DataFrame
                 valid['score'].tolist(),
             )
             logger.info(
-                f"[SURROGATE] warm_start: seeded {len(valid)} rows from CSV+DB "
+                f"[SURROGATE] warm_start: seeded {len(valid)} rows from "
+                f"CSV+SQLite training pool "
                 f"(anchors so far: {surrogate.total_train_size})"
             )
 
     # Also merge in rxn{rxn_id}.csv without epoch filter (additive anchors).
-    training_df = load_training_csv_for_surrogate(RXN_ID)
-    if not training_df.empty:
+    extra_csv = load_training_csv_for_surrogate(RXN_ID)
+    if not extra_csv.empty:
         surrogate.add_anchor_data(
-            training_df['smiles'].tolist(),
-            training_df['score'].tolist(),
+            extra_csv['smiles'].tolist(),
+            extra_csv['score'].tolist(),
         )
         logger.info(
-            f"[SURROGATE] warm_start: +{len(training_df)} anchors from "
+            f"[SURROGATE] warm_start: +{len(extra_csv)} anchors from "
             f"rxn{RXN_ID}.csv (total_train_size={surrogate.total_train_size})"
         )
 
@@ -1576,9 +1557,11 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
     """
     Main loop that continuously generates and scores molecules until interrupted.
 
-    Pipeline per round (surrogate-gated, mirrors miner.py):
-      1. Reload molecules from CSV + DB (warm-seed pool)
-      2. [round 1 only] Warm-start surrogate anchors from that pool
+    Pipeline per round (surrogate-gated):
+      1. Reload CSV molecules → top pool for genetic crossover (parents)
+         SQLite score_results is NOT mixed into the top pool.
+      2. [round 1 only] Warm-start surrogate anchors from CSV scores +
+         SQLite score_results (DB = training only) + unfiltered training CSV
       3. Generate  desired_unique_count * GENERATE_MULTIPLIER  candidates
          via genetic crossover + full validation (SMILES/heavy atoms/
          banned atoms/rotatable bonds/HF uniqueness — already dedup'd
@@ -1593,10 +1576,10 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
     logger.info("🚀 Starting generation and scoring loop...")
     logger.info("Press Ctrl+C to stop")
     logger.info(
-        f"✅ Pipeline = generate {GENERATE_MULTIPLIER}x → validate/dedup → "
-        f"surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}%, active once "
-        f">= {SURROGATE_MIN_TRAIN_SIZE} samples, else hard-cap "
-        f"{BOLTZ_BUDGET}) → Boltz"
+        f"✅ Pipeline = CSV top-pool → generate {GENERATE_MULTIPLIER}x → "
+        f"validate/dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}%, "
+        f"active once >= {SURROGATE_MIN_TRAIN_SIZE} samples, else hard-cap "
+        f"{BOLTZ_BUDGET}) → Boltz | SQLite = surrogate training ONLY"
     )
 
     desired_unique_count = 1500
@@ -1613,12 +1596,12 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
             logger.info(f"🔄 Round {round_number}")
             logger.info(f"{'='*70}")
 
-            # ── Reload molecules from CSV and database ────────────────
-            logger.info("📂 Reloading molecules from CSV and database...")
+            # ── Reload CSV → top pool (generation parents) ─────────────
+            # SQLite is intentionally NOT merged into this pool.
+            logger.info("📂 Reloading CSV molecules for top pool (generation)...")
             config = state['config']
-            molecules_df = load_molecules_combined(
+            molecules_df = load_molecules_from_csv_with_validation(
                 RXN_CSV,
-                SCORE_RESULTS_DB,
                 state['current_challenge_targets'],
                 STARTING_EPOCH,
                 RXN_ID,
@@ -1626,24 +1609,39 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
             )
 
             if molecules_df.empty:
-                logger.warning("⚠️  No valid molecules loaded from CSV or database, waiting...")
+                logger.warning("⚠️  No valid molecules loaded from CSV, waiting...")
                 await asyncio.sleep(10)
                 continue
 
-            # ── Warm-start surrogate anchors (round 1 only) ────────────
+            # ── Warm-start surrogate (round 1 only) ────────────────────
+            # Training pool = CSV scores + SQLite score_results.
+            # SQLite rows never become crossover parents.
             if not surrogate_warm_started:
-                warm_start_surrogate(surrogate, molecules_df)
+                training_pool = load_surrogate_training_pool(
+                    molecules_df, SCORE_RESULTS_DB, RXN_ID, config
+                )
+                warm_start_surrogate(surrogate, training_pool)
+                # Track DB InChIKeys as seen so we don't re-propose known mols,
+                # but do NOT put them in top_pool.
+                if not training_pool.empty and 'InChIKey' in training_pool.columns:
+                    state['seen_inchikeys'].update(
+                        training_pool['InChIKey'].dropna().tolist()
+                    )
                 surrogate_warm_started = True
 
-            # Get top 200 molecules (already sorted by score)
-            top_200_df = molecules_df.head(200)
+            # Get top 200 molecules from CSV only (already sorted by score)
+            top_200_df = molecules_df.head(500)
 
-            # Update state with new molecules
+            # Update state — top_pool is CSV-only
             state['top_pool'] = molecules_df.copy()
             state['seen_inchikeys'].update(molecules_df['InChIKey'].tolist())
             state['top_200_df'] = top_200_df
 
-            logger.info(f"✅ Reloaded {len(molecules_df)} molecules from CSV and database (top 200: {len(top_200_df)})")
+            logger.info(
+                f"✅ Top pool (CSV only): {len(molecules_df)} molecules "
+                f"(top 200 parents: {len(top_200_df)}) — "
+                f"SQLite excluded from generation parents"
+            )
 
             # ══════════════════════════════════════════════════════════
             # STEP 1 — Generate GENERATE_MULTIPLIER x candidates
@@ -1811,9 +1809,9 @@ async def main():
     rxn_id = parse_args()
 
     logger.info(
-        f"🚀 Starting surrogate_crossover.py | rxn={rxn_id} | "
-        f"DB=score_results_{rxn_id}.sqlite | "
-        f"CSV=data/rxn{rxn_id}.csv"
+        f"🚀 Starting crossover.py | rxn={rxn_id} | "
+        f"top_pool=CSV(data/rxn{rxn_id}.csv) | "
+        f"surrogate_train=SQLite(score_results_{rxn_id}.sqlite)+CSV"
     )
 
     # Load config

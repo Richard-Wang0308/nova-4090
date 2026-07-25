@@ -63,7 +63,7 @@ _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
 SURROGATE_TOP_N = 6000
-SURROGATE_BOTTOM_N = 0
+SURROGATE_BOTTOM_N = 6000
 
 
 # ═══════════════════════════════════════════════════════════════════════════
