@@ -7,7 +7,7 @@ from .molecules import (
     is_boltz_safe_smiles,
     contains_atom_type
 )
-from .challenge import get_challenge_params_from_blockhash
+from .challenge import get_challenge_params_from_blockhash, get_historical_submissions
 from .proteins import get_sequence_from_protein_code
 from .github import upload_file_to_github
 from .scoring import calculate_dynamic_entropy

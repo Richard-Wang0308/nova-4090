@@ -7,7 +7,8 @@ Workflow:
 1. On startup, immediately determine current epoch's allowed reaction and submit.
 2. Monitor blockchain for epoch boundaries.
 3. As soon as the epoch counter changes, determine that epoch's allowed reaction,
-    verify availability for only the top candidate pool (not the whole DB),
+    verify availability (HF unique + historical diversity) for only the top
+    candidate pool (not the whole DB),
     PREPARE all payloads, fire ALL chain commits in parallel (this is the
     time-critical race against other miners), then BATCH-UPLOAD all
     successfully-committed files to GitHub in a SINGLE commit (via the Git
@@ -47,8 +48,8 @@ sys.path.append(BASE_DIR)
 # Add as many wallets/hotkeys as needed.
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova",   "notd"),
-    ("nova",   "notc"),
+    ("nova",   "notb"),
+    ("nova",   "nota")
     # ("nova",   "notd")
     # ("alpha",  "hotkey1"),
     # ("beta",   "hotkey1"),
@@ -63,9 +64,13 @@ EPOCH_LENGTH = 361           # Blocks per epoch
 STATUS_LOG_INTERVAL = 60     # Log status every N seconds
 POLL_INTERVAL = 6            # Seconds between block polls
 
-# Only re-check HuggingFace uniqueness for this many top-scoring candidates
-# (instead of scanning the entire available=TRUE set).
-AVAILABILITY_CANDIDATE_POOL = 100
+# Only re-check HuggingFace uniqueness + historical diversity for this many
+# top-scoring candidates (instead of scanning the entire available=TRUE set).
+AVAILABILITY_CANDIDATE_POOL = 500
+
+# Keep in sync with tools/check.py and validator
+# config['max_similarity_to_historical'] when that exists.
+MAX_SIMILARITY_TO_HISTORICAL = 0.6
 
 # Retries for the GitHub batch-commit flow (re-fetches branch head + retries
 # the whole blob->tree->commit->ref-update sequence on conflict).
@@ -73,9 +78,13 @@ GITHUB_BATCH_MAX_RETRIES = 3
 
 # ============================================================================
 
+from rdkit import Chem, DataStructs
+from rdkit.Chem import rdFingerprintGenerator
+
 from config.config_loader import load_config
 from utils import (
     get_challenge_params_from_blockhash,
+    get_historical_submissions,
 )
 from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import molecule_unique_for_protein_hf
@@ -237,8 +246,9 @@ def setup_logging(config: argparse.Namespace) -> None:
     bt.logging.info(f"📊 Epoch length: {EPOCH_LENGTH} blocks")
     bt.logging.info(
         f"⚡ Parallel CHAIN COMMIT (per-wallet connections) | GitHub upload "
-        f"batched into ONE commit after chain commit | availability pool: "
-        f"top {AVAILABILITY_CANDIDATE_POOL} candidates"
+        f"batched into ONE commit after chain commit | availability: "
+        f"HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL} on top "
+        f"{AVAILABILITY_CANDIDATE_POOL} candidates"
     )
     bt.logging.info("="*70 + "\n")
 
@@ -499,26 +509,112 @@ def mark_molecules_unavailable(
         bt.logging.error(traceback.format_exc())
 
 
-def check_molecule_unique(
-    target_protein: str, molecule_name: str, smiles: str
+def load_historical_fingerprints(target_protein: str):
+    """
+    Load historical submissions for the target protein once and precompute
+    Morgan fingerprints for fast Tanimoto similarity comparisons.
+
+    Returns:
+        A DataFrame with a 'fingerprint' column, or None if no historical
+        submissions exist for this target.
+    """
+    morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+    historical_df = get_historical_submissions(target_protein, "molecules")
+
+    if historical_df is None or historical_df.empty:
+        bt.logging.warning(
+            f"   ⚠️  No historical submissions found for target '{target_protein}'"
+        )
+        return None
+
+    mols = [Chem.MolFromSmiles(smi) for smi in historical_df["SMILES"]]
+
+    # Filter out any SMILES that failed to parse, keeping df/mols in sync
+    valid_idx = [i for i, m in enumerate(mols) if m is not None]
+    if len(valid_idx) != len(mols):
+        bt.logging.warning(
+            f"   ⚠️  Dropped {len(mols) - len(valid_idx)} unparsable historical "
+            f"SMILES for target '{target_protein}'"
+        )
+        historical_df = historical_df.iloc[valid_idx].reset_index(drop=True)
+        mols = [mols[i] for i in valid_idx]
+
+    if not mols:
+        return None
+
+    fps = morgan_gen.GetFingerprints(mols, numThreads=8)
+    historical_df = historical_df.copy()
+    historical_df["fingerprint"] = list(fps)
+
+    return historical_df
+
+
+def is_diverse_enough(
+    mol_fp,
+    historical_df,
+    max_similarity: float,
 ) -> bool:
     """
-    Return True if molecule is NOT already in the HuggingFace dataset
-    for the target protein.
+    Return True if no historical submission has Tanimoto similarity
+    >= max_similarity to mol_fp. No historical data => treat as diverse.
+    """
+    if historical_df is None or historical_df.empty:
+        return True
+
+    similarities = DataStructs.BulkTanimotoSimilarity(
+        mol_fp,
+        list(historical_df["fingerprint"]),
+    )
+    return not any(sim >= max_similarity for sim in similarities)
+
+
+def check_molecule_available(
+    target_protein: str,
+    molecule_name: str,
+    smiles: str,
+    historical_df,
+    morgan_gen,
+    max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
+) -> Tuple[bool, str]:
+    """
+    A molecule is available only if BOTH:
+      1. NOT already in the HuggingFace dataset for the target protein, AND
+      2. NOT too similar (Tanimoto >= max_similarity) to any historical
+         submission for that protein.
+
+    Returns:
+        (available, reason) where reason is '' on success, else a short cause.
     """
     if not target_protein:
         bt.logging.warning(
-            "   ⚠️  No target protein provided for uniqueness check"
+            "   ⚠️  No target protein provided for availability check"
         )
-        return False
+        return False, "no_target"
 
     try:
-        return bool(molecule_unique_for_protein_hf(target_protein, smiles))
+        # Step 1: exact-match uniqueness against HuggingFace
+        if not bool(molecule_unique_for_protein_hf(target_protein, smiles)):
+            return False, "hf_duplicate"
+
+        # Step 2: diversity vs historical submissions
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            bt.logging.warning(
+                f"   ⚠️  Could not parse SMILES for {molecule_name}"
+            )
+            return False, "bad_smiles"
+
+        mol_fp = morgan_gen.GetFingerprint(mol)
+        if not is_diverse_enough(mol_fp, historical_df, max_similarity):
+            return False, "too_similar"
+
+        return True, ""
     except Exception as e:
         bt.logging.error(
-            f"   ❌ Uniqueness check failed for {molecule_name}: {e}"
+            f"   ❌ Availability check failed for {molecule_name}: {e}"
         )
-        return False
+        return False, "error"
 
 
 async def get_verified_top_n_molecules(
@@ -531,7 +627,7 @@ async def get_verified_top_n_molecules(
     Fast path for epoch submission:
     1. Load only the top `candidate_pool` molecules by score that are still
         marked available (available = TRUE).
-    2. Re-check HuggingFace uniqueness for those candidates only.
+    2. Re-check HF uniqueness AND historical diversity for those candidates.
     3. Stop as soon as `n` verified-available molecules are found.
     4. Persist updated available flags for every candidate checked.
     """
@@ -571,13 +667,26 @@ async def get_verified_top_n_molecules(
         return []
 
     bt.logging.info(
-        f"   🔍 Checking availability for top {len(candidates)} candidates "
-        f"(need {n} available)"
+        f"   🔍 Checking availability (unique + similarity≤"
+        f"{MAX_SIMILARITY_TO_HISTORICAL}) for top {len(candidates)} "
+        f"candidates (need {n} available)"
     )
+
+    # Load historical fingerprints once for this pool check.
+    historical_df = await asyncio.to_thread(
+        load_historical_fingerprints, target_protein
+    )
+    hist_count = 0 if historical_df is None else len(historical_df)
+    bt.logging.info(
+        f"   📚 Historical submissions for diversity check: {hist_count}"
+    )
+    morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
     verified: List[Tuple[str, float]] = []
     checked = 0
     marked_false = 0
+    rejected_hf = 0
+    rejected_similar = 0
 
     for molecule_name, score in candidates:
         if len(verified) >= n:
@@ -594,12 +703,17 @@ async def get_verified_top_n_molecules(
             marked_false += 1
             continue
 
-        # Offload sync HF lookup so the event loop stays responsive.
-        is_unique = await asyncio.to_thread(
-            check_molecule_unique, target_protein, molecule_name, smiles
+        # Offload sync HF + Tanimoto work so the event loop stays responsive.
+        is_available, reason = await asyncio.to_thread(
+            check_molecule_available,
+            target_protein,
+            molecule_name,
+            smiles,
+            historical_df,
+            morgan_gen,
         )
 
-        if is_unique:
+        if is_available:
             _set_molecule_available(db_path, molecule_name, True)
             verified.append((molecule_name, score))
             bt.logging.info(
@@ -609,13 +723,25 @@ async def get_verified_top_n_molecules(
         else:
             _set_molecule_available(db_path, molecule_name, False)
             marked_false += 1
+            if reason == "hf_duplicate":
+                rejected_hf += 1
+                detail = "already known (HF)"
+            elif reason == "too_similar":
+                rejected_similar += 1
+                detail = (
+                    f"too similar to historical "
+                    f"(≥{MAX_SIMILARITY_TO_HISTORICAL})"
+                )
+            else:
+                detail = reason or "failed availability check"
             bt.logging.info(
-                f"      ❌ {molecule_name}: already known → available=FALSE"
+                f"      ❌ {molecule_name}: {detail} → available=FALSE"
             )
 
     bt.logging.info(
         f"   📊 Availability check done: checked={checked}, "
-        f"verified={len(verified)}, marked_false={marked_false}"
+        f"verified={len(verified)}, marked_false={marked_false} "
+        f"(HF dup={rejected_hf}, too similar={rejected_similar})"
     )
 
     if not verified:
@@ -992,9 +1118,12 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         return
 
     # ==========================================================
-    # STEP 2: Fast availability check on top candidate pool only
+    # STEP 2: Availability = HF unique AND historical diversity
     # ==========================================================
-    bt.logging.info("🔹 STEP 2/3: Fast Availability Check (Top Candidates Only)")
+    bt.logging.info(
+        "🔹 STEP 2/3: Availability Check "
+        f"(HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL})"
+    )
     bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
     bt.logging.info(
         f"   ⚡ Candidate pool size: {AVAILABILITY_CANDIDATE_POOL} "
