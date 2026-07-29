@@ -1,3 +1,20 @@
+"""
+genetic.py — crossover.py + a mutation operator.
+
+crossover.py builds every candidate with a single operator: swap one reactant
+between two elite parents. This file keeps that pipeline (CSV top-pool →
+generate → validate/dedup → surrogate filter → Boltz → SQLite) untouched and
+adds the second classic GA operator on top:
+
+    offspring = crossover(parent1, parent2)
+    if random() < MUTATION_RATIO:
+        offspring = mutate_one_reactant(offspring)
+
+Mutation replaces ONE reactant of the offspring with another reactant valid
+for the same role, picked either as a Tanimoto NEIGHBOUR of the reactant it
+replaces (local refinement) or UNIFORMLY AT RANDOM from the role pool
+(global exploration). See MUTATION_MODE below.
+"""
 import os
 import sys
 import random
@@ -37,7 +54,7 @@ from utils import (
     get_historical_submissions
 )
 from molecules_base import generate_inchikey
-from combinatorial_db.reactions import get_smiles_from_reaction
+from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
@@ -57,6 +74,28 @@ SURROGATE_MIN_TRAIN_SIZE = 4000   # min samples before surrogate activates
 # for the target protein reaches this value (mirrors multi_submit_reaction.py).
 MAX_SIMILARITY_TO_HISTORICAL = 0.6
 
+# ── Genetic operator constants (crossover + mutation) ─────────────────────
+# Probability that a freshly created crossover offspring also gets ONE of its
+# reactants mutated. 0.0 reproduces crossover.py exactly; 1.0 mutates every
+# offspring. Overridable with --mutation_ratio.
+MUTATION_RATIO = 0.3
+
+# How the replacement reactant is chosen:
+#   "neighbour" — a Tanimoto-similar reactant from the same role pool
+#                 (local move: keeps the pharmacophore, tweaks one arm)
+#   "random"    — a uniformly random reactant from the same role pool
+#                 (global move: large jump, pure exploration)
+#   "mixed"     — neighbour with probability NEIGHBOUR_MUTATION_RATIO,
+#                 otherwise random  ← recommended default
+MUTATION_MODE = "mixed"
+NEIGHBOUR_MUTATION_RATIO = 0.7
+
+# Neighbour search: consider reactants with Tanimoto >= MIN_NEIGHBOUR_SIMILARITY
+# to the reactant being replaced, then sample uniformly from the closest
+# NEIGHBOUR_TOP_K of them (sampling, not argmax, keeps offspring diverse).
+NEIGHBOUR_TOP_K = 25
+MIN_NEIGHBOUR_SIMILARITY = 0.5
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -72,26 +111,81 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> int:
     global RXN_ID, SCORE_RESULTS_DB, RXN_CSV
+    global MUTATION_RATIO, MUTATION_MODE, NEIGHBOUR_MUTATION_RATIO
+    global NEIGHBOUR_TOP_K, MIN_NEIGHBOUR_SIMILARITY
 
     parser = argparse.ArgumentParser(
         description=(
-            "Crossover miner — CSV top-pool for generation; "
-            "SQLite score_results used only for surrogate training"
+            "Genetic miner (crossover + mutation) — CSV top-pool for "
+            "generation; SQLite score_results used only for surrogate training"
         )
     )
     parser.add_argument(
         "--rxn_id", type=int, required=True,
         help="Reaction ID (e.g. 1-5).",
     )
+    parser.add_argument(
+        "--mutation_ratio", type=float, default=MUTATION_RATIO,
+        help=(
+            "Probability that a crossover offspring also gets one reactant "
+            f"mutated (0.0-1.0, default {MUTATION_RATIO})."
+        ),
+    )
+    parser.add_argument(
+        "--mutation_mode", choices=["neighbour", "random", "mixed"],
+        default=MUTATION_MODE,
+        help=f"Replacement-reactant strategy (default {MUTATION_MODE}).",
+    )
+    parser.add_argument(
+        "--neighbour_ratio", type=float, default=NEIGHBOUR_MUTATION_RATIO,
+        help=(
+            "In --mutation_mode mixed, fraction of mutations that use a "
+            f"neighbour instead of a random reactant (default "
+            f"{NEIGHBOUR_MUTATION_RATIO})."
+        ),
+    )
+    parser.add_argument(
+        "--neighbour_top_k", type=int, default=NEIGHBOUR_TOP_K,
+        help=f"Sample from the K closest reactants (default {NEIGHBOUR_TOP_K}).",
+    )
+    parser.add_argument(
+        "--min_neighbour_similarity", type=float,
+        default=MIN_NEIGHBOUR_SIMILARITY,
+        help=(
+            "Minimum reactant-level Tanimoto for a neighbour "
+            f"(default {MIN_NEIGHBOUR_SIMILARITY})."
+        ),
+    )
     args = parser.parse_args()
+
+    if not 0.0 <= args.mutation_ratio <= 1.0:
+        parser.error("--mutation_ratio must be in [0.0, 1.0]")
+    if not 0.0 <= args.neighbour_ratio <= 1.0:
+        parser.error("--neighbour_ratio must be in [0.0, 1.0]")
+    if args.neighbour_top_k < 1:
+        parser.error("--neighbour_top_k must be >= 1")
 
     RXN_ID           = args.rxn_id
     SCORE_RESULTS_DB = os.path.join(BASE_DIR, f"score_results_{RXN_ID}.sqlite")
     RXN_CSV          = os.path.join(BASE_DIR, "data", f"rxn{RXN_ID}.csv")
 
+    MUTATION_RATIO           = args.mutation_ratio
+    MUTATION_MODE            = args.mutation_mode
+    NEIGHBOUR_MUTATION_RATIO = args.neighbour_ratio
+    NEIGHBOUR_TOP_K          = args.neighbour_top_k
+    MIN_NEIGHBOUR_SIMILARITY = args.min_neighbour_similarity
+
     logger.info(f"✅ rxn_id           = {RXN_ID}")
     logger.info(f"✅ SCORE_RESULTS_DB  = {SCORE_RESULTS_DB}  (surrogate training ONLY)")
     logger.info(f"✅ RXN_CSV           = {RXN_CSV}  (top pool + surrogate training)")
+    logger.info(
+        f"✅ mutation         = ratio {MUTATION_RATIO} | mode {MUTATION_MODE}"
+        + (
+            f" (neighbour {NEIGHBOUR_MUTATION_RATIO})"
+            if MUTATION_MODE == "mixed" else ""
+        )
+        + f" | top_k {NEIGHBOUR_TOP_K} | min_sim {MIN_NEIGHBOUR_SIMILARITY}"
+    )
     return RXN_ID
 
 
@@ -128,6 +222,210 @@ def get_morgan_fingerprint(smiles: str, n_bits: int = 2048) -> Optional[np.ndarr
         for k in list(_fp_cache.keys())[:12500]:
             del _fp_cache[k]
     return fp_array
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ReactantLibrary — role pools + neighbour search (for the mutation operator)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ReactantLibrary:
+    """
+    Reactant pools of one reaction, indexed per role, as needed by mutation.
+
+    A molecule name is rxn:{rxn_id}:{A_id}:{B_id}[:{C_id}], so name part 2 is
+    role A, part 3 role B and part 4 role C. A reactant may only be replaced
+    by another reactant carrying the same role bits, otherwise the reaction
+    cannot fire.
+
+    Fingerprint indexes are built lazily per role (pools reach ~80k reactants,
+    so we only pay for the roles that neighbour mutation actually touches) and
+    neighbour lists are cached per reactant, since elite parents reuse the same
+    reactants over and over.
+    """
+
+    ROLE_BY_NAME_INDEX = {2: "A", 3: "B", 4: "C"}
+    _NEIGHBOUR_CACHE_MAX = 50000
+
+    def __init__(self, rxn_id: int, db_path: str):
+        self.rxn_id = rxn_id
+        self.db_path = db_path
+        self._smiles_by_role: Dict[str, Dict[int, str]] = {}
+        self._ids_by_role: Dict[str, List[int]] = {}
+        self._fp_index: Dict[str, Tuple[List[int], List[Any]]] = {}
+        self._neighbour_cache: Dict[Tuple[str, int], List[int]] = {}
+        self._load_pools()
+
+    # ── pool loading ──────────────────────────────────────────────────────
+
+    def _load_pools(self) -> None:
+        reaction_info = get_reaction_info(self.rxn_id, self.db_path)
+        if not reaction_info:
+            raise ValueError(
+                f"Could not load reaction {self.rxn_id} from {self.db_path}"
+            )
+
+        _smarts, role_a, role_b, role_c = reaction_info
+        role_masks = {"A": role_a, "B": role_b}
+        if role_c:
+            role_masks["C"] = role_c
+
+        for role, mask in role_masks.items():
+            rows = self._query_role(mask)
+            self._smiles_by_role[role] = {
+                mol_id: smiles for mol_id, smiles in rows if smiles
+            }
+            self._ids_by_role[role] = list(self._smiles_by_role[role].keys())
+
+        logger.info(
+            f"🧱 Reactant pools for rxn:{self.rxn_id}: "
+            + ", ".join(
+                f"{role}={len(self._ids_by_role[role])}"
+                for role in sorted(self._ids_by_role)
+            )
+        )
+
+    def _query_role(self, role_mask: int) -> List[Tuple[int, str]]:
+        """All reactants whose role_mask carries every bit of role_mask."""
+        try:
+            abs_db_path = os.path.abspath(self.db_path)
+            with sqlite3.connect(
+                f"file:{abs_db_path}?mode=ro&immutable=1", uri=True
+            ) as conn:
+                conn.execute("PRAGMA query_only = ON")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT mol_id, smiles FROM molecules "
+                    "WHERE (role_mask & ?) = ?",
+                    (role_mask, role_mask),
+                )
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Error loading reactants for role_mask {role_mask}: {e}")
+            return []
+
+    # ── accessors ─────────────────────────────────────────────────────────
+
+    @property
+    def roles(self) -> List[str]:
+        return sorted(self._ids_by_role)
+
+    def role_for_name_index(self, name_index: int) -> Optional[str]:
+        role = self.ROLE_BY_NAME_INDEX.get(name_index)
+        return role if role in self._ids_by_role else None
+
+    def pool_size(self, role: str) -> int:
+        return len(self._ids_by_role.get(role, []))
+
+    def component_smiles(self, role: str, component_id: int) -> Optional[str]:
+        return self._smiles_by_role.get(role, {}).get(component_id)
+
+    # ── fingerprint index (lazy, per role) ────────────────────────────────
+
+    def _fingerprint_index(self, role: str) -> Tuple[List[int], List[Any]]:
+        if role in self._fp_index:
+            return self._fp_index[role]
+
+        t0 = time.time()
+        ids: List[int] = []
+        fps: List[Any] = []
+        for component_id, smiles in self._smiles_by_role.get(role, {}).items():
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
+            ids.append(component_id)
+            fps.append(MORGAN_FP_GENERATOR.GetFingerprint(mol))
+
+        self._fp_index[role] = (ids, fps)
+        logger.info(
+            f"🧬 Fingerprint index for role {role}: {len(ids)} reactants "
+            f"in {time.time() - t0:.1f}s"
+        )
+        return self._fp_index[role]
+
+    def _neighbours(self, role: str, component_id: int) -> List[int]:
+        """Cached ids of the closest reactants to `component_id` in `role`."""
+        cache_key = (role, component_id)
+        if cache_key in self._neighbour_cache:
+            return self._neighbour_cache[cache_key]
+
+        neighbours: List[int] = []
+        query_smiles = self.component_smiles(role, component_id)
+        query_mol = Chem.MolFromSmiles(query_smiles) if query_smiles else None
+
+        if query_mol is not None:
+            ids, fps = self._fingerprint_index(role)
+            if ids:
+                query_fp = MORGAN_FP_GENERATOR.GetFingerprint(query_mol)
+                similarities = DataStructs.BulkTanimotoSimilarity(query_fp, fps)
+                ranked = sorted(
+                    (
+                        (cid, sim)
+                        for cid, sim in zip(ids, similarities)
+                        if cid != component_id and sim >= MIN_NEIGHBOUR_SIMILARITY
+                    ),
+                    key=lambda pair: pair[1],
+                    reverse=True,
+                )
+                neighbours = [cid for cid, _ in ranked[:NEIGHBOUR_TOP_K]]
+
+        if len(self._neighbour_cache) >= self._NEIGHBOUR_CACHE_MAX:
+            for key in list(self._neighbour_cache.keys())[
+                : self._NEIGHBOUR_CACHE_MAX // 4
+            ]:
+                del self._neighbour_cache[key]
+        self._neighbour_cache[cache_key] = neighbours
+        return neighbours
+
+    # ── replacement picking ───────────────────────────────────────────────
+
+    def random_component(self, role: str, exclude_id: Optional[int] = None) -> Optional[int]:
+        pool = self._ids_by_role.get(role, [])
+        if not pool:
+            return None
+        if len(pool) == 1:
+            return None if pool[0] == exclude_id else pool[0]
+        for _ in range(5):
+            candidate = random.choice(pool)
+            if candidate != exclude_id:
+                return candidate
+        return None
+
+    def neighbour_component(self, role: str, component_id: int) -> Optional[int]:
+        neighbours = self._neighbours(role, component_id)
+        return random.choice(neighbours) if neighbours else None
+
+    def replacement_component(
+        self,
+        role: str,
+        component_id: int,
+        mode: str = None,
+        neighbour_ratio: float = None,
+    ) -> Tuple[Optional[int], str]:
+        """
+        Pick a replacement reactant for `component_id` in `role`.
+
+        Returns (component_id, kind) where kind is 'neighbour' or 'random'.
+        Neighbour mutation falls back to random when the reactant has no
+        neighbour above MIN_NEIGHBOUR_SIMILARITY.
+        """
+        mode = MUTATION_MODE if mode is None else mode
+        neighbour_ratio = (
+            NEIGHBOUR_MUTATION_RATIO if neighbour_ratio is None else neighbour_ratio
+        )
+
+        want_neighbour = (
+            mode == "neighbour"
+            or (mode == "mixed" and random.random() < neighbour_ratio)
+        )
+
+        if want_neighbour:
+            new_id = self.neighbour_component(role, component_id)
+            if new_id is not None:
+                return new_id, "neighbour"
+            if mode == "neighbour":
+                return None, "neighbour"
+
+        return self.random_component(role, exclude_id=component_id), "random"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -603,13 +901,47 @@ async def validate_molecule_complete(
 
 
 class GeneticAlgorithmOperator:
-    """Performs genetic algorithm operations on molecules (CROSSOVER ONLY)."""
+    """Performs genetic algorithm operations on molecules (CROSSOVER + MUTATION)."""
 
-    def __init__(self, rxn_id: int, db_path: str):
+    def __init__(
+        self,
+        rxn_id: int,
+        db_path: str,
+        reactant_library: Optional[ReactantLibrary] = None,
+        mutation_ratio: Optional[float] = None,
+        mutation_mode: Optional[str] = None,
+        neighbour_ratio: Optional[float] = None,
+    ):
         """Initialize GA operator."""
         self.rxn_id = rxn_id
         self.db_path = db_path
         self.generated_molecule_names: Set[str] = set()
+
+        # Mutation needs the reactant pools; without a library the operator
+        # degrades to plain crossover (i.e. crossover.py behaviour).
+        self.reactant_library = reactant_library
+        self.mutation_ratio = (
+            MUTATION_RATIO if mutation_ratio is None else mutation_ratio
+        )
+        self.mutation_mode = MUTATION_MODE if mutation_mode is None else mutation_mode
+        self.neighbour_ratio = (
+            NEIGHBOUR_MUTATION_RATIO if neighbour_ratio is None else neighbour_ratio
+        )
+        if self.reactant_library is None and self.mutation_ratio > 0:
+            logger.warning(
+                "⚠️  No reactant library provided — mutation disabled, "
+                "running crossover only"
+            )
+            self.mutation_ratio = 0.0
+
+        # Accumulated across apply_genetic_operations() calls
+        self.operator_stats: Dict[str, int] = {
+            'offspring': 0,
+            'mutations_attempted': 0,
+            'mutations_neighbour': 0,
+            'mutations_random': 0,
+            'mutations_failed': 0,
+        }
 
     def crossover_molecules(self, mol_name_1: str, mol_name_2: str) -> Optional[str]:
         """Crossover two molecules by swapping random components."""
@@ -670,12 +1002,102 @@ class GeneticAlgorithmOperator:
             logger.debug(f"Error in crossover_molecules: {e}")
             return None
 
+    def _is_buildable(self, molecule_name: str) -> bool:
+        """True when the reaction fires and RDKit can parse the product."""
+        try:
+            smiles = get_smiles_from_reaction(molecule_name)
+            if not smiles:
+                logger.debug(f"No SMILES generated for {molecule_name}")
+                return False
+            if Chem.MolFromSmiles(smiles) is None:
+                logger.debug(f"Invalid SMILES from RDKit: {smiles}")
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"Error validating mutant {molecule_name}: {e}")
+            return False
+
+    def mutate_molecule(self, molecule_name: str) -> Optional[Tuple[str, str]]:
+        """
+        Mutate ONE reactant of a molecule, keeping the other reactants intact.
+
+        The replacement is drawn from the same role pool (see
+        ReactantLibrary.replacement_component), so the reaction still fires.
+
+        Returns:
+            (mutant_name, kind) with kind in {'neighbour', 'random'}, or None
+            when no role yielded a new buildable molecule.
+        """
+        if self.reactant_library is None:
+            return None
+
+        try:
+            parts = molecule_name.split(':')
+
+            if parts[0] != 'rxn' or len(parts) not in [4, 5]:
+                logger.debug(f"Cannot mutate malformed name: {molecule_name}")
+                return None
+
+            try:
+                if int(parts[1]) != self.rxn_id:
+                    logger.debug(f"Wrong rxn_id for mutation: {molecule_name}")
+                    return None
+            except ValueError:
+                return None
+
+            # Try roles in random order so that one role without a usable
+            # replacement does not waste the whole mutation.
+            name_indices = list(range(2, len(parts)))
+            random.shuffle(name_indices)
+
+            for name_index in name_indices:
+                role = self.reactant_library.role_for_name_index(name_index)
+                if role is None:
+                    continue
+
+                try:
+                    current_id = int(parts[name_index])
+                except ValueError:
+                    continue
+
+                new_id, kind = self.reactant_library.replacement_component(
+                    role,
+                    current_id,
+                    mode=self.mutation_mode,
+                    neighbour_ratio=self.neighbour_ratio,
+                )
+                if new_id is None or new_id == current_id:
+                    continue
+
+                mutant_parts = parts.copy()
+                mutant_parts[name_index] = str(new_id)
+                mutant_name = ':'.join(mutant_parts)
+
+                if mutant_name in self.generated_molecule_names:
+                    continue
+
+                if self._is_buildable(mutant_name):
+                    self.generated_molecule_names.add(mutant_name)
+                    return mutant_name, kind
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Error in mutate_molecule: {e}")
+            return None
+
     def apply_genetic_operations(
         self,
         top_molecules: List[str],
         num_crossovers: int = 5
     ) -> List[Dict[str, Any]]:
-        """Apply genetic operations (CROSSOVER ONLY) to top molecules."""
+        """
+        Apply genetic operations (CROSSOVER, then MUTATION by ratio).
+
+        Each iteration crosses two random parents from the top pool and then,
+        with probability self.mutation_ratio, mutates one reactant of the
+        resulting offspring.
+        """
         new_molecules = []
         self.generated_molecule_names.clear()
 
@@ -689,6 +1111,20 @@ class GeneticAlgorithmOperator:
                 offspring = self.crossover_molecules(parent1, parent2)
 
                 if offspring:
+                    operator = 'crossover'
+
+                    if self.mutation_ratio > 0 and random.random() < self.mutation_ratio:
+                        self.operator_stats['mutations_attempted'] += 1
+                        mutated = self.mutate_molecule(offspring)
+                        if mutated:
+                            offspring, kind = mutated
+                            operator = f'crossover+mutation_{kind}'
+                            self.operator_stats[f'mutations_{kind}'] += 1
+                        else:
+                            # Keep the un-mutated offspring rather than
+                            # throwing away a valid candidate.
+                            self.operator_stats['mutations_failed'] += 1
+
                     try:
                         smiles = get_smiles_from_reaction(offspring)
                         inchikey = generate_inchikey(smiles)
@@ -698,9 +1134,10 @@ class GeneticAlgorithmOperator:
                                 'name': offspring,
                                 'smiles': smiles,
                                 'InChIKey': inchikey,
-                                'type': 'crossover'
+                                'type': operator
                             })
                             crossovers_created += 1
+                            self.operator_stats['offspring'] += 1
 
                     except Exception as e:
                         logger.debug(f"Error processing offspring: {e}")
@@ -1480,6 +1917,9 @@ async def generate_unique_molecules_from_top200(
     """
     Generate unique molecules using genetic algorithm from top 200 molecules.
 
+    Each candidate is a crossover offspring of two parents from the top pool,
+    which is then mutated on one reactant with probability MUTATION_RATIO.
+
     NOTE: `desired_count` here is the PRE-surrogate-filter target — i.e. the
     caller may request GENERATE_MULTIPLIER x more than it actually intends
     to send to Boltz, then apply the surrogate filter afterward. This
@@ -1490,7 +1930,11 @@ async def generate_unique_molecules_from_top200(
         logger.warning("Top 200 DataFrame is empty")
         return []
 
-    ga_operator = GeneticAlgorithmOperator(state['rxn_id'], DB_PATH)
+    ga_operator = GeneticAlgorithmOperator(
+        state['rxn_id'],
+        DB_PATH,
+        reactant_library=state.get('reactant_library'),
+    )
     all_names = top_200_df['name'].tolist()
 
     pool_sizes = [200, 350, 500]
@@ -1505,7 +1949,9 @@ async def generate_unique_molecules_from_top200(
 
     logger.info(
         f"🧬 Generating {desired_count} unique molecules with validation "
-        f"(starting with top {current_pool_size}, max_attempts={max_attempts})..."
+        f"(starting with top {current_pool_size}, max_attempts={max_attempts}, "
+        f"mutation_ratio={ga_operator.mutation_ratio}, "
+        f"mutation_mode={ga_operator.mutation_mode})..."
     )
 
     unique_molecules = []
@@ -1615,6 +2061,13 @@ async def generate_unique_molecules_from_top200(
         f"\n   - Failed historical similarity (>= {MAX_SIMILARITY_TO_HISTORICAL}): "
         f"{validation_stats['failed_historical_sim']}"
         f"\n   - Failed other: {validation_stats['failed_other']}"
+        f"\n   Operator stats (pre-validation offspring):"
+        f"\n   - Offspring built: {ga_operator.operator_stats['offspring']}"
+        f"\n   - Mutations attempted: {ga_operator.operator_stats['mutations_attempted']}"
+        f"\n   - Mutations by neighbour: {ga_operator.operator_stats['mutations_neighbour']}"
+        f"\n   - Mutations by random: {ga_operator.operator_stats['mutations_random']}"
+        f"\n   - Mutations failed (kept crossover offspring): "
+        f"{ga_operator.operator_stats['mutations_failed']}"
     )
 
     return unique_molecules
@@ -1688,7 +2141,8 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
       2. [round 1 only] Warm-start surrogate anchors from CSV scores +
          SQLite score_results (DB = training only) + unfiltered training CSV
       3. Generate  desired_unique_count * GENERATE_MULTIPLIER  candidates
-         via genetic crossover + full validation (SMILES/heavy atoms/
+         via genetic crossover + mutation (MUTATION_RATIO of the offspring
+         get one reactant replaced) + full validation (SMILES/heavy atoms/
          banned atoms/rotatable bonds/HF uniqueness/historical similarity
          — already dedup'd against generated_molecules/generated_inchikeys)
       4. Surrogate filter  → keep top SURROGATE_KEEP_RATIO (20%) of the
@@ -1701,7 +2155,9 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
     logger.info("🚀 Starting generation and scoring loop...")
     logger.info("Press Ctrl+C to stop")
     logger.info(
-        f"✅ Pipeline = CSV top-pool → generate {GENERATE_MULTIPLIER}x → "
+        f"✅ Pipeline = CSV top-pool → crossover + mutation"
+        f"(ratio {MUTATION_RATIO}, mode {MUTATION_MODE}) "
+        f"{GENERATE_MULTIPLIER}x → "
         f"validate/dedup → surrogate(keep {SURROGATE_KEEP_RATIO*100:.0f}%, "
         f"active once >= {SURROGATE_MIN_TRAIN_SIZE} samples, else hard-cap "
         f"{BOLTZ_BUDGET}) → Boltz | SQLite = surrogate training ONLY"
@@ -1937,7 +2393,7 @@ async def main():
     rxn_id = parse_args()
 
     logger.info(
-        f"🚀 Starting crossover.py | rxn={rxn_id} | "
+        f"🚀 Starting genetic.py (crossover + mutation) | rxn={rxn_id} | "
         f"top_pool=CSV(data/rxn{rxn_id}.csv) | "
         f"surrogate_train=SQLite(score_results_{rxn_id}.sqlite)+CSV"
     )
@@ -1964,6 +2420,7 @@ async def main():
         'generated_inchikeys': set(),
         'boltz_wrapper': None,
         'top_200_df': pd.DataFrame(),
+        'reactant_library': None,
     }
 
     state['current_challenge_targets'] = config["small_molecule_target"]
@@ -1992,6 +2449,26 @@ async def main():
         f"\n   - SURROGATE_MIN_TRAIN_SIZE: {SURROGATE_MIN_TRAIN_SIZE}"
         f"\n   - BOLTZ_BUDGET (pre-training hard cap): {BOLTZ_BUDGET}"
     )
+
+    logger.info(
+        f"✅ Genetic operators:"
+        f"\n   - MUTATION_RATIO: {MUTATION_RATIO}"
+        f"\n   - MUTATION_MODE: {MUTATION_MODE}"
+        f"\n   - NEIGHBOUR_MUTATION_RATIO: {NEIGHBOUR_MUTATION_RATIO}"
+        f"\n   - NEIGHBOUR_TOP_K: {NEIGHBOUR_TOP_K}"
+        f"\n   - MIN_NEIGHBOUR_SIMILARITY: {MIN_NEIGHBOUR_SIMILARITY}"
+    )
+
+    # Reactant pools for the mutation operator (fingerprint indexes are built
+    # lazily on the first neighbour mutation of each role).
+    if MUTATION_RATIO > 0:
+        logger.info("🧱 Loading reactant pools for mutation...")
+        try:
+            state['reactant_library'] = ReactantLibrary(RXN_ID, DB_PATH)
+        except Exception as e:
+            logger.error(f"❌ Failed to load reactant pools: {e}")
+            logger.warning("⚠️  Falling back to crossover-only generation")
+            state['reactant_library'] = None
 
     # Import BoltzWrapper
     logger.info("🔬 Importing BoltzWrapper...")

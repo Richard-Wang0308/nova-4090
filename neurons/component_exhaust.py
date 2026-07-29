@@ -19,10 +19,12 @@ Pipeline (repeated for --iterations rounds):
   3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
   4. Drop molecules already scored (sqlite / rxn CSV) or already sampled
   5. Drop molecules already in HuggingFace Submission-Archive
-  6. Surrogate pre-score the sampled valid set; keep top-n
-  7. Boltz-score top-n in batches, merging each batch into
+  6. Drop molecules too similar (Tanimoto >= 0.6) to historical submissions
+     for the target protein
+  7. Surrogate pre-score the sampled valid set; keep top-n
+  8. Boltz-score top-n in batches, merging each batch into
      score_results_{rxn_id}.sqlite immediately
-  8. Retrain surrogate on updated DB before the next iteration
+  9. Retrain surrogate on updated DB before the next iteration
 """
 import os
 import sys
@@ -35,7 +37,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Set, Tuple
 from sklearn.ensemble import RandomForestRegressor
-from rdkit import Chem
+from rdkit import Chem, DataStructs
 from rdkit.Chem import Descriptors
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -48,7 +50,12 @@ sys.path.append(BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 
 from config.config_loader import load_config
-from utils import get_heavy_atom_count, contains_atom_type, molecule_unique_for_protein_hf
+from utils import (
+    get_heavy_atom_count,
+    contains_atom_type,
+    molecule_unique_for_protein_hf,
+    get_historical_submissions,
+)
 from molecules import MoleculeManager, MoleculeUtils
 
 logging.basicConfig(
@@ -64,6 +71,10 @@ _fp_cache: Dict[str, np.ndarray] = {}
 # ── surrogate training params ────────────────────────────────────────────
 SURROGATE_TOP_N = 6000
 SURROGATE_BOTTOM_N = 6000
+
+# Reject candidates whose Tanimoto similarity to any historical submission
+# for the target protein reaches this value (mirrors multi_submit_reaction.py).
+MAX_SIMILARITY_TO_HISTORICAL = 0.6
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -327,6 +338,83 @@ def build_and_validate(names: List[str], config: Dict) -> pd.DataFrame:
     mask = df["smiles"].apply(lambda s: validate_smiles(s, config))
     df = df[mask].reset_index(drop=True)
     return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Historical-submission similarity
+# ═══════════════════════════════════════════════════════════════════════════
+def load_historical_fingerprints(target_protein: str) -> Optional[pd.DataFrame]:
+    """
+    Load historical submissions for the target protein once and precompute
+    Morgan fingerprints for fast Tanimoto similarity comparisons.
+
+    Returns:
+        A DataFrame with a 'fingerprint' column, or None if no historical
+        submissions exist for this target.
+    """
+    historical_df = get_historical_submissions(target_protein, "molecules")
+
+    if historical_df is None or historical_df.empty:
+        logger.warning(
+            f"[Exhaust] ⚠️  No historical submissions for target '{target_protein}'"
+        )
+        return None
+
+    mols = [Chem.MolFromSmiles(smi) for smi in historical_df["SMILES"]]
+
+    # Keep df/mols in sync after dropping unparsable SMILES
+    valid_idx = [i for i, m in enumerate(mols) if m is not None]
+    if len(valid_idx) != len(mols):
+        logger.warning(
+            f"[Exhaust] ⚠️  Dropped {len(mols) - len(valid_idx)} unparsable "
+            f"historical SMILES for target '{target_protein}'"
+        )
+        historical_df = historical_df.iloc[valid_idx].reset_index(drop=True)
+        mols = [mols[i] for i in valid_idx]
+
+    if not mols:
+        return None
+
+    fps = MORGAN_FP_GENERATOR.GetFingerprints(mols, numThreads=8)
+    historical_df = historical_df.copy()
+    historical_df["fingerprint"] = list(fps)
+
+    return historical_df
+
+
+def is_diverse_enough(
+    mol_fp,
+    historical_df: Optional[pd.DataFrame],
+    max_similarity: float,
+) -> bool:
+    """
+    Return True if no historical submission has Tanimoto similarity
+    >= max_similarity to mol_fp. No historical data => treat as diverse.
+    """
+    if historical_df is None or historical_df.empty:
+        return True
+
+    similarities = DataStructs.BulkTanimotoSimilarity(
+        mol_fp,
+        list(historical_df["fingerprint"]),
+    )
+    return not any(sim >= max_similarity for sim in similarities)
+
+
+def is_diverse_from_historical(
+    smiles: str,
+    historical_df: Optional[pd.DataFrame],
+    max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
+) -> bool:
+    """Tanimoto diversity check for a single candidate SMILES."""
+    if historical_df is None or historical_df.empty:
+        return True
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return False
+    return is_diverse_enough(
+        MORGAN_FP_GENERATOR.GetFingerprint(mol), historical_df, max_similarity
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -624,7 +712,18 @@ async def run_component_exhaust(
     primary_target = target_proteins[0] if target_proteins else None
     if not primary_target:
         logger.warning(
-            "[Exhaust] No target protein — skipping HuggingFace uniqueness check"
+            "[Exhaust] No target protein — skipping HuggingFace uniqueness "
+            "and historical similarity checks"
+        )
+        historical_df = None
+    else:
+        historical_df = await asyncio.to_thread(
+            load_historical_fingerprints, primary_target
+        )
+        logger.info(
+            f"[Exhaust] Historical submissions for {primary_target}: "
+            f"{0 if historical_df is None else len(historical_df)} "
+            f"(reject Tanimoto >= {MAX_SIMILARITY_TO_HISTORICAL})"
         )
 
     # Names already considered this run (avoid re-sampling across iterations)
@@ -701,7 +800,29 @@ async def run_component_exhaust(
             )
             continue
 
-        # ── 5. Surrogate pre-score → keep top-n ─────────────────────────
+        # ── 5. Skip candidates too similar to historical submissions ────
+        if historical_df is not None and not historical_df.empty:
+            pre = len(valid_df)
+            diverse_mask = valid_df["smiles"].apply(
+                lambda s: is_diverse_from_historical(s, historical_df)
+            )
+            valid_df = valid_df[diverse_mask].reset_index(drop=True)
+            n_sim = pre - len(valid_df)
+            if n_sim:
+                logger.info(
+                    f"[Exhaust] {iter_label}: skipped {n_sim} too similar "
+                    f"(Tanimoto >= {MAX_SIMILARITY_TO_HISTORICAL}) to historical "
+                    f"submissions for {primary_target}"
+                )
+
+        if valid_df.empty:
+            logger.warning(
+                f"[Exhaust] {iter_label}: all remaining candidates too similar "
+                f"to historical submissions"
+            )
+            continue
+
+        # ── 6. Surrogate pre-score → keep top-n ─────────────────────────
         if surrogate.is_trained:
             t0 = time.time()
             preds = surrogate.predict(valid_df["smiles"].tolist())
@@ -723,7 +844,7 @@ async def run_component_exhaust(
             f"[Exhaust] {iter_label}: selected top {len(top_df)} for Boltz"
         )
 
-        # ── 6. Boltz score + merge into DB ─────────────────────────────
+        # ── 7. Boltz score + merge into DB ─────────────────────────────
         scored, n_written = await _boltz_score_batches(
             boltz, config, target_proteins, top_df, db_path,
             boltz_batch_size, iter_label,
@@ -731,7 +852,7 @@ async def run_component_exhaust(
         all_scored.extend(scored)
         total_written += n_written
 
-        # ── 7. Retrain surrogate on updated DB for next iteration ──────
+        # ── 8. Retrain surrogate on updated DB for next iteration ──────
         if it < iterations:
             logger.info(
                 f"[Exhaust] {iter_label}: retraining surrogate on updated DB…"
