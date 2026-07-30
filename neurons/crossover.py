@@ -21,7 +21,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-STARTING_EPOCH = 23900
+STARTING_EPOCH = 23800
 
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None
@@ -1493,7 +1493,7 @@ async def generate_unique_molecules_from_top200(
     ga_operator = GeneticAlgorithmOperator(state['rxn_id'], DB_PATH)
     all_names = top_200_df['name'].tolist()
 
-    pool_sizes = [200, 350, 500]
+    pool_sizes = [200, 500, 1000]
     current_pool_size_idx = 0
     current_pool_size = min(pool_sizes[current_pool_size_idx], len(all_names))
 
@@ -1755,7 +1755,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                 surrogate_warm_started = True
 
             # Get top 200 molecules from CSV only (already sorted by score)
-            top_200_df = molecules_df.head(500)
+            top_200_df = molecules_df.head(1000)
 
             # Update state — top_pool is CSV-only
             state['top_pool'] = molecules_df.copy()
