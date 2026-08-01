@@ -38,7 +38,7 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
-STARTING_EPOCH = 23800
+STARTING_EPOCH = 24000
 
 # ── These are set dynamically from --rxn_id argument in parse_args() ─────
 RXN_ID           = None
@@ -1628,6 +1628,23 @@ def load_training_csv_for_surrogate(rxn_id: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["smiles", "score"])
 
 
+def get_generation_method(molecule: Dict[str, Any]) -> str:
+    """Return the concise generation label used in score logs."""
+    raw_method = str(
+        molecule.get('generation_method')
+        or molecule.get('type')
+        or 'crossover'
+    ).lower()
+
+    # Check mutation variants first because labels such as
+    # "crossover+mutation_neighbour" also contain "crossover".
+    if 'neighbour' in raw_method or 'neighbor' in raw_method:
+        return 'neighbour'
+    if 'random' in raw_method:
+        return 'random'
+    return 'crossover'
+
+
 async def score_molecules_with_boltz_batched(
     state: Dict[str, Any],
     molecules: List[Dict[str, Any]],
@@ -1869,10 +1886,17 @@ async def score_molecules_with_boltz_batched(
                 name = mol.get('name', 'unknown')
                 score = mol.get('boltz_score')
                 source = mol.get('boltz_score_source', 'boltz')
+                generation_method = get_generation_method(mol)
                 if score is not None:
-                    logger.info(f"      {name}: {score:.6f} [{source}]")
+                    logger.info(
+                        f"      {name}: {score:.6f} "
+                        f"[{source}] [{generation_method}]"
+                    )
                 else:
-                    logger.info(f"      {name}: skipped [{source}]")
+                    logger.info(
+                        f"      {name}: skipped "
+                        f"[{source}] [{generation_method}]"
+                    )
 
     scored_molecules = sorted(
         all_scored_molecules,
@@ -2327,9 +2351,11 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                         best_score_so_far = score
                         best_molecule_so_far = mol
                         source = mol.get('boltz_score_source', 'unknown')
+                        generation_method = get_generation_method(mol)
                         logger.info(
                             f"   🏆 New best in round {round_number}, batch {batch_idx + 1}: "
-                            f"{mol['name']} (score: {score:.6f}, source: {source})"
+                            f"{mol['name']} (score: {score:.6f}) "
+                            f"[{source}] [{generation_method}]"
                         )
 
             if all_scored_molecules:
@@ -2342,7 +2368,11 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                     name = mol.get('name', 'unknown')
                     score = mol.get('boltz_score')
                     source = mol.get('boltz_score_source', 'boltz')
-                    logger.info(f"   {name}: {score:.6f} [{source}]")
+                    generation_method = get_generation_method(mol)
+                    logger.info(
+                        f"   {name}: {score:.6f} "
+                        f"[{source}] [{generation_method}]"
+                    )
 
             # ══════════════════════════════════════════════════════════
             # STEP 4 — Feed fresh Boltz scores back into the surrogate

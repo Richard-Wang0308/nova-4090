@@ -69,8 +69,8 @@ MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize
 _fp_cache: Dict[str, np.ndarray] = {}
 
 # ── surrogate training params ────────────────────────────────────────────
-SURROGATE_TOP_N = 6000
-SURROGATE_BOTTOM_N = 6000
+SURROGATE_TOP_N = 20000
+SURROGATE_BOTTOM_N = 20000
 
 # Reject candidates whose Tanimoto similarity to any historical submission
 # for the target protein reaches this value (mirrors multi_submit_reaction.py).
