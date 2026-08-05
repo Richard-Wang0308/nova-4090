@@ -74,26 +74,73 @@ def load_historical_fingerprints(target_protein: str):
 
 def is_diverse_enough(
     mol_fp,
-    historical_df,
+    historical_fps,
     max_similarity: float,
 ) -> bool:
     """
     Check whether a molecule's fingerprint is sufficiently diverse (not too
     similar) compared to all historical submission fingerprints.
 
+    Args:
+        historical_fps: Precomputed list of Morgan fingerprints (materialize
+            once per run — do NOT rebuild from a DataFrame every call).
+
     Returns:
         True if diverse enough (no historical similarity >= max_similarity)
         False if too similar to at least one historical submission
     """
-    if historical_df is None or historical_df.empty:
-        # No historical data to compare against -> treat as diverse
+    if not historical_fps:
         return True
 
-    similarities = DataStructs.BulkTanimotoSimilarity(
-        mol_fp,
-        list(historical_df["fingerprint"]),
-    )
+    similarities = DataStructs.BulkTanimotoSimilarity(mol_fp, historical_fps)
     return not any(sim >= max_similarity for sim in similarities)
+
+
+def load_hf_inchikey_set(target_protein: str) -> set:
+    """
+    Load the HuggingFace InChIKey set once for this run.
+
+    Warms molecule_unique_for_protein_hf's cache, then returns the set so
+    callers can do a single MolFromSmiles → InChIKey lookup without re-parsing
+    inside the HF helper on every row.
+    """
+    # Trigger cache load (metadata + CSV) via a trivial valid SMILES.
+    molecule_unique_for_protein_hf(target_protein, "C")
+    cache = getattr(molecule_unique_for_protein_hf, "_CACHE", None)
+    if not cache:
+        return set()
+    inchikeys_set = cache[2]
+    return inchikeys_set if inchikeys_set is not None else set()
+
+
+def check_availability_fast(
+    smiles: str,
+    inchikeys_set: set,
+    historical_fps,
+    morgan_gen,
+    max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
+) -> tuple:
+    """
+    Single-parse availability check.
+
+    Returns:
+        (available: bool, reason: str)
+        reason is one of: "" | "bad_smiles" | "hf_duplicate" | "too_similar"
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return False, "bad_smiles"
+
+    # Exact match vs HF archive
+    if Chem.MolToInchiKey(mol) in inchikeys_set:
+        return False, "hf_duplicate"
+
+    # Diversity vs historical submissions
+    mol_fp = morgan_gen.GetFingerprint(mol)
+    if not is_diverse_enough(mol_fp, historical_fps, max_similarity):
+        return False, "too_similar"
+
+    return True, ""
 
 
 async def check_molecule_available(
@@ -103,6 +150,8 @@ async def check_molecule_available(
     historical_df,
     morgan_gen,
     max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
+    historical_fps=None,
+    inchikeys_set: Optional[set] = None,
 ) -> bool:
     """
     Check if a molecule is "available" for the target protein:
@@ -119,30 +168,28 @@ async def check_molecule_available(
         return False
 
     try:
-        # --- Step 1: exact-match uniqueness check against HuggingFace ---
-        is_unique_hf = molecule_unique_for_protein_hf(target_protein, smiles)
-        if not is_unique_hf:
-            return False
+        if historical_fps is None:
+            if historical_df is None or getattr(historical_df, "empty", True):
+                historical_fps = []
+            else:
+                historical_fps = list(historical_df["fingerprint"])
 
-        # --- Step 2: diversity check against historical submissions ---
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
+        if inchikeys_set is None:
+            inchikeys_set = load_hf_inchikey_set(target_protein)
+
+        available, reason = check_availability_fast(
+            smiles, inchikeys_set, historical_fps, morgan_gen, max_similarity
+        )
+        if reason == "bad_smiles":
             bt.logging.warning(
                 f"Could not parse SMILES for {molecule_name}: '{smiles}'"
             )
-            return False
-
-        mol_fp = morgan_gen.GetFingerprint(mol)
-        pass_diversity = is_diverse_enough(mol_fp, historical_df, max_similarity)
-
-        if not pass_diversity:
+        elif reason == "too_similar":
             bt.logging.debug(
                 f"❌ Molecule {molecule_name} too similar to a historical "
                 f"submission for target '{target_protein}'"
             )
-            return False
-
-        return True
+        return available
 
     except Exception as e:
         bt.logging.error(f"Error checking availability: {e}")
@@ -225,9 +272,16 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
     ONLY processes molecules where available is TRUE (skips FALSE and NULL),
     unless force_recalculate is True.
     """
+    # Flush pending UPDATE rows this often (also drives progress logs).
+    WRITE_BATCH_SIZE = 2000
+
     try:
         t0 = time.perf_counter()
         conn = sqlite3.connect(db_path)
+        # Faster bulk writes: WAL + less fsync pressure.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
         bt.logging.info(f"⏱️  DB connect: {time.perf_counter() - t0:.3f}s ({db_path})")
         cursor = conn.cursor()
 
@@ -259,9 +313,21 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         bt.logging.info(f"Loading historical submissions for target '{target_protein}'...")
         t_hist = time.perf_counter()
         historical_df = load_historical_fingerprints(target_protein)
+        # Materialize once — rebuilding list(df["fingerprint"]) per row was ~0.35ms each.
+        historical_fps = (
+            [] if historical_df is None else list(historical_df["fingerprint"])
+        )
         bt.logging.info(
             f"⏱️  Historical submissions loaded in {time.perf_counter() - t_hist:.3f}s "
-            f"({0 if historical_df is None else len(historical_df)} rows)"
+            f"({len(historical_fps)} fingerprints)"
+        )
+
+        # --- Load HF InChIKey set ONCE (skip per-row re-parse inside HF helper) ---
+        t_hf = time.perf_counter()
+        inchikeys_set = load_hf_inchikey_set(target_protein)
+        bt.logging.info(
+            f"⏱️  HF InChIKey set loaded in {time.perf_counter() - t_hf:.3f}s "
+            f"({len(inchikeys_set)} keys)"
         )
 
         morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
@@ -275,7 +341,18 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         availability_checks = 0
         availability_batch_time = 0.0
         availability_total_time = 0.0
+        pending_updates = []
         overall_start = time.perf_counter()
+
+        def flush_updates():
+            if not pending_updates:
+                return
+            cursor.executemany(
+                "UPDATE scored_molecules SET available = ? WHERE molecule_name = ?",
+                pending_updates,
+            )
+            conn.commit()
+            pending_updates.clear()
 
         for idx, (molecule_name,) in enumerate(molecules, 1):
             try:
@@ -288,46 +365,35 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                     error_count += 1
                 else:
                     t_check = time.perf_counter()
-
-                    # First check exact HF match (cheap early-exit)
-                    is_unique_hf = molecule_unique_for_protein_hf(target_protein, smiles)
-                    if not is_unique_hf:
-                        available = False
-                        skipped_hf += 1
-                    else:
-                        mol = Chem.MolFromSmiles(smiles)
-                        if mol is None:
-                            bt.logging.warning(
-                                f"Could not parse SMILES for {molecule_name}: '{smiles}'"
-                            )
-                            available = False
-                        else:
-                            mol_fp = morgan_gen.GetFingerprint(mol)
-                            pass_diversity = is_diverse_enough(
-                                mol_fp, historical_df, MAX_SIMILARITY_TO_HISTORICAL
-                            )
-                            if not pass_diversity:
-                                available = False
-                                skipped_similarity += 1
-                            else:
-                                available = True
-
+                    available, reason = check_availability_fast(
+                        smiles,
+                        inchikeys_set,
+                        historical_fps,
+                        morgan_gen,
+                        MAX_SIMILARITY_TO_HISTORICAL,
+                    )
                     check_elapsed = time.perf_counter() - t_check
                     availability_checks += 1
                     availability_batch_time += check_elapsed
                     availability_total_time += check_elapsed
 
-                    if available:
-                        updated_to_true += 1
-                    else:
+                    if reason == "bad_smiles":
+                        bt.logging.warning(
+                            f"Could not parse SMILES for {molecule_name}: '{smiles}'"
+                        )
                         updated_to_false += 1
+                    elif reason == "hf_duplicate":
+                        skipped_hf += 1
+                        updated_to_false += 1
+                    elif reason == "too_similar":
+                        skipped_similarity += 1
+                        updated_to_false += 1
+                    else:
+                        updated_to_true += 1
 
                     success_count += 1
 
-                cursor.execute(
-                    "UPDATE scored_molecules SET available = ? WHERE molecule_name = ?",
-                    (available, molecule_name)
-                )
+                pending_updates.append((available, molecule_name))
 
                 if availability_checks > 0 and availability_checks % 1000 == 0:
                     bt.logging.info(
@@ -338,8 +404,8 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                     )
                     availability_batch_time = 0.0
 
-                if idx % 100 == 0:
-                    conn.commit()
+                if len(pending_updates) >= WRITE_BATCH_SIZE:
+                    flush_updates()
                     bt.logging.info(
                         f"Progress: {idx}/{total} | Success: {success_count} | "
                         f"Errors: {error_count} | TRUE: {updated_to_true} | "
@@ -350,10 +416,7 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
             except Exception as e:
                 bt.logging.error(f"Error processing molecule {molecule_name}: {e}")
                 error_count += 1
-                cursor.execute(
-                    "UPDATE scored_molecules SET available = ? WHERE molecule_name = ?",
-                    (False, molecule_name)
-                )
+                pending_updates.append((False, molecule_name))
                 updated_to_false += 1
 
         remainder = availability_checks % 1000
@@ -365,7 +428,7 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                 f"over {availability_checks} checks"
             )
 
-        conn.commit()
+        flush_updates()
         conn.close()
 
         overall_elapsed = time.perf_counter() - overall_start
