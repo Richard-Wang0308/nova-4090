@@ -74,7 +74,7 @@ SURROGATE_BOTTOM_N = 20000
 
 # Reject candidates whose Tanimoto similarity to any historical submission
 # for the target protein reaches this value (mirrors multi_submit_reaction.py).
-MAX_SIMILARITY_TO_HISTORICAL = 0.6
+MAX_SIMILARITY_TO_HISTORICAL = 0.9
 
 
 # ═══════════════════════════════════════════════════════════════════════════

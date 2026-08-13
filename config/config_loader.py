@@ -16,6 +16,10 @@ def load_config(path: str = "config/config.yaml"):
     small_molecule_target_clip_interval = [tuple(interval) if interval else None for interval in config["protein_selection"]["small_molecule"]["clip_interval"]]
     nanobody_target = config["protein_selection"]["nanobody"]["target"].split(",")
     nanobody_target_clip_interval = [tuple(interval) if interval else None for interval in config["protein_selection"]["nanobody"]["clip_interval"]]
+    nanobody_structure = config["protein_selection"]["nanobody"]["structure"]
+    nanobody_structure_chain = config["protein_selection"]["nanobody"]["structure_chain"]
+    nanobody_structure_res_index = config["protein_selection"]["nanobody"]["structure_res_index"]
+    nanobody_structure_binding_site = config["protein_selection"]["nanobody"]["structure_binding_site"]
 
     no_submission_blocks = config["competition"]["no_submission_blocks"]
     nanobody_weight = config["competition"]["nanobody_weight"]
@@ -31,6 +35,7 @@ def load_config(path: str = "config/config.yaml"):
     num_molecules = molecule_config["num_molecules"]
     min_entropy = molecule_config["min_entropy"]
     banned_atom_types = molecule_config["banned_atom_types"]
+    max_similarity_to_historical = molecule_config["max_similarity_to_historical"]
 
     boltz_config = config["boltz2_config"]
     boltz_metric = boltz_config["boltz_metric"]
@@ -70,6 +75,10 @@ def load_config(path: str = "config/config.yaml"):
         'small_molecule_target_clip_interval': small_molecule_target_clip_interval,
         'nanobody_target': nanobody_target,
         'nanobody_target_clip_interval': nanobody_target_clip_interval,
+        'nanobody_structure': nanobody_structure,
+        'nanobody_structure_chain': nanobody_structure_chain,
+        'nanobody_structure_res_index': nanobody_structure_res_index,
+        'nanobody_structure_binding_site': nanobody_structure_binding_site,
         'no_submission_blocks': no_submission_blocks,
         'nanobody_weight': nanobody_weight,
         'emission_override_uid': emission_override_uid,
@@ -104,6 +113,7 @@ def load_config(path: str = "config/config.yaml"):
         'enforce_vhh_hallmarks': enforce_vhh_hallmarks,
         'boltzgen_rank_mode': boltzgen_rank_mode,
         'boltzgen_rank_by': boltzgen_rank_by,
+        'max_similarity_to_historical': max_similarity_to_historical,
     }
 
 def load_boltzgen_metrics(path: str = "config/boltzgen_config.yaml") -> dict:

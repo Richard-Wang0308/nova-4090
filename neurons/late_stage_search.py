@@ -87,7 +87,7 @@ _fp_cache: Dict[str, np.ndarray] = {}
 _bv_cache: Dict[str, Any] = {}
 
 # Defaults tuned for late-stage / saturated archives
-MAX_SIMILARITY_TO_HISTORICAL = 0.6
+MAX_SIMILARITY_TO_HISTORICAL = 0.9
 DEFAULT_MUTATION_RATIO = 0.7
 DEFAULT_MUTATION_MODE = "mixed"
 DEFAULT_NEIGHBOUR_RATIO = 0.4          # lean random for exploration
