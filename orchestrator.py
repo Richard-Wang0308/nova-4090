@@ -266,12 +266,25 @@ def parse_args():
 # =============================================================================
 
 class ScoreStore:
+    """
+    Primary store = original score_results_{rxn}.sqlite.
+    No separate top20_v2 score database is created.
+
+    Existing rows are kept in the canonical scored_molecules table and extra
+    columns are added in-place. Existing submit.py code remains compatible.
+
+    Target safety:
+      - metadata.active_target_key records the current target.
+      - existing rows with no metadata are assumed to belong to the current target.
+      - if the target changes later, old rows are archived INSIDE the same SQLite
+        file and the live scored_molecules table is cleared for the new target.
+    """
     def __init__(self, rxn_id: int, target_key: str, target_label: str):
         self.rxn_id = rxn_id
         self.target_key = target_key
         self.target_label = target_label
-        self.path = OUTPUT_DIR / f"scores_rxn{rxn_id}_{target_key[:12]}.sqlite"
-        self.compat_path = BASE_DIR / f"score_results_{rxn_id}.sqlite"
+        self.path = BASE_DIR / f"score_results_{rxn_id}.sqlite"
+        self.compat_path = self.path
         self._init()
 
     def _connect(self):
@@ -280,68 +293,159 @@ class ScoreStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
+    def _ensure_columns(self, conn):
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scored_molecules (
+                molecule_name TEXT PRIMARY KEY,
+                score REAL NOT NULL,
+                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                available BOOLEAN DEFAULT TRUE,
+                iteration INTEGER
+            )
+            """
+        )
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(scored_molecules)").fetchall()}
+        additions = {
+            "target_key": "TEXT",
+            "target_label": "TEXT",
+            "rxn_id": "INTEGER",
+            "smiles": "TEXT",
+            "inchikey": "TEXT",
+            "source": "TEXT",
+            "round": "INTEGER",
+        }
+        for name, sqltype in additions.items():
+            if name not in cols:
+                cur.execute(f"ALTER TABLE scored_molecules ADD COLUMN {name} {sqltype}")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        conn.commit()
+
     def _init(self):
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS scored_molecules (
-                    target_key TEXT NOT NULL,
-                    target_label TEXT NOT NULL,
-                    rxn_id INTEGER NOT NULL,
-                    molecule_name TEXT NOT NULL,
-                    smiles TEXT NOT NULL,
-                    inchikey TEXT,
-                    score REAL NOT NULL,
-                    source TEXT,
-                    round INTEGER,
-                    scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY(target_key, molecule_name)
+            self._ensure_columns(conn)
+
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key='active_target_key'"
+            ).fetchone()
+            active = row[0] if row else None
+            count = conn.execute("SELECT COUNT(*) FROM scored_molecules").fetchone()[0]
+
+            if active is None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('active_target_key',?)",
+                    (self.target_key,),
                 )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_score_target "
-                "ON scored_molecules(target_key, score DESC)"
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('active_target_label',?)",
+                    (self.target_label,),
                 )
-                """
-            )
+                if count:
+                    conn.execute(
+                        """
+                        UPDATE scored_molecules
+                        SET target_key=COALESCE(target_key,?),
+                            target_label=COALESCE(target_label,?),
+                            rxn_id=COALESCE(rxn_id,?),
+                            round=COALESCE(round,iteration)
+                        """,
+                        (self.target_key, self.target_label, self.rxn_id),
+                    )
+                conn.commit()
+
+            elif active != self.target_key:
+                stamp = int(time.time())
+                archive = f"scored_molecules_archive_{stamp}"
+                conn.execute(f"CREATE TABLE {archive} AS SELECT * FROM scored_molecules")
+                conn.execute("DELETE FROM scored_molecules")
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('active_target_key',?)",
+                    (self.target_key,),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('active_target_label',?)",
+                    (self.target_label,),
+                )
+                conn.commit()
+                log.warning(
+                    "Target changed. Archived old rows to %s inside %s and reset live table.",
+                    archive, self.path
+                )
+
             conn.execute(
-                "INSERT OR REPLACE INTO metadata(key,value) VALUES('target_label',?)",
-                (self.target_label,),
+                "CREATE INDEX IF NOT EXISTS idx_scored_score ON scored_molecules(score DESC)"
             )
             conn.commit()
 
     def names(self) -> Set[str]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT molecule_name FROM scored_molecules WHERE target_key=?",
-                (self.target_key,),
-            ).fetchall()
+            rows = conn.execute("SELECT molecule_name FROM scored_molecules").fetchall()
         return {r[0] for r in rows}
 
     def dataframe(self) -> pd.DataFrame:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT molecule_name, smiles, inchikey, score, source, round
+                SELECT molecule_name, smiles, inchikey, score,
+                       COALESCE(source,'legacy') AS source,
+                       COALESCE(round,iteration,0) AS round
                 FROM scored_molecules
-                WHERE target_key=?
                 ORDER BY score DESC
-                """,
-                (self.target_key,),
+                """
             ).fetchall()
+
         df = pd.DataFrame(
             rows, columns=["name", "smiles", "inchikey", "score", "source", "round"]
         )
-        if not df.empty:
-            df["score"] = pd.to_numeric(df["score"], errors="coerce")
-            df = df[np.isfinite(df["score"])].dropna(subset=["score"])
+        if df.empty:
+            return df
+
+        df["score"] = pd.to_numeric(df["score"], errors="coerce")
+        df = df[np.isfinite(df["score"])].dropna(subset=["score"]).reset_index(drop=True)
+
+        missing = df["smiles"].isna() | (df["smiles"].astype(str) == "")
+        if missing.any() and _GLOBAL_MANAGER is not None:
+            names = df.loc[missing, "name"].tolist()
+            raw = pd.DataFrame({"name": names})
+            try:
+                resolved = _GLOBAL_MANAGER.validate_molecules(
+                    active_validation_config(_GLOBAL_MANAGER), raw
+                )
+                smap = dict(zip(resolved["name"], resolved["smiles"]))
+                updates = []
+                for idx in df.index[missing]:
+                    name = df.at[idx, "name"]
+                    s = smap.get(name)
+                    if s:
+                        ik = inchikey(s)
+                        df.at[idx, "smiles"] = s
+                        df.at[idx, "inchikey"] = ik
+                        updates.append((s, ik, self.target_key, self.target_label,
+                                        self.rxn_id, name))
+                if updates:
+                    with self._connect() as conn:
+                        conn.executemany(
+                            """
+                            UPDATE scored_molecules
+                            SET smiles=?, inchikey=?, target_key=?, target_label=?, rxn_id=?
+                            WHERE molecule_name=?
+                            """,
+                            updates,
+                        )
+                        conn.commit()
+            except Exception as e:
+                log.warning("Could not backfill legacy SMILES: %s", e)
+
+        df = df[df["smiles"].notna() & (df["smiles"].astype(str) != "")]
         return df.reset_index(drop=True)
 
     def write(self, records: Sequence[Dict[str, Any]], round_no: int):
@@ -360,114 +464,54 @@ class ScoreStore:
                 continue
             rows.append(
                 (
-                    self.target_key,
-                    self.target_label,
-                    self.rxn_id,
-                    name,
-                    smiles,
-                    inchikey(smiles),
-                    score,
+                    name, score, True, int(round_no),
+                    self.target_key, self.target_label, self.rxn_id,
+                    smiles, inchikey(smiles),
                     str(r.get("source", r.get("generation_method", "search"))),
                     int(round_no),
                 )
             )
+
         if not rows:
             return
+
         with self._connect() as conn:
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO scored_molecules
-                (target_key,target_label,rxn_id,molecule_name,smiles,inchikey,score,source,round)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                INSERT INTO scored_molecules
+                (molecule_name,score,available,iteration,target_key,target_label,
+                 rxn_id,smiles,inchikey,source,round)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(molecule_name) DO UPDATE SET
+                    score=excluded.score,
+                    available=excluded.available,
+                    iteration=excluded.iteration,
+                    target_key=excluded.target_key,
+                    target_label=excluded.target_label,
+                    rxn_id=excluded.rxn_id,
+                    smiles=excluded.smiles,
+                    inchikey=excluded.inchikey,
+                    source=excluded.source,
+                    round=excluded.round,
+                    scored_at=CURRENT_TIMESTAMP
                 """,
                 rows,
             )
             conn.commit()
-        self.sync_compat_db()
 
     def sync_compat_db(self):
-        """Keep current repository submit.py compatible."""
-        df = self.dataframe()
-        if df.empty:
-            return
-        conn = sqlite3.connect(str(self.compat_path))
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scored_molecules (
-                molecule_name TEXT PRIMARY KEY,
-                score REAL NOT NULL,
-                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                available BOOLEAN DEFAULT TRUE,
-                iteration INTEGER
-            )
-            """
-        )
-        cols = {r[1] for r in cur.execute("PRAGMA table_info(scored_molecules)").fetchall()}
-        if "iteration" not in cols:
-            cur.execute("ALTER TABLE scored_molecules ADD COLUMN iteration INTEGER")
-        rows = [
-            (r["name"], float(r["score"]), True, int(r.get("round") or 0))
-            for _, r in df.iterrows()
-        ]
-        cur.executemany(
-            """
-            INSERT OR REPLACE INTO scored_molecules
-            (molecule_name,score,available,iteration)
-            VALUES (?,?,?,?)
-            """,
-            rows,
-        )
-        conn.commit()
-        conn.close()
+        return
 
     def import_legacy_once(self, legacy_path: str, manager: MoleculeManager):
-        if not legacy_path:
-            return
-        marker = f"imported:{Path(legacy_path).resolve()}"
-        with self._connect() as conn:
-            row = conn.execute("SELECT value FROM metadata WHERE key=?", (marker,)).fetchone()
-            if row:
-                log.info("Legacy DB already imported once; skipping")
-                return
-        p = Path(legacy_path)
-        if not p.exists():
-            log.warning("Legacy DB not found: %s", p)
-            return
-
-        conn = sqlite3.connect(str(p))
-        rows = conn.execute(
-            "SELECT molecule_name, score FROM scored_molecules WHERE molecule_name LIKE ?",
-            (f"rxn:{self.rxn_id}:%",),
-        ).fetchall()
-        conn.close()
-
-        raw = pd.DataFrame(rows, columns=["name", "score"])
-        if raw.empty:
-            return
-        valid = manager.validate_molecules(active_validation_config(manager), raw[["name"]])
-        score_map = dict(zip(raw["name"], raw["score"]))
-        recs = []
-        for _, row in valid.iterrows():
-            s = score_map.get(row["name"])
-            if s is None or not np.isfinite(float(s)):
-                continue
-            recs.append(
-                {
-                    "name": row["name"],
-                    "smiles": row["smiles"],
-                    "boltz_score": float(s),
-                    "source": "legacy_import",
-                }
-            )
-        self.write(recs, round_no=-1)
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)",
-                (marker, str(time.time())),
-            )
-            conn.commit()
-        log.info("Imported %d current-target legacy scores", len(recs))
+        if legacy_path:
+            supplied = Path(legacy_path).resolve()
+            if supplied != self.path.resolve():
+                log.warning(
+                    "--legacy-db=%s ignored because primary DB is now %s",
+                    supplied, self.path
+                )
+            else:
+                log.info("Using original DB directly: %s", self.path)
 
 
 # =============================================================================
@@ -782,72 +826,92 @@ class Top20Surrogate:
 # =============================================================================
 
 class HistoricalGuard:
-    def __init__(self, target: str, max_similarity: float,
-                 disable_hf: bool, disable_history: bool):
+    """Fast, fully cached historical/archive guard."""
+    def __init__(self, target: str, max_similarity: float, disable_hf: bool, disable_history: bool):
         self.target = target
         self.max_similarity = max_similarity
         self.disable_hf = disable_hf
         self.disable_history = disable_history
         self.hist_fps: List[Any] = []
         self.hist_smiles: Set[str] = set()
-        self._load()
+        self.hist_inchikeys: Set[str] = set()
+        self._load_once()
 
-    def _load(self):
-        if self.disable_history or get_historical_submissions is None:
+    def _load_once(self):
+        if get_historical_submissions is None:
+            log.warning("get_historical_submissions unavailable; archive cache disabled")
             return
         try:
-            df = get_historical_submissions(self.target, "molecules")
+            t0=time.time()
+            df=get_historical_submissions(self.target, "molecules")
             if df is None or df.empty:
+                log.info("HistoricalGuard: target archive is empty")
                 return
-            smiles_col = "SMILES" if "SMILES" in df.columns else "smiles"
-            if smiles_col not in df.columns:
+            smiles_col=next((c for c in ("SMILES","smiles","Smiles","canonical_smiles") if c in df.columns), None)
+            if smiles_col is None:
+                log.warning("HistoricalGuard: no SMILES column in archive: %s", list(df.columns))
                 return
-            for s in df[smiles_col].dropna().astype(str):
-                mol = mol_from_smiles(s)
-                if mol is None:
-                    continue
-                self.hist_smiles.add(s)
-                self.hist_fps.append(MORGAN.GetFingerprint(mol))
-            log.info("HistoricalGuard: loaded %d historical fingerprints", len(self.hist_fps))
+            for s in df[smiles_col].dropna().astype(str).unique():
+                mol=mol_from_smiles(s)
+                if mol is None: continue
+                try: canon=Chem.MolToSmiles(mol, canonical=True)
+                except Exception: canon=s
+                try: ik=Chem.MolToInchiKey(mol)
+                except Exception: ik=""
+                self.hist_smiles.add(canon)
+                if ik: self.hist_inchikeys.add(ik)
+                if not self.disable_history:
+                    self.hist_fps.append(MORGAN.GetFingerprint(mol))
+            log.info("HistoricalGuard cache ready: %d smiles | %d inchikeys | %d fps | %.2fs", len(self.hist_smiles), len(self.hist_inchikeys), len(self.hist_fps), time.time()-t0)
         except Exception as e:
             log.warning("Could not load historical submissions: %s", e)
 
-    def history_ok(self, smiles: str) -> bool:
-        if self.disable_history or not self.hist_fps:
-            return True
-        fp = morgan_bv(smiles)
-        if fp is None:
-            return False
+    def exact_archive_ok(self, smiles: str) -> bool:
+        if self.disable_hf: return True
+        mol=mol_from_smiles(smiles)
+        if mol is None: return False
         try:
-            sims = DataStructs.BulkTanimotoSimilarity(fp, self.hist_fps)
+            ik=Chem.MolToInchiKey(mol)
+            if ik and ik in self.hist_inchikeys: return False
+        except Exception: pass
+        try:
+            canon=Chem.MolToSmiles(mol, canonical=True)
+            if canon in self.hist_smiles: return False
+        except Exception: pass
+        return True
+
+    def hf_ok(self, smiles: str) -> bool:
+        return self.exact_archive_ok(smiles)
+
+    def history_ok(self, smiles: str) -> bool:
+        if self.disable_history or not self.hist_fps: return True
+        fp=morgan_bv(smiles)
+        if fp is None: return False
+        try:
+            sims=DataStructs.BulkTanimotoSimilarity(fp, self.hist_fps)
             return (max(sims) if sims else 0.0) < self.max_similarity
         except Exception:
             return False
 
-    def hf_ok(self, smiles: str) -> bool:
-        if self.disable_hf or molecule_unique_for_protein_hf is None:
-            return True
-        try:
-            return bool(molecule_unique_for_protein_hf(self.target, smiles))
-        except Exception as e:
-            # Network/archive failures should not silently delete the whole search pool.
-            log.debug("HF uniqueness check failed (%s); retaining candidate", e)
-            return True
+    def exact_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty: return df
+        keep=[idx for idx,row in df.iterrows() if self.exact_archive_ok(row["smiles"])]
+        return df.loc[keep].reset_index(drop=True) if keep else df.head(0)
+
+    def strict_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty: return df
+        t0=time.time(); rows=[]
+        for _,row in df.iterrows():
+            s=row["smiles"]
+            if not self.exact_archive_ok(s): continue
+            if not self.history_ok(s): continue
+            rows.append(row)
+        out=pd.DataFrame(rows).reset_index(drop=True) if rows else df.head(0)
+        log.info("Strict history filter: %d -> %d candidates | %.2fs", len(df), len(out), time.time()-t0)
+        return out
 
     def filter(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        rows = []
-        for _, row in df.iterrows():
-            s = row["smiles"]
-            if not self.hf_ok(s):
-                continue
-            if not self.history_ok(s):
-                continue
-            rows.append(row)
-        if not rows:
-            return df.head(0)
-        return pd.DataFrame(rows).reset_index(drop=True)
+        return self.strict_filter(df)
 
 
 # =============================================================================
@@ -871,12 +935,66 @@ class CandidateGenerator:
         self.py_rng = random.Random(args.seed)
         self.synthon = SynthonLibrary(self.sub)
 
+        self._ids = {
+            "A": np.asarray(self.sub.moles_A_id, dtype=np.int64),
+            "B": np.asarray(self.sub.moles_B_id, dtype=np.int64),
+            "C": np.asarray(self.sub.moles_C_id, dtype=np.int64)
+                 if self.sub.is_three_component else np.asarray([], dtype=np.int64),
+        }
+        self._prob_cache: Dict[Tuple[str, float], np.ndarray] = {}
+
+    def refresh_sampling_cache(self):
+        self._prob_cache.clear()
+
+    def _role_probs(self, role: str, epsilon: float) -> Optional[np.ndarray]:
+        key = (role, round(float(epsilon), 4))
+        if key in self._prob_cache:
+            return self._prob_cache[key]
+
+        ids = self._ids[role]
+        if len(ids) == 0:
+            return None
+
+        stat_map = self.surrogate.stats.single.get(role, {})
+        if not stat_map:
+            return None
+
+        gm = self.surrogate.stats.global_mean
+        gs = max(self.surrogate.stats.global_std, 1e-6)
+
+        raw = np.empty(len(ids), dtype=np.float64)
+        for i, mid in enumerate(ids):
+            val, cnt, topq = stat_map.get(int(mid), (gm, 0, gm))
+            z = np.clip(((0.65 * val + 0.35 * topq) - gm) / gs, -4.0, 4.0)
+            raw[i] = math.exp(0.7 * z)
+
+        total = raw.sum()
+        if not np.isfinite(total) or total <= 0:
+            return None
+
+        p = raw / total
+        uniform = np.full(len(ids), 1.0 / len(ids), dtype=np.float64)
+        p = (1.0 - epsilon) * p + epsilon * uniform
+        p /= p.sum()
+        self._prob_cache[key] = p
+        return p
+
     def _weighted_pick(self, ids: Sequence[int], role: str, n: int,
                        epsilon: float = 0.30) -> np.ndarray:
-        weights = self.surrogate.stats.component_weights(ids, role, epsilon)
-        if weights is None:
-            return self.rng.choice(ids, size=n, replace=True)
-        return self.rng.choice(ids, size=n, replace=True, p=weights)
+        arr = self._ids[role]
+        if len(arr) == 0:
+            return np.asarray([], dtype=np.int64)
+        p = self._role_probs(role, epsilon)
+        return self.rng.choice(arr, size=n, replace=True, p=p)
+
+    def _bulk_components(self, n: int, epsilon: float = 0.35):
+        A = self._weighted_pick(self._ids["A"], "A", n, epsilon)
+        B = self._weighted_pick(self._ids["B"], "B", n, epsilon)
+        C = (
+            self._weighted_pick(self._ids["C"], "C", n, epsilon)
+            if self.sub.is_three_component else None
+        )
+        return A, B, C
 
     def global_candidates(self, n: int) -> List[str]:
         A = self._weighted_pick(self.sub.moles_A_id, "A", n, epsilon=0.35)
@@ -888,36 +1006,37 @@ class CandidateGenerator:
         return [make_name(self.rxn_id, int(a), int(b), None) for a, b in zip(A, B)]
 
     def crossover(self, scored: pd.DataFrame, n: int) -> List[str]:
-        if scored.empty:
+        if scored.empty or n <= 0:
             return []
         parents = scored.sort_values("score", ascending=False).head(self.args.parent_pool)
         names = parents["name"].tolist()
         if not names:
             return []
 
+        mutA, mutB, mutC = self._bulk_components(n, epsilon=0.45)
+
         out = []
-        for _ in range(n):
-            p1 = self.py_rng.choice(names)
-            p2 = self.py_rng.choice(names)
+        for i in range(n):
+            p1 = names[self.py_rng.randrange(len(names))]
+            p2 = names[self.py_rng.randrange(len(names))]
             A1, B1, C1 = parse_components(p1)
             A2, B2, C2 = parse_components(p2)
             if A1 is None or A2 is None:
                 continue
 
-            # Deliberate recombination plus mutation.
-            A = self.py_rng.choice([A1, A2])
-            B = self.py_rng.choice([B1, B2])
-            C = self.py_rng.choice([C1, C2]) if self.sub.is_three_component else None
+            A = A1 if self.py_rng.random() < 0.5 else A2
+            B = B1 if self.py_rng.random() < 0.5 else B2
+            C = (C1 if self.py_rng.random() < 0.5 else C2) if self.sub.is_three_component else None
 
-            # 30% component mutation; bias mutation using learned component priors.
             if self.py_rng.random() < 0.30:
-                A = int(self._weighted_pick(self.sub.moles_A_id, "A", 1, 0.45)[0])
+                A = int(mutA[i])
             if self.py_rng.random() < 0.30:
-                B = int(self._weighted_pick(self.sub.moles_B_id, "B", 1, 0.45)[0])
+                B = int(mutB[i])
             if self.sub.is_three_component and self.py_rng.random() < 0.30:
-                C = int(self._weighted_pick(self.sub.moles_C_id, "C", 1, 0.45)[0])
+                C = int(mutC[i])
 
-            out.append(make_name(self.rxn_id, A, B, C))
+            out.append(make_name(self.rxn_id, int(A), int(B),
+                                 int(C) if C is not None else None))
         return out
 
     def local_neighbour(self, scored: pd.DataFrame, n: int) -> List[str]:
@@ -941,6 +1060,8 @@ class CandidateGenerator:
         return out
 
     def single_anchor(self, n: int) -> List[str]:
+        if n <= 0:
+            return []
         stats = self.surrogate.stats
         top_A = stats.top_single("A", self.args.elite_anchors)
         top_B = stats.top_single("B", self.args.elite_anchors)
@@ -952,25 +1073,25 @@ class CandidateGenerator:
         if not anchors:
             return []
 
+        A_arr, B_arr, C_arr = self._bulk_components(n, epsilon=0.35)
+
         out = []
-        for _ in range(n):
-            role, fixed = self.py_rng.choice(anchors)
-            A = int(self._weighted_pick(self.sub.moles_A_id, "A", 1, 0.35)[0])
-            B = int(self._weighted_pick(self.sub.moles_B_id, "B", 1, 0.35)[0])
-            C = (
-                int(self._weighted_pick(self.sub.moles_C_id, "C", 1, 0.35)[0])
-                if self.sub.is_three_component else None
-            )
+        for i in range(n):
+            role, fixed = anchors[self.py_rng.randrange(len(anchors))]
+            A = int(A_arr[i]); B = int(B_arr[i])
+            C = int(C_arr[i]) if C_arr is not None else None
             if role == "A":
-                A = fixed
+                A = int(fixed)
             elif role == "B":
-                B = fixed
+                B = int(fixed)
             elif role == "C":
-                C = fixed
+                C = int(fixed)
             out.append(make_name(self.rxn_id, A, B, C))
         return out
 
     def pair_anchor(self, n: int) -> List[str]:
+        if n <= 0:
+            return []
         stats = self.surrogate.stats
         pairs: List[Tuple[str, Tuple[int, int]]] = []
         pairs += [("AB", x) for x in stats.top_pairs("AB", self.args.pair_anchors)]
@@ -980,25 +1101,27 @@ class CandidateGenerator:
         if not pairs:
             return []
 
+        A_arr, B_arr, C_arr = self._bulk_components(n, epsilon=0.35)
+
         out = []
-        for _ in range(n):
-            kind, pair = self.py_rng.choice(pairs)
-            A = int(self._weighted_pick(self.sub.moles_A_id, "A", 1, 0.35)[0])
-            B = int(self._weighted_pick(self.sub.moles_B_id, "B", 1, 0.35)[0])
-            C = (
-                int(self._weighted_pick(self.sub.moles_C_id, "C", 1, 0.35)[0])
-                if self.sub.is_three_component else None
-            )
+        for i in range(n):
+            kind, pair = pairs[self.py_rng.randrange(len(pairs))]
+            A = int(A_arr[i]); B = int(B_arr[i])
+            C = int(C_arr[i]) if C_arr is not None else None
+
             if kind == "AB":
-                A, B = pair
+                A, B = int(pair[0]), int(pair[1])
             elif kind == "AC":
-                A, C = pair
+                A, C = int(pair[0]), int(pair[1])
             elif kind == "BC":
-                B, C = pair
+                B, C = int(pair[0]), int(pair[1])
+
             out.append(make_name(self.rxn_id, A, B, C))
         return out
 
     def generate(self, scored: pd.DataFrame, seen: Set[str], n_total: int) -> pd.DataFrame:
+        t_all = time.time()
+        self.refresh_sampling_cache()
         # Distribution adapts once we actually have learned signal.
         if scored.empty or len(scored) < 200:
             proportions = {
@@ -1018,11 +1141,31 @@ class CandidateGenerator:
             }
 
         names: List[str] = []
-        names += self.global_candidates(int(n_total * proportions["global"]))
-        names += self.crossover(scored, int(n_total * proportions["cross"]))
-        names += self.local_neighbour(scored, int(n_total * proportions["local"]))
-        names += self.single_anchor(int(n_total * proportions["single"]))
-        names += self.pair_anchor(int(n_total * proportions["pair"]))
+
+        t = time.time()
+        g = self.global_candidates(int(n_total * proportions["global"]))
+        log.info("generator/global: %d candidates | %.2fs", len(g), time.time() - t)
+        names += g
+
+        t = time.time()
+        c = self.crossover(scored, int(n_total * proportions["cross"]))
+        log.info("generator/crossover: %d candidates | %.2fs", len(c), time.time() - t)
+        names += c
+
+        t = time.time()
+        l = self.local_neighbour(scored, int(n_total * proportions["local"]))
+        log.info("generator/local-neighbour: %d candidates | %.2fs", len(l), time.time() - t)
+        names += l
+
+        t = time.time()
+        sa = self.single_anchor(int(n_total * proportions["single"]))
+        log.info("generator/single-anchor: %d candidates | %.2fs", len(sa), time.time() - t)
+        names += sa
+
+        t = time.time()
+        pa = self.pair_anchor(int(n_total * proportions["pair"]))
+        log.info("generator/pair-anchor: %d candidates | %.2fs", len(pa), time.time() - t)
+        names += pa
 
         # Preserve order, remove already Boltz-scored.
         unique = []
@@ -1046,6 +1189,8 @@ class CandidateGenerator:
         valid["inchikey"] = valid["smiles"].map(inchikey)
         valid = valid[valid["inchikey"] != ""]
         valid = valid.drop_duplicates("inchikey", keep="first").reset_index(drop=True)
+        log.info("generator/total: %d locally-valid unique | %.2fs",
+                 len(valid), time.time() - t_all)
         return valid
 
 
@@ -1055,6 +1200,7 @@ class CandidateGenerator:
 
 _GLOBAL_CONFIG: Optional[Dict[str, Any]] = None
 _GLOBAL_ARGS = None
+_GLOBAL_MANAGER = None
 
 
 def active_validation_config(manager: MoleculeManager) -> Dict[str, Any]:
@@ -1135,6 +1281,8 @@ async def boltz_score(
             fmap = getattr(boltz, "final_boltz_scores", {}).get(0, {}).get(target, {})
             scores = [fmap.get(x["smiles"], -math.inf) for x in batch]
 
+        batch_scored = []
+
         for rec, score in zip(batch, scores):
             try:
                 score = float(score)
@@ -1142,16 +1290,43 @@ async def boltz_score(
                 continue
             if not np.isfinite(score):
                 continue
+
             r = dict(rec)
             r["boltz_score"] = score
             out.append(r)
+            batch_scored.append((rec["name"], score))
+
+        elapsed = time.time() - t0
+
+        finite_scores = [score for _, score in batch_scored]
 
         log.info(
             "Boltz batch %d-%d: %d/%d finite | %.1fs",
-            start + 1, min(start + len(batch), len(molecules)),
-            len([x for x in scores if np.isfinite(float(x))]),
-            len(batch), time.time() - t0,
+            start + 1,
+            min(start + len(batch), len(molecules)),
+            len(batch_scored),
+            len(batch),
+            elapsed,
         )
+
+        # Print every molecule score so live mining progress is visible.
+        # Preserve original batch order for easy comparison with Boltz execution.
+        for offset, (name, score) in enumerate(batch_scored, start=start + 1):
+            log.info(
+                "  BOLTZ [%d/%d] score=%.6f | %s",
+                offset,
+                len(molecules),
+                score,
+                name,
+            )
+
+        if finite_scores:
+            log.info(
+                "  BATCH STATS | best=%.6f | mean=%.6f | worst=%.6f",
+                max(finite_scores),
+                float(np.mean(finite_scores)),
+                min(finite_scores),
+            )
 
     return out
 
@@ -1255,6 +1430,7 @@ def final_top20(
     guard: HistoricalGuard,
     config: Dict[str, Any],
 ) -> pd.DataFrame:
+    t0_final = time.time()
     df = store.dataframe()
     if df.empty:
         return df
@@ -1325,7 +1501,10 @@ def final_top20(
         except Exception as e:
             log.debug("Entropy check unavailable/failed: %s", e)
 
-    return top.reset_index(drop=True)
+    top = top.reset_index(drop=True)
+    log.info("final_top20 rebuild: %d molecules | %.2fs",
+             len(top), time.time() - t0_final)
+    return top
 
 
 def export_top20(df: pd.DataFrame, rxn_id: int, target: str):
@@ -1366,7 +1545,7 @@ def target_identity(config: Dict[str, Any]) -> Tuple[str, str]:
 # =============================================================================
 
 async def main():
-    global _GLOBAL_CONFIG, _GLOBAL_ARGS
+    global _GLOBAL_CONFIG, _GLOBAL_ARGS, _GLOBAL_MANAGER
 
     args = parse_args()
     _GLOBAL_ARGS = args
@@ -1388,6 +1567,7 @@ async def main():
         cfg["max_heavy_atoms"] = 10**9
 
     manager = MoleculeManager(config=cfg, db_path=str(DB_PATH))
+    _GLOBAL_MANAGER = manager
     target_key, target_label = target_identity(config)
     target = config["small_molecule_target"][0]
 
@@ -1426,7 +1606,7 @@ async def main():
     log.info("validator objective: exactly %d molecules", int(config.get("num_molecules", 20)))
     log.info("Boltz combination=%s metrics=%s",
              config.get("combination_strategy"), config.get("boltz_metric"))
-    log.info("target-aware DB=%s", store.path)
+    log.info("primary score DB=%s", store.path)
 
     for round_no in range(1, args.max_rounds + 1):
         t0 = time.time()
@@ -1455,26 +1635,37 @@ async def main():
             await asyncio.sleep(args.sleep)
             continue
 
-        # HF/historical are hard validity gates, not rewards.
-        filtered = guard.filter(raw)
-        log.info("[round %d] archive-valid=%d/%d", round_no, len(filtered), len(raw))
+        # Cheap exact archive identity check on the full pool.
+        t_filter = time.time()
+        filtered = guard.exact_filter(raw)
+        log.info("[round %d] exact-archive-valid=%d/%d | %.2fs", round_no, len(filtered), len(raw), time.time()-t_filter)
         if filtered.empty:
             await asyncio.sleep(args.sleep)
             continue
 
         if surrogate.trained:
             ranked = surrogate.predict(filtered)
-            chosen = choose_boltz_batch(ranked, args.boltz_budget, rng)
+            # Historical-similarity filtering is expensive; apply it only to an acquisition shortlist.
+            strict_pool_size = min(len(ranked), max(args.boltz_budget * 5, 500))
+            prechosen = choose_boltz_batch(ranked, strict_pool_size, rng)
+            strict = guard.strict_filter(prechosen)
+            if len(strict) < args.boltz_budget:
+                used_names = set(strict["name"]) if not strict.empty else set()
+                remain = ranked[~ranked["name"].isin(used_names)].sort_values(
+                    ["acq","p_improve","ei","mu"], ascending=False
+                ).head(max(args.boltz_budget * 5, 500))
+                extra = guard.strict_filter(remain)
+                strict = pd.concat([strict, extra], ignore_index=True).drop_duplicates("name")
+            chosen = choose_boltz_batch(strict, args.boltz_budget, rng)
         else:
-            # Bootstrap: broad chemically diverse/random sample.
-            if len(filtered) > args.boltz_budget:
-                chosen = filtered.sample(
-                    n=args.boltz_budget,
-                    random_state=args.seed + round_no,
-                ).reset_index(drop=True)
+            sample_n=min(len(filtered), max(args.boltz_budget * 5, 500))
+            pre=filtered.sample(n=sample_n, random_state=args.seed+round_no).reset_index(drop=True)
+            strict=guard.strict_filter(pre)
+            if len(strict)>args.boltz_budget:
+                chosen=strict.sample(n=args.boltz_budget, random_state=args.seed+1000+round_no).reset_index(drop=True)
             else:
-                chosen = filtered.copy()
-            chosen["source"] = "bootstrap"
+                chosen=strict.copy()
+            chosen["source"]="bootstrap"
 
         if chosen.empty:
             await asyncio.sleep(args.sleep)
