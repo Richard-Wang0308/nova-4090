@@ -1,0 +1,1 @@
+rm -rf boltz/boltz_tmp_files
