@@ -17,7 +17,7 @@ from utils.molecules import molecule_unique_for_protein_hf
 from utils import get_historical_submissions
 
 # TODO: Set your target protein here
-TARGET_PROTEIN = "Q9UQM7"  # Replace with actual target protein
+TARGET_PROTEIN = "P40261"  # Replace with actual target protein
 
 # TODO: Keep this in sync with validator config['max_similarity_to_historical']
 MAX_SIMILARITY_TO_HISTORICAL = 0.9

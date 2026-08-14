@@ -29,6 +29,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NUM_REACTIONS = 5
+INVALID_SCORE = -999.99
+COMPOUND_API_BASE = "https://compound-api.metanova-labs.ai"
 ScoreStats = Dict[str, List[float]]
 
 
@@ -46,16 +48,29 @@ def resolve_path(path: str) -> str:
 
 def fetch_leaderboard_data(epoch: int) -> Optional[dict]:
     url = (
-        "https://compound-api-staging.metanova-labs.ai"
-        f"/api/competitions/leaderboard/{epoch}/molecules"
+        f"{COMPOUND_API_BASE}/api/competitions/leaderboard/{epoch}/molecules"
     )
+    params = {"molecule_detail": "summary"}
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if not payload.get("success"):
+            logger.warning(f"API returned success=false for epoch {epoch}")
+            return None
+        return payload
     except requests.exceptions.RequestException as e:
         logger.debug(f"Error fetching epoch {epoch}: {e}")
         return None
+
+
+def _is_valid_score(score: Optional[float]) -> bool:
+    if score is None:
+        return False
+    try:
+        return float(score) != INVALID_SCORE
+    except (TypeError, ValueError):
+        return False
 
 
 def extract_training_samples(data: dict) -> List[dict]:
@@ -66,18 +81,22 @@ def extract_training_samples(data: dict) -> List[dict]:
         return samples
 
     for entry in leaderboard:
-        final_score = entry.get("final_score")
+        if not _is_valid_score(entry.get("final_score")):
+            continue
+
         molecules = entry.get("molecules", [])
         if not molecules:
             continue
+
         for mol_entry in molecules:
             mol_name = mol_entry.get("name", "")
-            if not mol_name:
+            mol_score = mol_entry.get("final_score")
+            if not mol_name or not _is_valid_score(mol_score):
                 continue
             samples.append(
                 {
                     "molecule_name": mol_name,
-                    "final_score": final_score,
+                    "final_score": float(mol_score),
                 }
             )
     return samples

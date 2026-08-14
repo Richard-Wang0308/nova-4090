@@ -45,4 +45,11 @@ uv pip install cuequivariance-torch cuequivariance-ops-cu12 cuequivariance-ops-t
 pip uninstall scalecodec cyscale -y
 pip install -U cyscale --force-reinstall
 
+pip uninstall -y torch torchvision torchaudio nvidia-nccl-cu12
+pip cache purge
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+
+pip uninstall -y nvidia-nccl-cu13
+pip install --no-cache-dir nvidia-nccl-cu13==2.31.2
+
 echo "Installation complete."

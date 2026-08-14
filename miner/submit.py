@@ -7,14 +7,14 @@ Workflow:
 1. On startup, immediately determine current epoch's allowed reaction and submit.
 2. Monitor blockchain for epoch boundaries.
 3. As soon as the epoch counter changes, determine that epoch's allowed reaction,
-    verify availability (HF unique + historical diversity) for only the top
-    candidate pool (not the whole DB),
-    PREPARE all payloads, fire ALL chain commits in parallel (this is the
-    time-critical race against other miners), then BATCH-UPLOAD all
-    successfully-committed files to GitHub in a SINGLE commit (via the Git
-    Data API: blobs -> tree -> commit -> one ref update) — this avoids the
-    read-modify-write race that the per-file Contents API had when multiple
-    wallets uploaded concurrently. Then mark submitted molecules unavailable.
+    build a diverse set of num_molecules (default 20) per wallet from the top
+    candidate pool — each set must pass HF uniqueness, historical diversity,
+    no InChIKey duplicates within the set, and MACCS entropy >= min_entropy
+    (same checks the validator applies).
+    PREPARE all payloads (comma-separated molecule names, timelock-encrypted),
+    fire ALL chain commits in parallel, then BATCH-UPLOAD all successfully-
+    committed files to GitHub in a SINGLE commit. Mark submitted molecules
+    unavailable.
 4. Repeat.
 """
 
@@ -48,8 +48,6 @@ sys.path.append(BASE_DIR)
 # Add as many wallets/hotkeys as needed.
 # ============================================================================
 WALLET_HOTKEY_PAIRS: List[Tuple[str, str]] = [
-    ("nova",   "notc"),
-    ("nova",   "notb"),
     ("nova",   "nota")
     # ("nova",   "notd")
     # ("alpha",  "hotkey1"),
@@ -67,11 +65,12 @@ POLL_INTERVAL = 6            # Seconds between block polls
 
 # Only re-check HuggingFace uniqueness + historical diversity for this many
 # top-scoring candidates (instead of scanning the entire available=TRUE set).
-AVAILABILITY_CANDIDATE_POOL = 500
+# Keep large enough for num_molecules × wallet count greedy selection.
+AVAILABILITY_CANDIDATE_POOL = 1000
 
 # Keep in sync with tools/check.py and validator
 # config['max_similarity_to_historical'] when that exists.
-MAX_SIMILARITY_TO_HISTORICAL = 0.6
+MAX_SIMILARITY_TO_HISTORICAL = 0.9
 
 # Retries for the GitHub batch-commit flow (re-fetches branch head + retries
 # the whole blob->tree->commit->ref-update sequence on conflict).
@@ -88,7 +87,10 @@ from utils import (
     get_historical_submissions,
 )
 from combinatorial_db.reactions import get_smiles_from_reaction
-from utils.molecules import molecule_unique_for_protein_hf
+from utils.molecules import (
+    compute_maccs_entropy,
+    molecule_unique_for_protein_hf,
+)
 from btdr import QuicknetBittensorDrandTimelock
 
 
@@ -110,6 +112,12 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ============================================================================
 # CHALLENGE PARAM COMPAT
 # ============================================================================
+
+def _cfg_val(config: Any, key: str, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
 
 def resolve_challenge_params(config: argparse.Namespace, block_hash: str) -> Optional[Dict[str, Any]]:
     """
@@ -247,8 +255,10 @@ def setup_logging(config: argparse.Namespace) -> None:
     bt.logging.info(f"📊 Epoch length: {EPOCH_LENGTH} blocks")
     bt.logging.info(
         f"⚡ Parallel CHAIN COMMIT (per-wallet connections) | GitHub upload "
-        f"batched into ONE commit after chain commit | availability: "
-        f"HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL} on top "
+        f"batched into ONE commit after chain commit | "
+        f"{_cfg_val(config, 'num_molecules', 20)} molecules/wallet | "
+        f"HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL} + "
+        f"MACCS entropy≥{_cfg_val(config, 'min_entropy', 0.1)} on top "
         f"{AVAILABILITY_CANDIDATE_POOL} candidates"
     )
     bt.logging.info("="*70 + "\n")
@@ -618,21 +628,124 @@ def check_molecule_available(
         return False, "error"
 
 
-async def get_verified_top_n_molecules(
-    n: int,
+def _smiles_inchikey(smiles: str) -> Optional[str]:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return Chem.MolToInchiKey(mol)
+
+
+def _set_meets_entropy(smiles_list: List[str], min_entropy: float) -> bool:
+    if len(smiles_list) < 2:
+        return True
+    try:
+        return compute_maccs_entropy(smiles_list) >= min_entropy
+    except Exception:
+        return False
+
+
+
+def select_diverse_molecule_set(
+    candidates: List[Tuple[str, float, str]],
+    num_molecules: int,
+    min_entropy: float,
+    target_protein: str,
+    historical_df,
+    morgan_gen,
+    max_similarity: float,
+) -> Tuple[List[Tuple[str, float]], Dict[str, int], List[Tuple[str, str]]]:
+    """
+    Greedily build a set of num_molecules from score-sorted candidates.
+
+    Each pick must pass HF uniqueness + historical diversity, must not be
+    chemically identical to an already-selected molecule, and the growing
+    SMILES set must keep MACCS entropy >= min_entropy once it has 2+ members
+    (mirrors validator-side checks).
+
+    Returns:
+        (selected, stats, failed_availability) where failed_availability is
+        a list of (molecule_name, reason) for HF/historical/smiles failures
+        that should be marked unavailable in the DB.
+    """
+    selected: List[Tuple[str, float]] = []
+    selected_smiles: List[str] = []
+    selected_inchikeys: set = set()
+    failed_availability: List[Tuple[str, str]] = []
+    stats = {
+        "checked": 0,
+        "rejected_hf": 0,
+        "rejected_similar": 0,
+        "rejected_dup": 0,
+        "rejected_entropy": 0,
+        "rejected_bad_smiles": 0,
+    }
+
+    for molecule_name, score, smiles in candidates:
+        if len(selected) >= num_molecules:
+            break
+
+        stats["checked"] += 1
+
+        inchikey = _smiles_inchikey(smiles)
+        if inchikey is None:
+            stats["rejected_bad_smiles"] += 1
+            continue
+        if inchikey in selected_inchikeys:
+            stats["rejected_dup"] += 1
+            continue
+
+        is_available, reason = check_molecule_available(
+            target_protein=target_protein,
+            molecule_name=molecule_name,
+            smiles=smiles,
+            historical_df=historical_df,
+            morgan_gen=morgan_gen,
+            max_similarity=max_similarity,
+        )
+
+        if not is_available:
+            if reason in ("hf_duplicate", "too_similar", "bad_smiles", "no_target", "error"):
+                failed_availability.append((molecule_name, reason))
+            if reason == "hf_duplicate":
+                stats["rejected_hf"] += 1
+            elif reason == "too_similar":
+                stats["rejected_similar"] += 1
+            else:
+                stats["rejected_bad_smiles"] += 1
+            continue
+
+        trial_smiles = selected_smiles + [smiles]
+        if len(trial_smiles) >= 2 and not _set_meets_entropy(trial_smiles, min_entropy):
+            stats["rejected_entropy"] += 1
+            continue
+
+        selected.append((molecule_name, score))
+        selected_smiles.append(smiles)
+        selected_inchikeys.add(inchikey)
+
+    return selected, stats, failed_availability
+
+
+async def get_verified_molecule_sets(
+    n_wallets: int,
+    molecules_per_wallet: int,
+    min_entropy: float,
     db_path: str,
     target_protein: str,
     candidate_pool: int = AVAILABILITY_CANDIDATE_POOL,
-) -> List[Tuple[str, float]]:
+    max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
+) -> List[List[Tuple[str, float]]]:
     """
-    Fast path for epoch submission:
-    1. Load only the top `candidate_pool` molecules by score that are still
-        marked available (available = TRUE).
-    2. Re-check HF uniqueness AND historical diversity for those candidates.
-    3. Stop as soon as `n` verified-available molecules are found.
+    Build one diverse molecule set per wallet for epoch submission.
+
+    1. Load top `candidate_pool` available molecules by score.
+    2. For each wallet, greedily select `molecules_per_wallet` molecules that
+       pass HF/historical checks, have no InChIKey duplicates within the set,
+       and maintain MACCS entropy >= min_entropy.
+    3. Molecules assigned to an earlier wallet are excluded from later wallets.
     4. Persist updated available flags for every candidate checked.
     """
-    if n <= 0:
+    if n_wallets <= 0 or molecules_per_wallet <= 0:
         return []
 
     if not os.path.exists(db_path):
@@ -655,7 +768,7 @@ async def get_verified_top_n_molecules(
             """,
             (candidate_pool,),
         )
-        candidates = cursor.fetchall()
+        rows = cursor.fetchall()
         conn.close()
     except sqlite3.Error as e:
         bt.logging.error(
@@ -663,17 +776,17 @@ async def get_verified_top_n_molecules(
         )
         return []
 
-    if not candidates:
+    if not rows:
         bt.logging.warning("   ⚠️  No candidate molecules found in database")
         return []
 
     bt.logging.info(
-        f"   🔍 Checking availability (unique + similarity≤"
-        f"{MAX_SIMILARITY_TO_HISTORICAL}) for top {len(candidates)} "
-        f"candidates (need {n} available)"
+        f"   🔍 Building {n_wallets} set(s) of {molecules_per_wallet} molecules "
+        f"from top {len(rows)} candidates "
+        f"(HF unique + historical similarity≤{max_similarity}, "
+        f"MACCS entropy≥{min_entropy})"
     )
 
-    # Load historical fingerprints once for this pool check.
     historical_df = await asyncio.to_thread(
         load_historical_fingerprints, target_protein
     )
@@ -683,17 +796,9 @@ async def get_verified_top_n_molecules(
     )
     morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
-    verified: List[Tuple[str, float]] = []
-    checked = 0
-    marked_false = 0
-    rejected_hf = 0
-    rejected_similar = 0
-
-    for molecule_name, score in candidates:
-        if len(verified) >= n:
-            break
-
-        checked += 1
+    # Pre-resolve SMILES for all candidates once.
+    candidate_triples: List[Tuple[str, float, str]] = []
+    for molecule_name, score in rows:
         smiles = get_smiles_from_reaction(molecule_name)
         if smiles is None:
             bt.logging.warning(
@@ -701,56 +806,79 @@ async def get_verified_top_n_molecules(
                 f"→ available=FALSE"
             )
             _set_molecule_available(db_path, molecule_name, False)
-            marked_false += 1
             continue
+        candidate_triples.append((molecule_name, score, smiles))
 
-        # Offload sync HF + Tanimoto work so the event loop stays responsive.
-        is_available, reason = await asyncio.to_thread(
-            check_molecule_available,
+    wallet_sets: List[List[Tuple[str, float]]] = []
+    used_names: set = set()
+
+    for wallet_idx in range(n_wallets):
+        remaining = [
+            (name, score, smiles)
+            for name, score, smiles in candidate_triples
+            if name not in used_names
+        ]
+
+        selected, stats, failed_availability = await asyncio.to_thread(
+            select_diverse_molecule_set,
+            remaining,
+            molecules_per_wallet,
+            min_entropy,
             target_protein,
-            molecule_name,
-            smiles,
             historical_df,
             morgan_gen,
+            max_similarity,
         )
 
-        if is_available:
-            _set_molecule_available(db_path, molecule_name, True)
-            verified.append((molecule_name, score))
-            bt.logging.info(
-                f"      ✅ [{len(verified)}/{n}] {molecule_name:<30} "
-                f"| Score: {score:.6f}"
-            )
-        else:
-            _set_molecule_available(db_path, molecule_name, False)
-            marked_false += 1
+        for name, reason in failed_availability:
+            _set_molecule_available(db_path, name, False)
             if reason == "hf_duplicate":
-                rejected_hf += 1
                 detail = "already known (HF)"
             elif reason == "too_similar":
-                rejected_similar += 1
-                detail = (
-                    f"too similar to historical "
-                    f"(≥{MAX_SIMILARITY_TO_HISTORICAL})"
-                )
+                detail = f"too similar to historical (≥{max_similarity})"
             else:
                 detail = reason or "failed availability check"
             bt.logging.info(
-                f"      ❌ {molecule_name}: {detail} → available=FALSE"
+                f"      ❌ {name}: {detail} → available=FALSE"
             )
 
-    bt.logging.info(
-        f"   📊 Availability check done: checked={checked}, "
-        f"verified={len(verified)}, marked_false={marked_false} "
-        f"(HF dup={rejected_hf}, too similar={rejected_similar})"
-    )
+        if len(selected) < molecules_per_wallet:
+            bt.logging.warning(
+                f"   ⚠️  Wallet set {wallet_idx + 1}/{n_wallets}: only found "
+                f"{len(selected)}/{molecules_per_wallet} molecules "
+                f"(checked={stats['checked']}, HF dup={stats['rejected_hf']}, "
+                f"historical={stats['rejected_similar']}, "
+                f"dup InChIKey={stats['rejected_dup']}, "
+                f"entropy={stats['rejected_entropy']})"
+            )
+            break
 
-    if not verified:
+        final_smiles = [
+            get_smiles_from_reaction(name) for name, _score in selected
+        ]
+        entropy = compute_maccs_entropy(final_smiles)
+        molecule_names = [name for name, _score in selected]
+        used_names.update(molecule_names)
+
+        for name, score in selected:
+            _set_molecule_available(db_path, name, True)
+            bt.logging.info(
+                f"      ✅ wallet {wallet_idx + 1} | {name:<30} "
+                f"| Score: {score:.6f}"
+            )
+
+        bt.logging.info(
+            f"   📦 Wallet set {wallet_idx + 1}/{n_wallets}: "
+            f"{len(selected)} molecules, MACCS entropy={entropy:.4f}"
+        )
+        wallet_sets.append(selected)
+
+    if not wallet_sets:
         bt.logging.warning(
-            "   ⚠️  No available molecules found in the top candidate pool"
+            "   ⚠️  No valid molecule sets found in the top candidate pool"
         )
 
-    return verified
+    return wallet_sets
 
 
 # ============================================================================
@@ -941,7 +1069,7 @@ def upload_files_to_github_batch(
 async def prepare_submission(
     wallet: Any,
     miner_uid: int,
-    candidate_product: str,
+    candidate_products: List[str],
     state: Dict[str, Any],
     current_block: int,
 ) -> Optional[Dict[str, Any]]:
@@ -952,13 +1080,31 @@ async def prepare_submission(
     wallet_name = wallet.name if hasattr(wallet, 'name') else 'unknown'
     hotkey_name = wallet.hotkey_str if hasattr(wallet, 'hotkey_str') else 'unknown'
     label = f"{wallet_name}/{hotkey_name}"
+    num_molecules = _cfg_val(state['config'], 'num_molecules', 1)
 
-    if not candidate_product:
-        bt.logging.warning(f"      ⚠️  UID {miner_uid}: No candidate product")
+    if not candidate_products:
+        bt.logging.warning(f"      ⚠️  UID {miner_uid}: No candidate products")
+        return None
+
+    if len(candidate_products) != num_molecules:
+        bt.logging.warning(
+            f"      ⚠️  UID {miner_uid}: expected {num_molecules} molecules, "
+            f"got {len(candidate_products)}"
+        )
+        return None
+
+    if len(set(candidate_products)) != len(candidate_products):
+        bt.logging.warning(
+            f"      ⚠️  UID {miner_uid}: submission contains duplicate molecules"
+        )
         return None
 
     try:
-        message = f"{candidate_product}|~"
+        # Decrypted payload format (validator + read_local_input_file):
+        #   mol_name1,mol_name2,...|protein_seq1,protein_seq2,...
+        # Small-molecule-only submissions use "~" as the sequences placeholder
+        # (same convention as the original single-molecule "|~" format).
+        message = f"{','.join(candidate_products)}|~"
 
         # Offload in case encrypt() is CPU-bound (timelock crypto usually is)
         encrypted_response = await asyncio.to_thread(
@@ -971,14 +1117,14 @@ async def prepare_submission(
         commit_content = f"{state['github_path']}/{filename}.txt"
 
         bt.logging.info(
-            f"      🧪 Prepared {label} → {candidate_product} "
+            f"      🧪 Prepared {label} → {len(candidate_products)} molecules "
             f"(commit path: {commit_content})"
         )
 
         return {
             "wallet": wallet,
             "miner_uid": miner_uid,
-            "molecule_name": candidate_product,
+            "molecule_names": candidate_products,
             "commit_content": commit_content,
             "encoded_content": encoded_content,
             "filename": filename,
@@ -1118,29 +1264,40 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         )
         return
 
+    num_molecules = _cfg_val(cfg, "num_molecules", 1)
+    min_entropy = _cfg_val(cfg, "min_entropy", 0.1)
+    max_similarity = _cfg_val(
+        cfg, "max_similarity_to_historical", MAX_SIMILARITY_TO_HISTORICAL
+    )
+
     # ==========================================================
-    # STEP 2: Availability = HF unique AND historical diversity
+    # STEP 2: Build diverse molecule sets (HF + historical + MACCS entropy)
     # ==========================================================
     bt.logging.info(
-        "🔹 STEP 2/3: Availability Check "
-        f"(HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL})"
+        "🔹 STEP 2/3: Molecule Selection "
+        f"({num_molecules} per wallet, HF unique, "
+        f"historical similarity<{max_similarity}, MACCS entropy≥{min_entropy})"
     )
     bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
     bt.logging.info(
         f"   ⚡ Candidate pool size: {AVAILABILITY_CANDIDATE_POOL} "
-        f"(need {num_pairs} available)"
+        f"(need {num_pairs} wallet set(s) × {num_molecules} molecules)"
     )
 
-    top_molecules = await get_verified_top_n_molecules(
-        n=num_pairs,
+    molecule_sets = await get_verified_molecule_sets(
+        n_wallets=num_pairs,
+        molecules_per_wallet=num_molecules,
+        min_entropy=min_entropy,
         db_path=reaction_db_path,
         target_protein=target_protein,
         candidate_pool=AVAILABILITY_CANDIDATE_POOL,
+        max_similarity=max_similarity,
     )
 
-    if not top_molecules:
+    if len(molecule_sets) < num_pairs:
         bt.logging.warning(
-            f"   ⚠️  No available molecules found for {allowed_reaction}. "
+            f"   ⚠️  Only built {len(molecule_sets)}/{num_pairs} complete "
+            f"molecule set(s) for {allowed_reaction}. "
             "Skipping submission for this epoch.\n"
         )
         return
@@ -1151,40 +1308,42 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
     # STEP 3a: PREPARE all payloads in parallel (no chain/GitHub calls)
     # ==========================================================
     bt.logging.info("🔹 STEP 3/3: Prepare → Parallel Commit → Batched Upload")
-    bt.logging.info(f"   🧪 Preparing {len(top_molecules)} payload(s)...")
+    bt.logging.info(
+        f"   🧪 Preparing {len(molecule_sets)} payload(s) "
+        f"({num_molecules} molecules each)..."
+    )
 
     # Re-fetch block right before preparing, so the encrypted payload uses
     # the freshest block available before we race to commit.
     current_block = await state["subtensor"].get_current_block()
 
-    prep_pairs: List[Tuple[Any, int, str, float]] = []
-    for idx, (molecule_name, score) in enumerate(top_molecules):
+    prep_pairs: List[Tuple[Any, int, List[str], List[float]]] = []
+    for idx, molecule_set in enumerate(molecule_sets):
         if idx >= len(state['wallets']):
-            bt.logging.warning(
-                f"   ⚠️  More molecules ({len(top_molecules)}) than "
-                f"wallet/hotkey pairs ({num_pairs}). Skipping: {molecule_name}"
-            )
             break
         wallet = state['wallets'][idx]
         miner_uid = state['miner_uids'][idx]
-        prep_pairs.append((wallet, miner_uid, molecule_name, score))
+        molecule_names = [name for name, _score in molecule_set]
+        molecule_scores = [score for _name, score in molecule_set]
+        prep_pairs.append((wallet, miner_uid, molecule_names, molecule_scores))
 
     prep_tasks = [
-        prepare_submission(wallet, miner_uid, molecule_name, state, current_block)
-        for (wallet, miner_uid, molecule_name, _score) in prep_pairs
+        prepare_submission(wallet, miner_uid, molecule_names, state, current_block)
+        for (wallet, miner_uid, molecule_names, _scores) in prep_pairs
     ]
     prep_results = await asyncio.gather(*prep_tasks, return_exceptions=True)
 
     payloads: List[Dict[str, Any]] = []
-    scores: List[float] = []
-    for (wallet, miner_uid, molecule_name, score), result in zip(prep_pairs, prep_results):
+    set_scores: List[List[float]] = []
+    for (wallet, miner_uid, molecule_names, scores), result in zip(prep_pairs, prep_results):
         if isinstance(result, Exception) or result is None:
             bt.logging.error(
-                f"   ❌ Skipping {molecule_name} (UID {miner_uid}): prepare failed"
+                f"   ❌ Skipping UID {miner_uid} ({len(molecule_names)} molecules): "
+                f"prepare failed"
             )
             continue
         payloads.append(result)
-        scores.append(score)
+        set_scores.append(scores)
 
     if not payloads:
         bt.logging.warning("   ⚠️  No payloads prepared successfully. Skipping epoch.\n")
@@ -1214,7 +1373,7 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         if isinstance(outcome, Exception):
             bt.logging.error(
                 f"   ❌ Commit exception for {payloads[idx]['label']} "
-                f"({payloads[idx]['molecule_name']}): {outcome}"
+                f"({len(payloads[idx]['molecule_names'])} molecules): {outcome}"
             )
             commit_ok.append(False)
         else:
@@ -1245,7 +1404,7 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         ]
         commit_message = (
             f"Epoch {current_epoch} submissions "
-            f"({len(files_for_batch)} molecule(s))"
+            f"({len(files_for_batch)} wallet file(s))"
         )
         batch_upload_ok = await asyncio.to_thread(
             upload_files_to_github_batch, files_for_batch, commit_message
@@ -1271,9 +1430,10 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
     # upload needs to be retried out-of-band, the molecule name is now
     # "spent" on-chain.
     submitted_ok = [
-        payloads[idx]["molecule_name"]
+        name
         for idx in range(len(payloads))
         if commit_ok[idx]
+        for name in payloads[idx]["molecule_names"]
     ]
     mark_molecules_unavailable(reaction_db_path, submitted_ok)
 
@@ -1305,12 +1465,17 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         status = "✅" if results[idx] else ("⛓️❌" if not commit_ok[idx] else "📤❌")
         label = payload["label"]
         miner_uid = payload["miner_uid"]
-        molecule_name = payload["molecule_name"]
-        score = scores[idx]
+        molecule_names = payload["molecule_names"]
+        scores = set_scores[idx]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
         bt.logging.info(
             f"   {idx+1:>2}. {status} UID {miner_uid:>3} ({label:<22}) | "
-            f"{molecule_name:<30} | Score: {score:.6f}"
+            f"{len(molecule_names)} molecules | avg score: {avg_score:.6f}"
         )
+        for mol_idx, (name, score) in enumerate(zip(molecule_names, scores), 1):
+            bt.logging.info(
+                f"        {mol_idx:>2}. {name:<30} | Score: {score:.6f}"
+            )
     bt.logging.info("")
 
 
