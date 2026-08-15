@@ -308,6 +308,9 @@ class ScoreStore:
         )
         cols = {r[1] for r in cur.execute("PRAGMA table_info(scored_molecules)").fetchall()}
         additions = {
+            # miner/miner.py writes `iteration` and never `round`; keep both so the
+            # two writers stay interoperable on a shared DB
+            "iteration": "INTEGER",
             "target_key": "TEXT",
             "target_label": "TEXT",
             "rxn_id": "INTEGER",
@@ -319,6 +322,7 @@ class ScoreStore:
         for name, sqltype in additions.items():
             if name not in cols:
                 cur.execute(f"ALTER TABLE scored_molecules ADD COLUMN {name} {sqltype}")
+                cols.add(name)
 
         cur.execute(
             """
@@ -329,10 +333,11 @@ class ScoreStore:
             """
         )
         conn.commit()
+        return cols
 
     def _init(self):
         with self._connect() as conn:
-            self._ensure_columns(conn)
+            cols = self._ensure_columns(conn)
 
             row = conn.execute(
                 "SELECT value FROM metadata WHERE key='active_target_key'"
@@ -350,13 +355,16 @@ class ScoreStore:
                     (self.target_label,),
                 )
                 if count:
+                    # legacy DBs may predate either `iteration` or `round`
+                    round_clause = (
+                        ", round=COALESCE(round,iteration)" if "iteration" in cols else ""
+                    )
                     conn.execute(
-                        """
+                        f"""
                         UPDATE scored_molecules
                         SET target_key=COALESCE(target_key,?),
                             target_label=COALESCE(target_label,?),
-                            rxn_id=COALESCE(rxn_id,?),
-                            round=COALESCE(round,iteration)
+                            rxn_id=COALESCE(rxn_id,?){round_clause}
                         """,
                         (self.target_key, self.target_label, self.rxn_id),
                     )
