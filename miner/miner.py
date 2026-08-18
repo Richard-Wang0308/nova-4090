@@ -55,6 +55,10 @@ DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 
 RXN_ID: Optional[int] = None
 SCORE_RESULTS_DB: Optional[str] = None
+# Target identity for the shared score DB, stamped from config in main().
+# Kept in orchestrator.py's format so both writers agree on target_key.
+TARGET_KEY: Optional[str] = None
+TARGET_LABEL: Optional[str] = None
 LOG_PATH = os.path.join(BASE_DIR, "log.txt")
 GRAPH_AVG_PATH = os.path.join(BASE_DIR, "pool_avg_score.png")
 GRAPH_MAX_PATH = os.path.join(BASE_DIR, "pool_max_score.png")
@@ -74,6 +78,7 @@ _morgan_bv_cache: Dict[str, Any] = {}
 
 from config.config_loader import load_config
 from molecules import MoleculeManager, MoleculeUtils
+import score_store
 from tools import (
     IterationParams,
     SynthonLibrary,
@@ -417,33 +422,19 @@ class SurrogateModel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Score DB (with iteration column)
+# Score DB — delegated to score_store so the schema, upsert semantics and
+# target guard stay identical to orchestrator.py's ScoreStore.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def init_score_results_db(db_path: str = None) -> None:
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scored_molecules (
-            molecule_name TEXT PRIMARY KEY,
-            score         REAL NOT NULL,
-            scored_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            available     BOOLEAN DEFAULT TRUE,
-            iteration     INTEGER
-        )
-        """
+    score_store.init_score_results_db(
+        db_path,
+        rxn_id=RXN_ID,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
     )
-    # migrate older DBs that lack iteration
-    cur.execute("PRAGMA table_info(scored_molecules)")
-    cols = {row[1] for row in cur.fetchall()}
-    if "iteration" not in cols:
-        cur.execute("ALTER TABLE scored_molecules ADD COLUMN iteration INTEGER")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)")
-    conn.commit()
-    conn.close()
     logger.info(f"✅ Score DB ready: {db_path}")
 
 
@@ -456,40 +447,22 @@ def write_scores_to_db(
         db_path = SCORE_RESULTS_DB
     if not molecules:
         return
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        rows = []
-        skipped = 0
-        for m in molecules:
-            name = m.get("name")
-            score = m.get("boltz_score", m.get("score"))
-            if not name or score is None:
-                continue
-            try:
-                score_f = float(score)
-            except (TypeError, ValueError):
-                skipped += 1
-                continue
-            if not np.isfinite(score_f):
-                skipped += 1
-                continue
-            rows.append((name, score_f, True, int(iteration)))
-        if rows:
-            cur.executemany(
-                "INSERT OR REPLACE INTO scored_molecules "
-                "(molecule_name, score, available, iteration) VALUES (?, ?, ?, ?)",
-                rows,
-            )
-            conn.commit()
-            logger.info(
-                f"✅ Wrote {len(rows)} scores (iter={iteration}) → {db_path}"
-            )
-        if skipped:
-            logger.warning(f"⚠️ Skipped {skipped} non-finite scores")
-        conn.close()
-    except Exception as e:
-        logger.error(f"❌ Error writing scores: {e}")
+    # `iteration` lands in both the iteration and round columns, matching how
+    # orchestrator stamps round_no, so COALESCE(round,iteration) always resolves.
+    n = score_store.write_scores_to_db(
+        db_path,
+        molecules,
+        rxn_id=RXN_ID,
+        round_no=iteration,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+        source="dpex_dja",
+    )
+    if n:
+        logger.info(f"✅ Wrote {n} scores (iter={iteration}) → {db_path}")
+    skipped = len(molecules) - n
+    if skipped > 0:
+        logger.warning(f"⚠️ Skipped {skipped} unusable/non-finite scores")
 
 
 def batch_get_scores_from_db(
@@ -498,39 +471,13 @@ def batch_get_scores_from_db(
 ) -> Dict[str, float]:
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-    if not molecule_names:
-        return {}
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        placeholders = ",".join("?" * len(molecule_names))
-        cur.execute(
-            f"SELECT molecule_name, score FROM scored_molecules "
-            f"WHERE molecule_name IN ({placeholders})",
-            molecule_names,
-        )
-        results = {name: float(score) for name, score in cur.fetchall()}
-        conn.close()
-        return results
-    except Exception as e:
-        logger.debug(f"batch_get_scores_from_db: {e}")
-        return {}
+    return score_store.batch_get_scores_from_db(db_path, molecule_names)
 
 
 def count_scored_in_db(db_path: str = None) -> int:
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-    if not db_path or not os.path.exists(db_path):
-        return 0
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM scored_molecules")
-        n = int(cur.fetchone()[0])
-        conn.close()
-        return n
-    except Exception:
-        return 0
+    return score_store.count_scored(db_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1346,6 +1293,8 @@ async def find_solution(state: Dict[str, Any]) -> None:
 
 
 async def main():
+    global TARGET_KEY, TARGET_LABEL
+
     parse_args()
     try:
         config = load_config()
@@ -1353,6 +1302,11 @@ async def main():
     except Exception as e:
         logger.error(f"❌ Failed to load config: {e}")
         return
+
+    # Resolve target identity before touching the DB so every row we write is
+    # tagged the same way orchestrator.py tags its own.
+    TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
+    logger.info(f"✅ target={TARGET_LABEL} | target_key={TARGET_KEY[:12]}")
 
     initialize_solution(config)
     init_score_results_db()

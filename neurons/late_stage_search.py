@@ -72,6 +72,12 @@ from utils import (
 )
 from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from molecules import MoleculeManager, MoleculeUtils
+import score_store
+
+# Target identity for the shared score DB (orchestrator.py's format), resolved
+# from config in main()/run_rxn_round().
+TARGET_KEY: Optional[str] = None
+TARGET_LABEL: Optional[str] = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,48 +160,26 @@ def rxn_csv_path(rxn_id: int) -> str:
     return os.path.join(DATA_DIR, f"rxn{rxn_id}.csv")
 
 
-def init_score_results_db(db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scored_molecules (
-            molecule_name TEXT PRIMARY KEY,
-            score         REAL NOT NULL,
-            scored_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            available     BOOLEAN DEFAULT TRUE
-        )
-        """
+def init_score_results_db(db_path: str, rxn_id: Optional[int] = None) -> None:
+    """Canonical orchestrator schema + target guard (see score_store)."""
+    score_store.init_score_results_db(
+        db_path,
+        rxn_id=rxn_id,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
     )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)")
-    conn.commit()
-    conn.close()
 
 
 def load_all_scored(db_path: str, rxn_id: int) -> pd.DataFrame:
-    if not os.path.exists(db_path):
-        return pd.DataFrame(columns=["name", "score"])
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute(
-        "SELECT molecule_name, score FROM scored_molecules WHERE molecule_name LIKE ?",
-        (f"rxn:{rxn_id}:%",),
-    ).fetchall()
-    conn.close()
-    df = pd.DataFrame(rows, columns=["name", "score"])
-    df["score"] = pd.to_numeric(df["score"], errors="coerce")
-    return df[np.isfinite(df["score"])].reset_index(drop=True)
+    """
+    Orchestrator's dataframe shape: [name, smiles, inchikey, score, source,
+    round]. Callers may reuse the stored SMILES instead of rebuilding it.
+    """
+    return score_store.load_all_scored(db_path, rxn_id)
 
 
 def load_scored_name_set(db_path: str, rxn_id: int) -> Set[str]:
-    names: Set[str] = set()
-    if os.path.exists(db_path):
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT molecule_name FROM scored_molecules WHERE molecule_name LIKE ?",
-            (f"rxn:{rxn_id}:%",),
-        ).fetchall()
-        conn.close()
-        names |= {r[0] for r in rows}
+    names: Set[str] = score_store.load_scored_name_set(db_path, rxn_id)
     csv_path = rxn_csv_path(rxn_id)
     if os.path.exists(csv_path):
         try:
@@ -213,32 +197,22 @@ def load_scored_name_set(db_path: str, rxn_id: int) -> Set[str]:
     return names
 
 
-def write_scores_to_db(db_path: str, records: List[Dict[str, Any]]) -> int:
-    if not records:
-        return 0
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    rows = []
-    for r in records:
-        name, score = r.get("name"), r.get("boltz_score")
-        if not name or score is None:
-            continue
-        try:
-            score_f = float(score)
-        except (TypeError, ValueError):
-            continue
-        if not np.isfinite(score_f):
-            continue
-        rows.append((name, score_f, True))
-    if rows:
-        cur.executemany(
-            "INSERT OR REPLACE INTO scored_molecules "
-            "(molecule_name, score, available) VALUES (?, ?, ?)",
-            rows,
-        )
-        conn.commit()
-    conn.close()
-    return len(rows)
+def write_scores_to_db(
+    db_path: str,
+    records: List[Dict[str, Any]],
+    rxn_id: Optional[int] = None,
+    round_no: int = 0,
+) -> int:
+    """Upsert with orchestrator's full column set (smiles/inchikey included)."""
+    return score_store.write_scores_to_db(
+        db_path,
+        records,
+        rxn_id=rxn_id,
+        round_no=round_no,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+        source="late_stage",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -814,7 +788,8 @@ class NoveltySurrogate:
         frames = []
         db_df = load_all_scored(db_path, rxn_id)
         if not db_df.empty:
-            frames.append(db_df.rename(columns={"name": "name", "score": "score"}))
+            # DB rows already carry SMILES under the canonical schema.
+            frames.append(db_df[["name", "smiles", "score"]])
 
         csv_path = rxn_csv_path(rxn_id)
         if os.path.exists(csv_path):
@@ -825,6 +800,7 @@ class NoveltySurrogate:
                     tmp = pd.DataFrame(
                         {
                             "name": csv_df["molecule_name"].astype(str),
+                            "smiles": None,
                             "score": pd.to_numeric(
                                 csv_df["final_score"], errors="coerce"
                             ),
@@ -847,8 +823,11 @@ class NoveltySurrogate:
         train_df = pd.concat([top, bottom]).drop_duplicates(subset="name")
 
         X, y = [], []
-        for name, score in zip(train_df["name"], train_df["score"]):
-            smiles = resolve_smiles(str(name))
+        for name, stored_smiles, score in zip(
+            train_df["name"], train_df["smiles"], train_df["score"]
+        ):
+            smiles = stored_smiles if isinstance(stored_smiles, str) and stored_smiles \
+                else resolve_smiles(str(name))
             if not smiles:
                 continue
             fp = get_morgan_fp_array(smiles)
@@ -951,8 +930,11 @@ def export_second_shelf_inventory(
     band = band.sort_values("score", ascending=False).reset_index(drop=True)
 
     rows = []
-    for name, score in zip(band["name"], band["score"]):
-        smiles = resolve_smiles(str(name))
+    for name, stored_smiles, score in zip(
+        band["name"], band["smiles"], band["score"]
+    ):
+        smiles = stored_smiles if isinstance(stored_smiles, str) and stored_smiles \
+            else resolve_smiles(str(name))
         if not smiles:
             continue
         max_sim = max_historical_similarity(smiles, historical_df)
@@ -1136,10 +1118,15 @@ async def run_rxn_round(
     historical_df: Optional[pd.DataFrame],
     args: argparse.Namespace,
     coverage: Optional[Dict[str, Any]] = None,
+    round_no: int = 0,
 ) -> int:
+    global TARGET_KEY, TARGET_LABEL
+    if TARGET_KEY is None:
+        TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
+
     target = config["small_molecule_target"][0]
     db_path = score_db_path(rxn_id)
-    init_score_results_db(db_path)
+    init_score_results_db(db_path, rxn_id=rxn_id)
 
     if coverage is None:
         coverage = measure_rxn_coverage(rxn_id, config)
@@ -1259,7 +1246,7 @@ async def run_rxn_round(
         )
         ok = [m for m in scored if m.get("boltz_score") is not None]
         failed = [m for m in scored if m.get("boltz_score") is None]
-        n = write_scores_to_db(db_path, ok)
+        n = write_scores_to_db(db_path, ok, rxn_id=rxn_id, round_no=round_no)
         written += n
 
         ok_sorted = sorted(
@@ -1358,6 +1345,8 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main() -> None:
+    global TARGET_KEY, TARGET_LABEL
+
     args = parse_args()
     if not (0.0 <= args.mutation_ratio <= 1.0):
         raise SystemExit("--mutation_ratio must be in [0,1]")
@@ -1367,6 +1356,9 @@ async def main() -> None:
     config = load_config()
     target = config["small_molecule_target"][0]
     rxn_id = args.rxn_id
+
+    # Tag rows with the same target identity orchestrator.py uses.
+    TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
 
     logger.info("=" * 70)
     logger.info("LATE-STAGE SEARCH")
@@ -1434,6 +1426,7 @@ async def main() -> None:
                 historical_df=historical_df,
                 args=args,
                 coverage=coverage,
+                round_no=round_no,
             )
 
     except KeyboardInterrupt:

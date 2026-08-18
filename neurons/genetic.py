@@ -56,8 +56,15 @@ from utils import (
 from molecules_base import generate_inchikey
 from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 
+import score_store
+
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
+
+# Target identity for the shared score DB (orchestrator.py's format), resolved
+# from config in main().
+TARGET_KEY: Optional[str] = None
+TARGET_LABEL: Optional[str] = None
 
 # ── Surrogate pipeline constants ──────────────────────────────────────────
 # Mirrors miner.py's DPEX-DJA surrogate design:
@@ -1150,59 +1157,37 @@ class GeneticAlgorithmOperator:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def init_score_results_db(db_path: str = None) -> None:
-    """Initialize/create the score_results.sqlite database."""
+    """Canonical orchestrator schema + target guard (see score_store)."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
 
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS scored_molecules (
-                molecule_name TEXT PRIMARY KEY,
-                score REAL NOT NULL,
-                scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                available BOOLEAN DEFAULT TRUE
-            )
-        """)
-
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)
-        """)
-
-        conn.commit()
-        conn.close()
-        print(f"Initialized score_results database at {db_path}")
-    except Exception as e:
-        print(f"Error initializing score_results database: {e}")
+    score_store.init_score_results_db(
+        db_path,
+        rxn_id=RXN_ID,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+    )
+    print(f"Initialized score_results database at {db_path}")
 
 
 def get_score_from_db(molecule_name: str, db_path: str = None) -> Optional[float]:
     """Get score for a molecule from the database."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
-
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT score FROM scored_molecules WHERE molecule_name = ?", (molecule_name,))
-        result = cursor.fetchone()
-        conn.close()
-
-        if result:
-            return float(result[0])
-        return None
-    except Exception as e:
-        logger.debug(f"Error getting score from DB for {molecule_name}: {e}")
-        return None
+    return score_store.get_score_from_db(db_path, molecule_name)
 
 
-def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> None:
-    """Write scored molecules to the database.
+def write_scores_to_db(
+    molecules: List[Dict[str, Any]],
+    db_path: str = None,
+    round_no: int = 0,
+) -> None:
+    """
+    Upsert scored molecules using orchestrator's full column set.
 
-    scored_at is always set explicitly so inserts stay non-NULL even when the
-    table was recreated without DEFAULT CURRENT_TIMESTAMP (e.g. after merge).
+    Previously this used a bare INSERT, so one already-present molecule_name
+    raised UNIQUE and the whole batch of fresh Boltz scores was discarded by
+    the surrounding except. The upsert refreshes existing rows instead.
     """
     if db_path is None:
         db_path = SCORE_RESULTS_DB
@@ -1210,56 +1195,25 @@ def write_scores_to_db(molecules: List[Dict[str, Any]], db_path: str = None) -> 
     if not molecules:
         return
 
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        to_insert = []
-        for mol in molecules:
-            molecule_name = mol.get('name')
-            score = mol.get('boltz_score')
-
-            if molecule_name and score is not None:
-                to_insert.append((molecule_name, float(score), now, True))
-
-        if to_insert:
-            cursor.executemany(
-                "INSERT INTO scored_molecules (molecule_name, score, scored_at, available) VALUES (?, ?, ?, ?)",
-                to_insert
-            )
-            conn.commit()
-            print(f"✅ Wrote {len(to_insert)} scored molecules to database")
-
-        conn.close()
-    except Exception as e:
-        print(f"Error writing scores to database: {e}")
+    n = score_store.write_scores_to_db(
+        db_path,
+        molecules,
+        rxn_id=RXN_ID,
+        round_no=round_no,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+        source="genetic",
+    )
+    if n:
+        print(f"✅ Wrote {n} scored molecules to database")
 
 
 def batch_get_scores_from_db(molecule_names: List[str], db_path: str = None) -> Dict[str, float]:
     """Get scores for multiple molecules from the database in batch."""
     if db_path is None:
         db_path = SCORE_RESULTS_DB
+    return score_store.batch_get_scores_from_db(db_path, molecule_names)
 
-    if not molecule_names:
-        return {}
-
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        placeholders = ','.join('?' * len(molecule_names))
-        cursor.execute(
-            f"SELECT molecule_name, score FROM scored_molecules WHERE molecule_name IN ({placeholders})",
-            molecule_names
-        )
-        results = cursor.fetchall()
-        conn.close()
-
-        return {name: float(score) for name, score in results}
-    except Exception as e:
-        logger.debug(f"Error batch getting scores from DB: {e}")
-        return {}
 
 def load_molecules_from_db_with_validation(
     db_path: str,
@@ -1279,12 +1233,10 @@ def load_molecules_from_db_with_validation(
             f"Loading molecules from database {db_path} for rxn_id={rxn_id}"
         )
 
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT molecule_name, score FROM scored_molecules")
-        db_results = cursor.fetchall()
-        conn.close()
+        # Canonical reader: already filtered to this rxn, and SMILES come from
+        # the DB column (rebuilt + backfilled only for pre-schema rows).
+        scored_df = score_store.load_all_scored(db_path, rxn_id)
+        db_results = list(zip(scored_df["name"], scored_df["smiles"], scored_df["score"]))
 
         if not db_results:
             logger.info("No molecules found in database")
@@ -1297,13 +1249,10 @@ def load_molecules_from_db_with_validation(
         heavy_atom_count = 0
         wrong_rxn_id_count = 0
 
-        for molecule_name, score in db_results:
+        for molecule_name, smiles, score in db_results:
             try:
-                if not molecule_name.startswith(f"rxn:{rxn_id}:"):
-                    wrong_rxn_id_count += 1
-                    continue
-
-                smiles = get_smiles_from_reaction(molecule_name)
+                if not smiles:
+                    smiles = get_smiles_from_reaction(molecule_name)
                 logger.debug(f"Attempting to parse SMILES from DB for {molecule_name}: {smiles}")
 
                 if not smiles:
@@ -1850,7 +1799,10 @@ async def score_molecules_with_boltz_batched(
                 if newly_scored_molecules:
                     for mol in newly_scored_molecules:
                         logger.debug(f"Molecule {mol['name']} scored {mol['boltz_score']}")
-                    write_scores_to_db(newly_scored_molecules)
+                    write_scores_to_db(
+                        newly_scored_molecules,
+                        round_no=state.get('round_number', 0),
+                    )
 
             except Exception as e:
                 logger.error(f"❌ Error scoring batch with Boltz: {e}")
@@ -2198,6 +2150,7 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
         while True:
             round_number += 1
             logger.info(f"\n{'='*70}")
+            state['round_number'] = round_number
             logger.info(f"🔄 Round {round_number}")
             logger.info(f"{'='*70}")
 
@@ -2455,6 +2408,12 @@ async def main():
 
     state['current_challenge_targets'] = config["small_molecule_target"]
     state['current_challenge_targets_clip_interval'] = config["small_molecule_target_clip_interval"]
+
+    # Tag rows with the same target identity orchestrator.py uses, so the
+    # shared score DB stays target-safe across both writers.
+    global TARGET_KEY, TARGET_LABEL
+    TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
+    logger.info(f"✅ target={TARGET_LABEL} | target_key={TARGET_KEY[:12]}")
 
     logger.info(f"Target protein: {state['current_challenge_targets'][0]}")
 

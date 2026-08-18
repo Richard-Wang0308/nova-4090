@@ -57,6 +57,12 @@ from utils import (
     get_historical_submissions,
 )
 from molecules import MoleculeManager, MoleculeUtils
+import score_store
+
+# Target identity for the shared score DB (orchestrator.py's format), resolved
+# from config in run_component_exhaust()/main().
+TARGET_KEY: Optional[str] = None
+TARGET_LABEL: Optional[str] = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,38 +140,24 @@ def get_scored_names_from_csv(rxn_id: int) -> set:
         return set()
 
 
-def init_score_results_db(db_path: str) -> None:
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scored_molecules (
-            molecule_name TEXT PRIMARY KEY,
-            score         REAL NOT NULL,
-            scored_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            available     BOOLEAN DEFAULT TRUE
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_score ON scored_molecules(score)")
-    conn.commit()
-    conn.close()
+def init_score_results_db(db_path: str, rxn_id: Optional[int] = None) -> None:
+    """Canonical orchestrator schema + target guard (see score_store)."""
+    score_store.init_score_results_db(
+        db_path,
+        rxn_id=rxn_id,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+    )
 
 
 def load_all_scored(db_path: str, rxn_id: int) -> pd.DataFrame:
-    """Load every scored row for this reaction (used for surrogate training)."""
-    if not os.path.exists(db_path):
-        return pd.DataFrame(columns=["name", "score"])
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT molecule_name, score FROM scored_molecules WHERE molecule_name LIKE ?",
-        (f"rxn:{rxn_id}:%",),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    df = pd.DataFrame(rows, columns=["name", "score"])
-    df["score"] = pd.to_numeric(df["score"], errors="coerce")
-    df = df[np.isfinite(df["score"])]
-    return df.reset_index(drop=True)
+    """
+    Load every scored row for this reaction (used for surrogate training).
+
+    Returns orchestrator's dataframe shape — [name, smiles, inchikey, score,
+    source, round] — so the stored SMILES can be reused instead of rebuilt.
+    """
+    return score_store.load_all_scored(db_path, rxn_id)
 
 
 def get_already_scored_names(
@@ -177,57 +169,27 @@ def get_already_scored_names(
     if not names:
         return set()
 
-    name_set = set(names)
-    found: set = set()
-
-    if os.path.exists(db_path):
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        # Chunk to stay under SQLite variable limits
-        chunk_size = 900
-        for i in range(0, len(names), chunk_size):
-            chunk = names[i : i + chunk_size]
-            placeholders = ",".join("?" * len(chunk))
-            cur.execute(
-                f"SELECT molecule_name FROM scored_molecules "
-                f"WHERE molecule_name IN ({placeholders})",
-                chunk,
-            )
-            found |= {r[0] for r in cur.fetchall()}
-        conn.close()
-
-    csv_names = get_scored_names_from_csv(rxn_id)
-    found |= name_set & csv_names
+    found = set(score_store.batch_get_scores_from_db(db_path, names))
+    found |= set(names) & get_scored_names_from_csv(rxn_id)
     return found
 
 
-def write_scores_to_db(db_path: str, records: List[Dict]) -> int:
-    """Merge a batch of {'name','boltz_score'} records into the DB."""
-    if not records:
-        return 0
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    to_insert = []
-    for r in records:
-        name, score = r.get("name"), r.get("boltz_score")
-        if not name or score is None:
-            continue
-        try:
-            score_f = float(score)
-        except (TypeError, ValueError):
-            continue
-        if not np.isfinite(score_f):
-            continue
-        to_insert.append((name, score_f, True))
-    if to_insert:
-        cur.executemany(
-            "INSERT OR REPLACE INTO scored_molecules "
-            "(molecule_name, score, available) VALUES (?, ?, ?)",
-            to_insert,
-        )
-        conn.commit()
-    conn.close()
-    return len(to_insert)
+def write_scores_to_db(
+    db_path: str,
+    records: List[Dict],
+    rxn_id: Optional[int] = None,
+    round_no: int = 0,
+) -> int:
+    """Upsert a batch of {'name','smiles','boltz_score'} records into the DB."""
+    return score_store.write_scores_to_db(
+        db_path,
+        records,
+        rxn_id=rxn_id,
+        round_no=round_no,
+        target_key=TARGET_KEY,
+        target_label=TARGET_LABEL,
+        source="component_exhaust",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -267,9 +229,15 @@ class SurrogateModel:
         )
 
         combined = combined.copy()
-        combined["smiles"] = combined["name"].apply(
-            MoleculeUtils.get_smiles_from_reaction_cached
-        )
+        # The DB carries SMILES now (orchestrator schema); only rebuild the
+        # rows that predate the column.
+        if "smiles" not in combined.columns:
+            combined["smiles"] = None
+        blank = combined["smiles"].isna() | (combined["smiles"].astype(str) == "")
+        if blank.any():
+            combined.loc[blank, "smiles"] = combined.loc[blank, "name"].apply(
+                MoleculeUtils.get_smiles_from_reaction_cached
+            )
         combined = combined[combined["smiles"].notna() & (combined["smiles"] != "")]
 
         X, y = [], []
@@ -640,6 +608,8 @@ async def _boltz_score_batches(
     db_path: str,
     boltz_batch_size: int,
     iter_label: str,
+    rxn_id: Optional[int] = None,
+    round_no: int = 0,
 ) -> Tuple[List[Dict], int]:
     """Boltz-score top_df in batches; merge each batch into DB. Returns (scored, n_written)."""
     all_scored: List[Dict] = []
@@ -670,7 +640,9 @@ async def _boltz_score_batches(
             print(batch_df[["name", "boltz_score"]].to_string(index=False))
             print(f"{'='*70}\n")
 
-        n_written = write_scores_to_db(db_path, scored)
+        n_written = write_scores_to_db(
+            db_path, scored, rxn_id=rxn_id, round_no=round_no
+        )
         total_written += n_written
         logger.info(
             f"[Exhaust] 💾 {iter_label} merged batch {b+1}/{total_batches} "
@@ -696,8 +668,13 @@ async def run_component_exhaust(
     boltz_batch_size: int = 10,
     seed: int = 42,
 ) -> pd.DataFrame:
+    global TARGET_KEY, TARGET_LABEL
+
+    # Tag rows with the same target identity orchestrator.py uses.
+    TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
+
     db_path = score_db_path(rxn_id)
-    init_score_results_db(db_path)
+    init_score_results_db(db_path, rxn_id=rxn_id)
 
     sample_size = max(1, min(int(sample_size), MAX_SAMPLE_PER_ITER))
     space_size = candidate_space_size(manager, vary_roles)
@@ -848,6 +825,7 @@ async def run_component_exhaust(
         scored, n_written = await _boltz_score_batches(
             boltz, config, target_proteins, top_df, db_path,
             boltz_batch_size, iter_label,
+            rxn_id=rxn_id, round_no=it,
         )
         all_scored.extend(scored)
         total_written += n_written
@@ -1031,8 +1009,12 @@ async def main():
             f"expected {expected_vary} free role(s), got {vary_roles})"
         )
 
+    global TARGET_KEY, TARGET_LABEL
+    TARGET_KEY, TARGET_LABEL = score_store.target_identity(cfg)
+    logger.info(f"✅ target={TARGET_LABEL} | target_key={TARGET_KEY[:12]}")
+
     db_path = score_db_path(rxn_id)
-    init_score_results_db(db_path)
+    init_score_results_db(db_path, rxn_id=rxn_id)
 
     # ── Initial surrogate train on top-4000 + bottom-4000 ────────────────
     surrogate = SurrogateModel()
