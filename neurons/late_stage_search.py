@@ -14,7 +14,8 @@ Pipeline per round (one fixed --rxn_id):
        a. component exhaust around elite reactant anchors
        b. exploratory genetic crossover + high-ratio mutation
   3. Dedup vs score_results DB + rxn CSV (never re-Boltz known names)
-  4. Validate property filters (heavy atoms / banned / rotatable bonds)
+  4. Validate property filters (heavy atoms / banned / rotatable bonds /
+     BRENK structural alerts)
   5. Reject HF duplicates + historical near-duplicates BEFORE Boltz
   6. Surrogate + novelty rank → keep top Boltz budget
   7. Boltz score → write into score_results_{rxn}.sqlite
@@ -69,6 +70,7 @@ from utils import (
     molecule_unique_for_protein_hf,
     get_heavy_atom_count,
     contains_atom_type,
+    get_brenk_matches,
 )
 from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from molecules import MoleculeManager, MoleculeUtils
@@ -266,11 +268,25 @@ def is_diverse_enough(
 # Validation
 # ═══════════════════════════════════════════════════════════════════════════
 
+def passes_brenk(smiles: str) -> bool:
+    """False when the validator's BRENK structural-alert filter would reject it."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return False
+    reasons = get_brenk_matches(mol)
+    if reasons:
+        logger.debug(f"[BRENK] rejected {smiles}: {'; '.join(reasons)}")
+        return False
+    return True
+
+
 def validate_smiles(smiles: str, config: Dict[str, Any]) -> bool:
     if not smiles:
         return False
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
+        return False
+    if get_brenk_matches(mol):
         return False
     try:
         n_heavy = get_heavy_atom_count(smiles)
@@ -636,7 +652,12 @@ class GeneticExplorer:
 
     def _buildable(self, name: str) -> bool:
         smiles = resolve_smiles(name)
-        return bool(smiles and Chem.MolFromSmiles(smiles))
+        if not smiles:
+            return False
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return False
+        return not get_brenk_matches(mol)
 
     def crossover(self, a: str, b: str) -> Optional[str]:
         p1, p2 = a.split(":"), b.split(":")
@@ -919,6 +940,7 @@ def export_second_shelf_inventory(
                 "score",
                 "max_hist_sim",
                 "hf_unique",
+                "brenk_ok",
                 "shelf_ok",
             ]
         ).to_csv(out_path, index=False)
@@ -942,8 +964,10 @@ def export_second_shelf_inventory(
             hf_unique = bool(molecule_unique_for_protein_hf(target_protein, smiles))
         except Exception:
             hf_unique = False
+        brenk_ok = passes_brenk(smiles)
         shelf_ok = (
             hf_unique
+            and brenk_ok
             and max_sim < MAX_SIMILARITY_TO_HISTORICAL
             and lo <= float(score) <= hi
         )
@@ -953,6 +977,7 @@ def export_second_shelf_inventory(
                 "score": float(score),
                 "max_hist_sim": max_sim,
                 "hf_unique": hf_unique,
+                "brenk_ok": brenk_ok,
                 "shelf_ok": shelf_ok,
             }
         )
@@ -1078,6 +1103,9 @@ def filter_candidates(
         if not smiles:
             stats["no_smiles"] += 1
             continue
+        if not passes_brenk(smiles):
+            stats["brenk"] += 1
+            continue
         if not validate_smiles(smiles, config):
             stats["invalid_props"] += 1
             continue
@@ -1095,10 +1123,11 @@ def filter_candidates(
         stats["kept"] += 1
 
     logger.info(
-        "[FILTER] in=%d already=%d no_smi=%d invalid=%d hf=%d hist=%d kept=%d",
+        "[FILTER] in=%d already=%d no_smi=%d brenk=%d invalid=%d hf=%d hist=%d kept=%d",
         stats["input"],
         stats["already_scored"],
         stats["no_smiles"],
+        stats["brenk"],
         stats["invalid_props"],
         stats["hf_dup"],
         stats["hist_sim"],

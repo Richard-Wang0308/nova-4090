@@ -12,7 +12,7 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
 from combinatorial_db.reactions import get_smiles_from_reaction
-from utils.molecules import molecule_unique_for_protein_hf
+from utils.molecules import molecule_unique_for_protein_hf, get_brenk_matches
 # TODO: adjust import path to match where this helper actually lives
 from utils import get_historical_submissions
 
@@ -125,7 +125,8 @@ def check_availability_fast(
 
     Returns:
         (available: bool, reason: str)
-        reason is one of: "" | "bad_smiles" | "hf_duplicate" | "too_similar"
+        reason is one of: "" | "bad_smiles" | "hf_duplicate" | "brenk" |
+        "too_similar"
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -134,6 +135,11 @@ def check_availability_fast(
     # Exact match vs HF archive
     if Chem.MolToInchiKey(mol) in inchikeys_set:
         return False, "hf_duplicate"
+
+    # BRENK structural alerts — one match invalidates the whole submission
+    # on the validator side, so the molecule can never be submitted.
+    if get_brenk_matches(mol):
+        return False, "brenk"
 
     # Diversity vs historical submissions
     mol_fp = morgan_gen.GetFingerprint(mol)
@@ -156,7 +162,8 @@ async def check_molecule_available(
     """
     Check if a molecule is "available" for the target protein:
       1. NOT already present in the HuggingFace dataset (exact match)
-      2. NOT too similar (Tanimoto >= max_similarity) to any historical
+      2. NOT disallowed by the BRENK structural-alert filter
+      3. NOT too similar (Tanimoto >= max_similarity) to any historical
          submission for the target protein
 
     Returns:
@@ -183,6 +190,10 @@ async def check_molecule_available(
         if reason == "bad_smiles":
             bt.logging.warning(
                 f"Could not parse SMILES for {molecule_name}: '{smiles}'"
+            )
+        elif reason == "brenk":
+            bt.logging.debug(
+                f"❌ Molecule {molecule_name} disallowed by the BRENK filter"
             )
         elif reason == "too_similar":
             bt.logging.debug(
@@ -266,7 +277,8 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
     Update available values for molecules in scored_molecules table.
     A molecule is 'available' (TRUE) only if:
       1. It is NOT already in the HuggingFace dataset for the target protein, AND
-      2. It is NOT too similar (Tanimoto >= MAX_SIMILARITY_TO_HISTORICAL) to any
+      2. It is NOT disallowed by the BRENK structural-alert filter, AND
+      3. It is NOT too similar (Tanimoto >= MAX_SIMILARITY_TO_HISTORICAL) to any
          historical submission for the target protein.
 
     ONLY processes molecules where available is TRUE (skips FALSE and NULL),
@@ -337,6 +349,7 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         updated_to_false = 0
         updated_to_true = 0
         skipped_hf = 0
+        skipped_brenk = 0
         skipped_similarity = 0
         availability_checks = 0
         availability_batch_time = 0.0
@@ -385,6 +398,9 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                     elif reason == "hf_duplicate":
                         skipped_hf += 1
                         updated_to_false += 1
+                    elif reason == "brenk":
+                        skipped_brenk += 1
+                        updated_to_false += 1
                     elif reason == "too_similar":
                         skipped_similarity += 1
                         updated_to_false += 1
@@ -410,6 +426,7 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
                         f"Progress: {idx}/{total} | Success: {success_count} | "
                         f"Errors: {error_count} | TRUE: {updated_to_true} | "
                         f"FALSE: {updated_to_false} (HF dup: {skipped_hf}, "
+                        f"BRENK: {skipped_brenk}, "
                         f"too similar: {skipped_similarity})"
                     )
 
@@ -437,7 +454,8 @@ async def update_available_values(db_path: str, target_protein: str, force_recal
         bt.logging.info(f"   Success: {success_count} | Errors: {error_count}")
         bt.logging.info(
             f"   Updated to TRUE: {updated_to_true} | Updated to FALSE: {updated_to_false} "
-            f"(HF duplicate: {skipped_hf}, too similar: {skipped_similarity})"
+            f"(HF duplicate: {skipped_hf}, BRENK: {skipped_brenk}, "
+            f"too similar: {skipped_similarity})"
         )
         bt.logging.info(
             f"⏱️  Timing summary: overall={overall_elapsed:.3f}s | "
@@ -571,7 +589,7 @@ async def main(
     bt.logging.info("\nChecking current database state...")
     get_statistics(db_path)
 
-    bt.logging.info("\nUpdating available values (uniqueness + diversity)...")
+    bt.logging.info("\nUpdating available values (uniqueness + BRENK + diversity)...")
     await update_available_values(db_path, TARGET_PROTEIN, force_recalculate=force_recalculate)
 
     bt.logging.info("\nFinal database state:")
@@ -586,7 +604,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Fix/refresh the 'available' column in a score_results SQLite DB, "
-                    "checking both HuggingFace uniqueness and historical diversity."
+                    "checking HuggingFace uniqueness, BRENK structural alerts and "
+                    "historical diversity."
     )
     parser.add_argument(
         "--force",

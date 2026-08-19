@@ -16,7 +16,8 @@ Pipeline (repeated for --iterations rounds):
      (rxn-specific, from score_results_{rxn_id}.sqlite)
   2. Sample up to --sample_size candidates (max 10000) from the free
      component space — never materialize the full cartesian product
-  3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse)
+  3. Validate (heavy atoms / banned atoms / rotatable bonds / RDKit parse /
+     BRENK structural alerts)
   4. Drop molecules already scored (sqlite / rxn CSV) or already sampled
   5. Drop molecules already in HuggingFace Submission-Archive
   6. Drop molecules too similar (Tanimoto >= 0.6) to historical submissions
@@ -53,6 +54,7 @@ from config.config_loader import load_config
 from utils import (
     get_heavy_atom_count,
     contains_atom_type,
+    get_brenk_matches,
     molecule_unique_for_protein_hf,
     get_historical_submissions,
 )
@@ -279,6 +281,14 @@ def validate_smiles(smiles: str, config: Dict) -> bool:
         return False
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
+        return False
+    # BRENK structural alerts — the validator rejects the whole submission
+    # on a single match, so drop these before they cost Boltz time.
+    brenk_reasons = get_brenk_matches(mol)
+    if brenk_reasons:
+        logger.debug(
+            f"[Exhaust] BRENK rejected {smiles}: {'; '.join(brenk_reasons)}"
+        )
         return False
     try:
         n_heavy = get_heavy_atom_count(smiles)
@@ -729,7 +739,8 @@ async def run_component_exhaust(
             f"(seen_total={len(seen_names):,} / space={space_size:,})"
         )
 
-        # ── 2. Validate ────────────────────────────────────────────────
+        # ── 2. Validate (heavy atoms / banned atoms / rotatable bonds /
+        #       RDKit parse / BRENK structural alerts) ──────────────────
         valid_df = build_and_validate(raw_names, config)
         logger.info(
             f"[Exhaust] {iter_label}: {len(valid_df)} valid after filtering"

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import time
 from rdkit import Chem
-from rdkit.Chem import MACCSkeys, AllChem
+from rdkit.Chem import MACCSkeys, AllChem, FilterCatalog
 from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata
 from huggingface_hub.errors import EntryNotFoundError
 import bittensor as bt
@@ -232,3 +232,43 @@ def contains_atom_type(mol: Chem.Mol, atom_types: list[str]) -> bool:
         if atom.GetSymbol() in atom_types:
             return True
     return False
+
+_BRENK_CATALOG = None
+
+
+def get_brenk_catalog() -> FilterCatalog.FilterCatalog:
+    """
+    Build the RDKit BRENK structural-alert catalog once and reuse it.
+
+    Building the catalog costs ~100ms, so it is cached at module level; miners
+    check thousands of molecules per iteration.
+    """
+    global _BRENK_CATALOG
+    if _BRENK_CATALOG is None:
+        filter_params = FilterCatalog.FilterCatalogParams()
+        filter_params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.BRENK)
+        _BRENK_CATALOG = FilterCatalog.FilterCatalog(filter_params)
+    return _BRENK_CATALOG
+
+
+def get_brenk_matches(mol: Chem.Mol) -> list[str]:
+    """
+    Return the descriptions of every BRENK alert the molecule matches.
+    Empty list means the molecule passes the filter.
+    """
+    if mol is None:
+        return []
+    catalog = get_brenk_catalog()
+    if not catalog.HasMatch(mol):
+        return []
+    return [entry.GetDescription() for entry in catalog.GetMatches(mol)]
+
+
+def contains_brenk_alert(mol: Chem.Mol) -> bool:
+    """
+    Check whether a molecule is disallowed by the BRENK filter — the same
+    check the validator applies in neurons/validator/molecule_validity.py.
+    """
+    if mol is None:
+        return False
+    return get_brenk_catalog().HasMatch(mol)

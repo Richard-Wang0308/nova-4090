@@ -24,8 +24,8 @@ Core design:
       * explicit exploration quota
   - All newly scored molecules immediately become parents/anchors/training data.
   - Target-aware SQLite prevents accidental score reuse across protein targets.
-  - Final top 20 are revalidated against current HF/history constraints and
-    de-duplicated by InChIKey before export.
+  - Final top 20 are revalidated against current HF/history/BRENK constraints
+    and de-duplicated by InChIKey before export.
   - Writes a compatibility score_results_{rxn}.sqlite so existing submit.py
     can continue to work.
 
@@ -106,6 +106,8 @@ try:
     from utils.molecules import compute_maccs_entropy
 except Exception:
     compute_maccs_entropy = None
+
+from utils.molecules import get_brenk_matches
 
 try:
     from boltz_wrapper import BoltzWrapper
@@ -199,6 +201,21 @@ def descriptors(smiles: str) -> Optional[np.ndarray]:
     )
     _desc_cache[smiles] = vals
     return vals
+
+
+def brenk_ok(smiles: str) -> bool:
+    """
+    False when the validator's BRENK structural-alert filter would reject the
+    molecule (one match invalidates an entire submission).
+    """
+    mol = mol_from_smiles(smiles)
+    if mol is None:
+        return False
+    reasons = get_brenk_matches(mol)
+    if reasons:
+        log.debug("BRENK rejected %s: %s", smiles, "; ".join(reasons))
+        return False
+    return True
 
 
 def inchikey(smiles: str) -> str:
@@ -1194,6 +1211,14 @@ class CandidateGenerator:
         if valid.empty:
             return valid
 
+        n_pre_brenk = len(valid)
+        valid = valid[valid["smiles"].map(brenk_ok)]
+        if len(valid) != n_pre_brenk:
+            log.info("generator/brenk: dropped %d/%d candidates",
+                     n_pre_brenk - len(valid), n_pre_brenk)
+        if valid.empty:
+            return valid
+
         valid["inchikey"] = valid["smiles"].map(inchikey)
         valid = valid[valid["inchikey"] != ""]
         valid = valid.drop_duplicates("inchikey", keep="first").reset_index(drop=True)
@@ -1452,6 +1477,8 @@ def final_top20(
         s = row["smiles"]
         ik = row["inchikey"] or inchikey(s)
         if not ik or ik in used_inchi:
+            continue
+        if not brenk_ok(s):
             continue
         if not guard.hf_ok(s):
             continue

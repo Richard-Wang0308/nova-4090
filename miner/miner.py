@@ -77,6 +77,7 @@ _mol_cache: Dict[str, Any] = {}
 _morgan_bv_cache: Dict[str, Any] = {}
 
 from config.config_loader import load_config
+from utils import get_brenk_matches
 from molecules import MoleculeManager, MoleculeUtils
 import score_store
 from tools import (
@@ -148,6 +149,18 @@ def get_mol(smiles: str):
     mol = Chem.MolFromSmiles(smiles)
     _mol_cache[smiles] = mol
     return mol
+
+
+def passes_brenk_filter(smiles: str) -> bool:
+    """Reject molecules the validator's BRENK structural-alert filter kills."""
+    mol = get_mol(smiles)
+    if mol is None:
+        return False
+    reasons = get_brenk_matches(mol)
+    if reasons:
+        logger.debug(f"[BRENK] rejected {smiles}: {'; '.join(reasons)}")
+        return False
+    return True
 
 
 def get_morgan_fingerprint(smiles: str, n_bits: int = 2048):
@@ -1032,6 +1045,17 @@ async def find_solution(state: Dict[str, Any]) -> None:
             data = data[data["smiles"].notna() & (data["smiles"] != "")].reset_index(
                 drop=True
             )
+            if data.empty:
+                await asyncio.sleep(2)
+                continue
+
+            # BRENK structural alerts — the validator discards a whole
+            # submission on a single match, so never spend Boltz time on them.
+            n_pre_brenk = len(data)
+            data = data[data["smiles"].map(passes_brenk_filter)].reset_index(drop=True)
+            n_brenk = n_pre_brenk - len(data)
+            if n_brenk:
+                logger.info(f"[BRENK] dropped {n_brenk}/{n_pre_brenk} candidates")
             if data.empty:
                 await asyncio.sleep(2)
                 continue

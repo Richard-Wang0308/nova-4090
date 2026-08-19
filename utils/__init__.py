@@ -5,7 +5,10 @@ from .molecules import (
     molecule_unique_for_protein_hf,
     find_chemically_identical,
     is_boltz_safe_smiles,
-    contains_atom_type
+    contains_atom_type,
+    contains_brenk_alert,
+    get_brenk_matches,
+    get_brenk_catalog
 )
 from .challenge import get_challenge_params_from_blockhash, get_historical_submissions
 from .proteins import get_sequence_from_protein_code

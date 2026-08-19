@@ -34,6 +34,7 @@ from utils import (
     get_heavy_atom_count,
     molecule_unique_for_protein_hf,
     contains_atom_type,
+    get_brenk_matches,
     get_historical_submissions
 )
 from molecules_base import generate_inchikey
@@ -409,6 +410,25 @@ def validate_molecule_banned_atoms(
         return False, f"Banned atom check error: {str(e)}"
 
 
+def validate_molecule_brenk(
+    molecule_name: str,
+    smiles: str,
+    config: Dict[str, Any] = None
+) -> Tuple[bool, str]:
+    """Validate molecule is not disallowed by the BRENK structural-alert filter."""
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return False, "Cannot parse SMILES for BRENK check"
+
+        brenk_reasons = get_brenk_matches(mol)
+        if brenk_reasons:
+            return False, f"Disallowed by BRENK: {'; '.join(brenk_reasons)}"
+        return True, ""
+    except Exception as e:
+        return False, f"BRENK check error: {str(e)}"
+
+
 def validate_molecule_rotatable_bonds(
     molecule_name: str,
     smiles: str,
@@ -593,12 +613,17 @@ async def validate_molecule_complete(
     if not is_valid:
         errors.append(f"[ROTATABLE_BONDS] {error_msg}")
 
-    # 5. HuggingFace uniqueness
+    # 5. BRENK structural alerts
+    is_valid, error_msg = validate_molecule_brenk(molecule_name, smiles, config)
+    if not is_valid:
+        errors.append(f"[BRENK] {error_msg}")
+
+    # 6. HuggingFace uniqueness
     is_valid, error_msg = await validate_molecule_huggingface_unique(state, molecule_name, smiles)
     if not is_valid:
         errors.append(f"[HF_UNIQUE] {error_msg}")
 
-    # 6. Diversity vs historical submissions
+    # 7. Diversity vs historical submissions
     is_valid, error_msg = await validate_molecule_historical_diversity(
         state, molecule_name, smiles
     )
@@ -661,6 +686,13 @@ class GeneticAlgorithmOperator:
                 if offspring_smiles:
                     mol = Chem.MolFromSmiles(offspring_smiles)
                     if mol is not None:
+                        brenk_reasons = get_brenk_matches(mol)
+                        if brenk_reasons:
+                            logger.debug(
+                                f"Offspring {offspring_name} disallowed by BRENK: "
+                                f"{'; '.join(brenk_reasons)}"
+                            )
+                            return None
                         self.generated_molecule_names.add(offspring_name)
                         return offspring_name
                     else:
@@ -808,6 +840,7 @@ def load_molecules_from_db_with_validation(
         successful_count = 0
         failed_count = 0
         banned_atom_count = 0
+        brenk_count = 0
         heavy_atom_count = 0
         wrong_rxn_id_count = 0
 
@@ -832,6 +865,15 @@ def load_molecules_from_db_with_validation(
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
+                    continue
+
+                brenk_reasons = get_brenk_matches(mol)
+                if brenk_reasons:
+                    logger.debug(
+                        f"Molecule {molecule_name} disallowed by BRENK "
+                        f"({'; '.join(brenk_reasons)}), skipping"
+                    )
+                    brenk_count += 1
                     continue
 
                 min_heavy_atoms = 10
@@ -874,7 +916,7 @@ def load_molecules_from_db_with_validation(
                 logger.info(
                     f"✅ Loaded {len(result_df)} molecules from database "
                     f"(successful: {successful_count}, failed: {failed_count}, "
-                    f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count}, "
+                    f"banned atoms: {banned_atom_count}, BRENK: {brenk_count}, insufficient heavy atoms: {heavy_atom_count}, "
                     f"wrong rxn_id: {wrong_rxn_id_count})"
                 )
                 if len(result_df) > 0:
@@ -888,7 +930,7 @@ def load_molecules_from_db_with_validation(
             logger.warning(
                 f"No valid molecules loaded from database "
                 f"(successful: {successful_count}, failed: {failed_count}, "
-                f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count}, "
+                f"banned atoms: {banned_atom_count}, BRENK: {brenk_count}, insufficient heavy atoms: {heavy_atom_count}, "
                 f"wrong rxn_id: {wrong_rxn_id_count})"
             )
 
@@ -943,6 +985,7 @@ def load_molecules_from_csv_with_validation(
         successful_count = 0
         failed_count = 0
         banned_atom_count = 0
+        brenk_count = 0
         heavy_atom_count = 0
 
         for _, row in df.iterrows():
@@ -966,6 +1009,15 @@ def load_molecules_from_csv_with_validation(
                 if banned_atoms and contains_atom_type(mol, banned_atoms):
                     logger.debug(f"Molecule {molecule_name} contains banned atoms {banned_atoms}, skipping")
                     banned_atom_count += 1
+                    continue
+
+                brenk_reasons = get_brenk_matches(mol)
+                if brenk_reasons:
+                    logger.debug(
+                        f"Molecule {molecule_name} disallowed by BRENK "
+                        f"({'; '.join(brenk_reasons)}), skipping"
+                    )
+                    brenk_count += 1
                     continue
 
                 min_heavy_atoms = 10
@@ -1014,7 +1066,7 @@ def load_molecules_from_csv_with_validation(
                 logger.info(
                     f"✅ Loaded {len(result_df)} molecules from CSV "
                     f"(successful: {successful_count}, failed: {failed_count}, "
-                    f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
+                    f"banned atoms: {banned_atom_count}, BRENK: {brenk_count}, insufficient heavy atoms: {heavy_atom_count})"
                 )
                 if len(result_df) > 0:
                     scores = result_df['score'].dropna()
@@ -1027,7 +1079,7 @@ def load_molecules_from_csv_with_validation(
             logger.warning(
                 f"No valid molecules loaded from CSV "
                 f"(successful: {successful_count}, failed: {failed_count}, "
-                f"banned atoms: {banned_atom_count}, insufficient heavy atoms: {heavy_atom_count})"
+                f"banned atoms: {banned_atom_count}, BRENK: {brenk_count}, insufficient heavy atoms: {heavy_atom_count})"
             )
 
         return result_df

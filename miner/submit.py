@@ -8,7 +8,8 @@ Workflow:
 2. Monitor blockchain for epoch boundaries.
 3. As soon as the epoch counter changes, determine that epoch's allowed reaction,
     build a diverse set of num_molecules (default 20) per wallet from the top
-    candidate pool — each set must pass HF uniqueness, historical diversity,
+    candidate pool — each set must pass HF uniqueness, BRENK structural alerts,
+    historical diversity,
     no InChIKey duplicates within the set, and MACCS entropy >= min_entropy
     (same checks the validator applies).
     PREPARE all payloads (comma-separated molecule names, timelock-encrypted),
@@ -90,6 +91,7 @@ from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import (
     compute_maccs_entropy,
     molecule_unique_for_protein_hf,
+    get_brenk_matches,
 )
 from btdr import QuicknetBittensorDrandTimelock
 
@@ -257,7 +259,7 @@ def setup_logging(config: argparse.Namespace) -> None:
         f"⚡ Parallel CHAIN COMMIT (per-wallet connections) | GitHub upload "
         f"batched into ONE commit after chain commit | "
         f"{_cfg_val(config, 'num_molecules', 20)} molecules/wallet | "
-        f"HF unique + similarity<{MAX_SIMILARITY_TO_HISTORICAL} + "
+        f"HF unique + BRENK + similarity<{MAX_SIMILARITY_TO_HISTORICAL} + "
         f"MACCS entropy≥{_cfg_val(config, 'min_entropy', 0.1)} on top "
         f"{AVAILABILITY_CANDIDATE_POOL} candidates"
     )
@@ -589,9 +591,10 @@ def check_molecule_available(
     max_similarity: float = MAX_SIMILARITY_TO_HISTORICAL,
 ) -> Tuple[bool, str]:
     """
-    A molecule is available only if BOTH:
+    A molecule is available only if ALL of:
       1. NOT already in the HuggingFace dataset for the target protein, AND
-      2. NOT too similar (Tanimoto >= max_similarity) to any historical
+      2. NOT disallowed by the BRENK structural-alert filter, AND
+      3. NOT too similar (Tanimoto >= max_similarity) to any historical
          submission for that protein.
 
     Returns:
@@ -608,7 +611,6 @@ def check_molecule_available(
         if not bool(molecule_unique_for_protein_hf(target_protein, smiles)):
             return False, "hf_duplicate"
 
-        # Step 2: diversity vs historical submissions
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             bt.logging.warning(
@@ -616,6 +618,17 @@ def check_molecule_available(
             )
             return False, "bad_smiles"
 
+        # Step 2: BRENK structural alerts — a single match makes the validator
+        # discard the whole submission, so such a molecule is never submittable.
+        brenk_reasons = get_brenk_matches(mol)
+        if brenk_reasons:
+            bt.logging.debug(
+                f"   ⚠️  {molecule_name} disallowed by BRENK: "
+                f"{'; '.join(brenk_reasons)}"
+            )
+            return False, "brenk"
+
+        # Step 3: diversity vs historical submissions
         mol_fp = morgan_gen.GetFingerprint(mol)
         if not is_diverse_enough(mol_fp, historical_df, max_similarity):
             return False, "too_similar"
@@ -657,7 +670,7 @@ def select_diverse_molecule_set(
     """
     Greedily build a set of num_molecules from score-sorted candidates.
 
-    Each pick must pass HF uniqueness + historical diversity, must not be
+    Each pick must pass HF uniqueness + BRENK + historical diversity, must not be
     chemically identical to an already-selected molecule, and the growing
     SMILES set must keep MACCS entropy >= min_entropy once it has 2+ members
     (mirrors validator-side checks).
@@ -674,6 +687,7 @@ def select_diverse_molecule_set(
     stats = {
         "checked": 0,
         "rejected_hf": 0,
+        "rejected_brenk": 0,
         "rejected_similar": 0,
         "rejected_dup": 0,
         "rejected_entropy": 0,
@@ -704,10 +718,15 @@ def select_diverse_molecule_set(
         )
 
         if not is_available:
-            if reason in ("hf_duplicate", "too_similar", "bad_smiles", "no_target", "error"):
+            if reason in (
+                "hf_duplicate", "brenk", "too_similar",
+                "bad_smiles", "no_target", "error",
+            ):
                 failed_availability.append((molecule_name, reason))
             if reason == "hf_duplicate":
                 stats["rejected_hf"] += 1
+            elif reason == "brenk":
+                stats["rejected_brenk"] += 1
             elif reason == "too_similar":
                 stats["rejected_similar"] += 1
             else:
@@ -834,6 +853,8 @@ async def get_verified_molecule_sets(
             _set_molecule_available(db_path, name, False)
             if reason == "hf_duplicate":
                 detail = "already known (HF)"
+            elif reason == "brenk":
+                detail = "disallowed by BRENK filter"
             elif reason == "too_similar":
                 detail = f"too similar to historical (≥{max_similarity})"
             else:
@@ -847,6 +868,7 @@ async def get_verified_molecule_sets(
                 f"   ⚠️  Wallet set {wallet_idx + 1}/{n_wallets}: only found "
                 f"{len(selected)}/{molecules_per_wallet} molecules "
                 f"(checked={stats['checked']}, HF dup={stats['rejected_hf']}, "
+                f"BRENK={stats['rejected_brenk']}, "
                 f"historical={stats['rejected_similar']}, "
                 f"dup InChIKey={stats['rejected_dup']}, "
                 f"entropy={stats['rejected_entropy']})"
@@ -1275,7 +1297,7 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
     # ==========================================================
     bt.logging.info(
         "🔹 STEP 2/3: Molecule Selection "
-        f"({num_molecules} per wallet, HF unique, "
+        f"({num_molecules} per wallet, HF unique, BRENK-clean, "
         f"historical similarity<{max_similarity}, MACCS entropy≥{min_entropy})"
     )
     bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
