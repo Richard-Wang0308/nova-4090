@@ -92,6 +92,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 from config.config_loader import load_config
 from molecules import MoleculeManager, MoleculeUtils
 from tools import SynthonLibrary
+import novelty
+import rescore
 
 try:
     from utils import (
@@ -132,6 +134,14 @@ log = logging.getLogger("nova-top20-v2")
 # =============================================================================
 
 MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+# After each round, molecules above this score are re-scored
+# CONFIRM_EXTRA_ROUNDS more times and their score becomes the mean of all draws.
+# One Boltz draw is noisy (measured: same molecule, same seed, up to 9% apart),
+# and the acquisition function deliberately chases the top of that noise, so the
+# leaders of a round are exactly the values least likely to reproduce.
+CONFIRM_SCORE_THRESHOLD = 0.1
+CONFIRM_EXTRA_ROUNDS = 2
 
 _mol_cache: Dict[str, Any] = {}
 _fp_cache: Dict[str, np.ndarray] = {}
@@ -1611,7 +1621,9 @@ async def main():
 
     guard = HistoricalGuard(
         target=target,
-        max_similarity=float(config.get("max_similarity_to_historical", 0.9)),
+        # Validator threshold, straight from config — a 0.9 fallback would mine
+        # a whole band (0.7-0.9) that can never be submitted.
+        max_similarity=novelty.config_threshold(config),
         disable_hf=args.disable_hf_filter,
         disable_history=args.disable_history_filter,
     )
@@ -1718,6 +1730,25 @@ async def main():
             batch_size=args.batch_size,
         )
         store.write(scored_new, round_no=round_no)
+
+        # Round scoring is done. Re-score everything above the threshold and
+        # replace its score with the mean of all draws, so the top-20 frontier
+        # and the surrogate are fitted to estimates rather than lucky draws.
+        await rescore.confirm_high_scorers(
+            boltz=boltz,
+            config=config,
+            scored=scored_new,
+            threshold=CONFIRM_SCORE_THRESHOLD,
+            extra_rounds=CONFIRM_EXTRA_ROUNDS,
+            batch_size=args.batch_size,
+            db_path=str(store.path),
+            rxn_id=rxn_id,
+            round_no=round_no,
+            target_key=store.target_key,
+            target_label=store.target_label,
+            source="top20_acquisition",
+            logger=log,
+        )
 
         # Every discovery is immediately visible to next round's model/parents/anchors.
         top20_after = final_top20(store, guard, config)

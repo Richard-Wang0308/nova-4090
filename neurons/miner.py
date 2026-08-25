@@ -1804,8 +1804,18 @@ async def main():
     elif isinstance(config, dict) and 'weekly_target' in config:
         state['current_challenge_targets'] = [config['weekly_target']]
     else:
-        logger.warning("⚠️  No weekly_target in config — using default P31652")
-        state['current_challenge_targets'] = ['P31652']
+        # config_loader does not produce weekly_target (it comes from the
+        # validator's argparse), so this branch is what a miner actually takes.
+        # Fall back to the configured small-molecule target, not a stale literal.
+        try:
+            _fallback = config['small_molecule_target'][0]
+        except Exception:
+            _fallback = 'P40261'
+        logger.warning(
+            f"⚠️  No weekly_target in config — using small_molecule_target "
+            f"{_fallback}"
+        )
+        state['current_challenge_targets'] = [_fallback]
 
     if hasattr(config, 'antitargets'):
         state['current_challenge_antitargets'] = config.antitargets or []

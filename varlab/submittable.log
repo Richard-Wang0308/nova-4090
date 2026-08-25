@@ -1,0 +1,39 @@
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterHierarchyMatcher> already registered; second conversion method ignored.
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterCatalogEntry> already registered; second conversion method ignored.
+historical: 31045 | threshold <0.7 | k=20
+scanning top 6000 available molecules
+  1000/6000
+  2000/6000
+  3000/6000
+  4000/6000
+  5000/6000
+  6000/6000
+
+======================================================================
+pass rate: 3715/6000  (61.9%)
+naive available top-20 sum      : 2.29677   (only 1/20 submittable)
+actually submittable top-20 sum : 2.17346
+shortfall vs what you look at   : -0.12331
+rank of the 20th submittable molecule in your list: 242
+
+submittable top-20:
+  rxn:2:128157:145209         0.11607  sim=0.675
+  rxn:2:101348:93947          0.11288  sim=0.579
+  rxn:2:110667:158710         0.10963  sim=0.676
+  rxn:2:139839:159258         0.10836  sim=0.671
+  rxn:2:99816:142273          0.10834  sim=0.581
+  rxn:2:126566:173019         0.10829  sim=0.685
+  rxn:2:135017:156548         0.10823  sim=0.677
+  rxn:2:97294:145452          0.10816  sim=0.658
+  rxn:2:111568:87143          0.10806  sim=0.596
+  rxn:2:138373:148983         0.10804  sim=0.658
+  rxn:2:138190:163711         0.10798  sim=0.684
+  rxn:2:111512:161792         0.10788  sim=0.662
+  rxn:2:78664:151299          0.10788  sim=0.620
+  rxn:2:125192:145452         0.10779  sim=0.690
+  rxn:2:146810:158710         0.10770  sim=0.671
+  rxn:2:91606:147854          0.10770  sim=0.681
+  rxn:2:135880:157753         0.10767  sim=0.653
+  rxn:2:81003:145209          0.10766  sim=0.685
+  rxn:2:107171:156548         0.10757  sim=0.649
+  rxn:2:88321:142273          0.10755  sim=0.594

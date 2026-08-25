@@ -71,6 +71,14 @@ SURROGATE_MIN_TRAIN_SIZE = 3000  # filtering requires training samples > this
 SURROGATE_ACTIVE_AFTER_ITER = 5   # filtering requires iteration > this
 TOP_AVG_K = 100  # progress signal: mean of top-K pool scores
 
+# After each round, molecules above this score are re-scored
+# CONFIRM_EXTRA_ROUNDS more times and their score becomes the mean of all draws.
+# A single Boltz draw is noisy (measured: same molecule, same seed, up to 9%
+# apart), so a lone high draw is exactly the thing that will not reproduce at
+# the validator.
+CONFIRM_SCORE_THRESHOLD = 0.1
+CONFIRM_EXTRA_ROUNDS = 2
+
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 _fp_cache: Dict[str, np.ndarray] = {}
 _mol_cache: Dict[str, Any] = {}
@@ -80,6 +88,8 @@ from config.config_loader import load_config
 from utils import get_brenk_matches
 from molecules import MoleculeManager, MoleculeUtils
 import score_store
+import novelty
+import rescore
 from tools import (
     IterationParams,
     SynthonLibrary,
@@ -819,6 +829,25 @@ async def find_solution(state: Dict[str, Any]) -> None:
         logger.warning(f"[Solution] Synthon library failed: {e}")
         params.synthon_lib = None
 
+    # Novelty guard. This miner previously had none: it Boltz-scored anything
+    # the generator produced, including molecules already in the Submission
+    # Archive, which can never be submitted. The archive also grows during a
+    # long run, so the guard refreshes itself rather than caching one snapshot.
+    novelty_guard = None
+    try:
+        targets = state.get("current_challenge_targets") or []
+        if targets:
+            novelty_guard = novelty.NoveltyGuard(
+                target=targets[0],
+                max_similarity=novelty.config_threshold(cfg),
+            )
+            logger.info(
+                f"[Solution] Novelty guard ready: reject Tanimoto >= "
+                f"{novelty_guard.max_similarity} vs {len(novelty_guard.fps)} archived"
+            )
+    except Exception as e:
+        logger.warning(f"[Solution] Novelty guard unavailable: {e}")
+
     with ProcessPoolExecutor(max_workers=n_workers) as cpu_executor:
         while True:
             iteration += 1
@@ -1104,6 +1133,28 @@ async def find_solution(state: Dict[str, Any]) -> None:
                     f"train_size>{SURROGATE_MIN_TRAIN_SIZE})"
                 )
 
+            # Drop anything the validator would reject as non-novel BEFORE
+            # paying for Boltz. Cheap (bulk Tanimoto) next to a GPU forward pass.
+            if novelty_guard is not None and not data.empty:
+                novelty_guard.maybe_refresh()
+                t_nov = time.time()
+                sims = novelty_guard.similarities(data["smiles"].tolist())
+                pre_nov = len(data)
+                data = data[sims < novelty_guard.max_similarity].reset_index(drop=True)
+                logger.info(
+                    f"[NOVELTY] {pre_nov} -> {len(data)} candidates "
+                    f"(dropped {pre_nov - len(data)} already-submitted / "
+                    f"near-duplicate) | {time.time() - t_nov:.1f}s"
+                )
+                if data.empty:
+                    logger.warning(
+                        "[Solution] All candidates were non-novel; "
+                        "raising mutation to escape the exhausted region"
+                    )
+                    params.mutation_prob = min(0.95, params.mutation_prob * 1.5)
+                    await asyncio.sleep(2)
+                    continue
+
             # optional CPU neighborhood seeds (overlap with scoring)
             cpu_futures = []
             if (
@@ -1133,6 +1184,25 @@ async def find_solution(state: Dict[str, Any]) -> None:
                 data.to_dict("records"),
                 iteration=iteration,
                 batch_size=BOLTZ_BATCH_SIZE,
+            )
+
+            # Round scoring is done. Confirm anything that cleared the
+            # threshold with extra draws and keep the mean, before it reaches
+            # the pool, the surrogate or the DPEX populations.
+            await rescore.confirm_high_scorers(
+                boltz=state.get("boltz_wrapper"),
+                config=config,
+                scored=scored_molecules,
+                threshold=CONFIRM_SCORE_THRESHOLD,
+                extra_rounds=CONFIRM_EXTRA_ROUNDS,
+                batch_size=BOLTZ_BATCH_SIZE,
+                db_path=SCORE_RESULTS_DB,
+                rxn_id=RXN_ID,
+                round_no=iteration,
+                target_key=TARGET_KEY,
+                target_label=TARGET_LABEL,
+                source="dpex_dja",
+                logger=logger,
             )
 
             scored_df = pd.DataFrame(

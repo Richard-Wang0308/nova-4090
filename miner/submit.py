@@ -69,9 +69,11 @@ POLL_INTERVAL = 6            # Seconds between block polls
 # Keep large enough for num_molecules × wallet count greedy selection.
 AVAILABILITY_CANDIDATE_POOL = 1000
 
-# Keep in sync with tools/check.py and validator
-# config['max_similarity_to_historical'] when that exists.
-MAX_SIMILARITY_TO_HISTORICAL = 0.9
+# Fallback only — overwritten from config/config.yaml right after the imports
+# below (load_config is not importable this early in the file). Never edit this
+# by hand: hardcoding 0.9 here while config said 0.7 is what let molecules the
+# validator rejects reach the submission set.
+MAX_SIMILARITY_TO_HISTORICAL = 0.7
 
 # Retries for the GitHub batch-commit flow (re-fetches branch head + retries
 # the whole blob->tree->commit->ref-update sequence on conflict).
@@ -83,6 +85,14 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
 from config.config_loader import load_config
+
+try:
+    MAX_SIMILARITY_TO_HISTORICAL = float(
+        load_config()["max_similarity_to_historical"]
+    )
+except Exception as _e:
+    print(f"[submit] could not read max_similarity_to_historical from config "
+          f"({_e}); using {MAX_SIMILARITY_TO_HISTORICAL}")
 from utils import (
     get_challenge_params_from_blockhash,
     get_historical_submissions,

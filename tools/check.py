@@ -16,11 +16,20 @@ from utils.molecules import molecule_unique_for_protein_hf, get_brenk_matches
 # TODO: adjust import path to match where this helper actually lives
 from utils import get_historical_submissions
 
-# TODO: Set your target protein here
-TARGET_PROTEIN = "P40261"  # Replace with actual target protein
+# Read both from config rather than hardcoding them. Keeping this in sync by
+# hand is what let MAX_SIMILARITY_TO_HISTORICAL sit at 0.9 while config said
+# 0.7, marking molecules available=TRUE that the validator would reject.
+from config.config_loader import load_config as _load_config
 
-# TODO: Keep this in sync with validator config['max_similarity_to_historical']
-MAX_SIMILARITY_TO_HISTORICAL = 0.9
+try:
+    _cfg = _load_config()
+    TARGET_PROTEIN = _cfg["small_molecule_target"][0]
+    MAX_SIMILARITY_TO_HISTORICAL = float(_cfg["max_similarity_to_historical"])
+except Exception as _e:  # keep the tool usable if config is unreadable
+    TARGET_PROTEIN = "P40261"
+    MAX_SIMILARITY_TO_HISTORICAL = 0.7
+    print(f"[check] could not read config ({_e}); "
+          f"falling back to {TARGET_PROTEIN} / {MAX_SIMILARITY_TO_HISTORICAL}")
 
 
 def scored_molecules_table_exists(cursor: sqlite3.Cursor) -> bool:

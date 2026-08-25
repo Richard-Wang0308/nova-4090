@@ -1,6 +1,12 @@
 .env
 timelock/
-boltz/boltz_tmp_files/inputs/*.yaml
+# Boltz scratch workspaces. The old rule only covered inputs/*.yaml, which
+# left ~11M of outputs and the per-process iso_<pid>/ confirmation workspaces
+# committable — including directories a live searcher is writing to.
+boltz/boltz_tmp_files/
+
+# Archive fingerprint cache — regenerated from HuggingFace on demand.
+data/novelty_cache/
 __pycache__/
 *.pyc
 *.pyo

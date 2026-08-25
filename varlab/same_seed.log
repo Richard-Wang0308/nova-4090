@@ -1,0 +1,97 @@
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterHierarchyMatcher> already registered; second conversion method ignored.
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterCatalogEntry> already registered; second conversion method ignored.
+Seed set to 68
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 5 inputs with 1 threads.
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  4.32it/s] 40%|████      | 2/5 [00:00<00:00,  3.97it/s] 60%|██████    | 3/5 [00:00<00:00,  3.98it/s] 80%|████████  | 4/5 [00:01<00:00,  3.84it/s]100%|██████████| 5/5 [00:01<00:00,  3.79it/s]100%|██████████| 5/5 [00:01<00:00,  3.87it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:76: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+Running structure prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:06<00:27,  0.15it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:13<00:20,  0.15it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:20<00:13,  0.15it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:26<00:06,  0.15it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:32<00:00,  0.15it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:32<00:00,  0.15it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:03<00:14,  0.27it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:08<00:12,  0.24it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:14<00:09,  0.20it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:21<00:05,  0.18it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:28<00:00,  0.18it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:28<00:00,  0.18it/s]
+pass 1 done in 86.2s
+Seed set to 68
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 5 inputs with 1 threads.
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:01,  2.40it/s] 40%|████      | 2/5 [00:00<00:01,  2.96it/s] 60%|██████    | 3/5 [00:00<00:00,  3.31it/s] 80%|████████  | 4/5 [00:01<00:00,  3.52it/s]100%|██████████| 5/5 [00:01<00:00,  3.68it/s]100%|██████████| 5/5 [00:01<00:00,  3.41it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:06<00:24,  0.16it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:12<00:19,  0.16it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:19<00:12,  0.15it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:25<00:06,  0.16it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:29<00:00,  0.17it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:29<00:00,  0.17it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:06<00:25,  0.16it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:12<00:19,  0.16it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:19<00:12,  0.16it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:25<00:06,  0.15it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:32<00:00,  0.16it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:32<00:00,  0.16it/s]
+pass 2 done in 85.1s
+Seed set to 68
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 5 inputs with 1 threads.
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  4.64it/s] 40%|████      | 2/5 [00:00<00:00,  4.00it/s] 60%|██████    | 3/5 [00:00<00:00,  3.84it/s] 80%|████████  | 4/5 [00:01<00:00,  3.81it/s]100%|██████████| 5/5 [00:01<00:00,  3.84it/s]100%|██████████| 5/5 [00:01<00:00,  3.89it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:04<00:16,  0.24it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:08<00:12,  0.24it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:13<00:08,  0.23it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:19<00:04,  0.20it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:26<00:00,  0.19it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:26<00:00,  0.19it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 5 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/5 [00:00<?, ?it/s]Predicting DataLoader 0:  20%|██        | 1/5 [00:06<00:25,  0.15it/s]Predicting DataLoader 0:  40%|████      | 2/5 [00:13<00:19,  0.15it/s]Predicting DataLoader 0:  60%|██████    | 3/5 [00:19<00:13,  0.15it/s]Predicting DataLoader 0:  80%|████████  | 4/5 [00:26<00:06,  0.15it/s]Predicting DataLoader 0: 100%|██████████| 5/5 [00:29<00:00,  0.17it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 5/5 [00:29<00:00,  0.17it/s]
+pass 3 done in 79.2s
+
+=== SAME seed 68, SAME batch, 3 passes ===
+molecule                         pass1       pass2       pass3    max diff
+rxn:2:150258:137856           0.140786    0.139811    0.142281    0.002470
+rxn:2:160183:137856           0.146793    0.141241    0.141286    0.005552
+rxn:2:149894:137856           0.129054    0.131787    0.130814    0.002733
+rxn:2:69935:124690            0.118632    0.112284    0.108438    0.010194
+rxn:2:71886:173019            0.135139    0.137484    0.135901    0.002345
+
+max spread across all molecules: 0.01019393
+VERDICT: varies by up to 0.010194 - averaging is meaningful

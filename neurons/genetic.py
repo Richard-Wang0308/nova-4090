@@ -58,6 +58,8 @@ from molecules_base import generate_inchikey
 from combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 
 import score_store
+import novelty
+import rescore
 
 BOLTZ_AVAILABLE = False
 BoltzWrapper = None
@@ -78,9 +80,32 @@ BOLTZ_BUDGET             = 1500    # hard cap while surrogate is not trained
 SURROGATE_KEEP_RATIO     = 0.2   # keep top 20% once surrogate is trained
 SURROGATE_MIN_TRAIN_SIZE = 4000   # min samples before surrogate activates
 
-# Reject candidates whose Tanimoto similarity to any historical submission
-# for the target protein reaches this value (mirrors multi_submit_reaction.py).
-MAX_SIMILARITY_TO_HISTORICAL = 0.9
+# Validator threshold, NOT a local preference: a molecule is only submittable
+# when max Tanimoto to the archive is < config['max_similarity_to_historical'].
+# This was hardcoded to 0.9 while the validator enforces 0.7, so everything
+# mined in the 0.7-0.9 band was unsubmittable. # Bind at import time so a caller that imports this module as a library gets
+# the same value as one that runs main(). Never edit the literal by hand — it
+# is a fallback for an unreadable config, nothing else.
+try:
+    from config.config_loader import load_config as _load_cfg
+    MAX_SIMILARITY_TO_HISTORICAL = float(
+        _load_cfg()["max_similarity_to_historical"]
+    )
+except Exception as _e:
+    MAX_SIMILARITY_TO_HISTORICAL = 0.7
+    print(f"[novelty] could not read max_similarity_to_historical from config "
+          f"({_e}); using {MAX_SIMILARITY_TO_HISTORICAL}")
+
+# After each round, molecules above this score are re-scored
+# CONFIRM_EXTRA_ROUNDS more times and their score becomes the mean of all draws.
+# One Boltz draw is noisy (measured: same molecule, same seed, up to 9% apart),
+# so a lone high draw is exactly what fails to reproduce at the validator.
+CONFIRM_SCORE_THRESHOLD = 0.1
+CONFIRM_EXTRA_ROUNDS = 2
+
+# Tag written into the score DB `source` column.
+SOURCE_TAG = "genetic"
+
 
 # ── Genetic operator constants (crossover + mutation) ─────────────────────
 # Probability that a freshly created crossover offspring also gets ONE of its
@@ -2371,6 +2396,26 @@ async def run_generation_and_scoring_loop(state: Dict[str, Any]) -> None:
                             f"[{source}] [{generation_method}]"
                         )
 
+            # Round scoring is done. Confirm everything above the threshold
+            # with extra draws and keep the mean, before these scores reach the
+            # surrogate or the top pool.
+            if all_scored_molecules:
+                await rescore.confirm_high_scorers(
+                    boltz=state.get('boltz_wrapper'),
+                    config=config,
+                    scored=all_scored_molecules,
+                    threshold=CONFIRM_SCORE_THRESHOLD,
+                    extra_rounds=CONFIRM_EXTRA_ROUNDS,
+                    batch_size=batch_size,
+                    db_path=SCORE_RESULTS_DB,
+                    rxn_id=RXN_ID,
+                    round_no=round_number,
+                    target_key=TARGET_KEY,
+                    target_label=TARGET_LABEL,
+                    source=SOURCE_TAG,
+                    logger=logger,
+                )
+
             if all_scored_molecules:
                 logger.info(f"📊 Round {round_number} calculated scores ({len(all_scored_molecules)} molecules):")
                 for mol in sorted(
@@ -2471,8 +2516,11 @@ async def main():
 
     # Tag rows with the same target identity orchestrator.py uses, so the
     # shared score DB stays target-safe across both writers.
-    global TARGET_KEY, TARGET_LABEL
+    global TARGET_KEY, TARGET_LABEL, MAX_SIMILARITY_TO_HISTORICAL
     TARGET_KEY, TARGET_LABEL = score_store.target_identity(config)
+    # Track the validator's novelty threshold rather than a local guess.
+    MAX_SIMILARITY_TO_HISTORICAL = novelty.config_threshold(config)
+    logger.info(f"max_similarity_to_historical = {MAX_SIMILARITY_TO_HISTORICAL} (from config)")
     logger.info(f"✅ target={TARGET_LABEL} | target_key={TARGET_KEY[:12]}")
 
     logger.info(f"Target protein: {state['current_challenge_targets'][0]}")

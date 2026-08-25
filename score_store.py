@@ -91,14 +91,17 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(molecule_name) DO UPDATE SET
     score=excluded.score,
     available=excluded.available,
-    iteration=excluded.iteration,
+    -- COALESCE so a writer that passes round_no=None (e.g. a backfill that is
+    -- only correcting scores) leaves the molecule's original round/iteration
+    -- intact instead of stamping it with a meaningless one.
+    iteration=COALESCE(excluded.iteration, scored_molecules.iteration),
     target_key=excluded.target_key,
     target_label=excluded.target_label,
     rxn_id=excluded.rxn_id,
     smiles=excluded.smiles,
     inchikey=excluded.inchikey,
     source=excluded.source,
-    round=excluded.round,
+    round=COALESCE(excluded.round, scored_molecules.round),
     scored_at=CURRENT_TIMESTAMP
 """
 
@@ -321,7 +324,7 @@ def write_scores_to_db(
     db_path: str,
     records: Sequence[Dict[str, Any]],
     rxn_id: Optional[int] = None,
-    round_no: int = 0,
+    round_no: Optional[int] = 0,
     target_key: Optional[str] = None,
     target_label: Optional[str] = None,
     source: str = "search",
@@ -333,7 +336,9 @@ def write_scores_to_db(
     ``smiles`` is taken from the record when present and otherwise rebuilt from
     the name, so the column is never left NULL for orchestrator to backfill.
     Per-record ``source`` / ``generation_method`` overrides the ``source``
-    argument. Returns the number of rows written.
+    argument. Pass ``round_no=None`` to leave an existing row's round/iteration
+    untouched -- for writers that are only correcting a score. Returns the
+    number of rows written.
     """
     if not records:
         return 0
@@ -361,13 +366,14 @@ def write_scores_to_db(
         row_rxn = rxn_id if rxn_id is not None else parse_rxn_id(name)
         row_source = str(r.get("source") or r.get("generation_method") or source)
 
+        stamp = None if round_no is None else int(round_no)
         rows.append(
             (
-                name, score, True, int(round_no),
+                name, score, True, stamp,
                 target_key, target_label, row_rxn,
                 smiles, r.get("inchikey") or inchikey(smiles),
                 row_source,
-                int(round_no),
+                stamp,
             )
         )
 
@@ -528,3 +534,530 @@ def count_scored(db_path: str, rxn_id: Optional[int] = None) -> int:
             return int(conn.execute(query, params).fetchone()[0])
     except sqlite3.Error:
         return 0
+
+
+# =============================================================================
+# Replicate scoring / variance tracking
+#
+# A Boltz score is a *draw*, not a fixed property of a molecule: boltz.predict
+# calls seed_everything(seed) once and then consumes the RNG sequentially as
+# records stream through the dataloader (input files are picked up with
+# glob("*")). A molecule's noise therefore depends on the seed AND on which
+# other molecules share its run and in what order. Validators score a
+# different pool, so they draw different noise for the same molecule.
+#
+# Consequence: picking the top-20 out of a large pool scored once each selects
+# the molecules with the luckiest draws (winner's curse), and those regress to
+# the mean when the validator re-draws. The cure is to average several
+# independent draws per molecule and rank on the estimate, not on one draw.
+# =============================================================================
+
+REPLICATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS molecule_replicates (
+    molecule_name TEXT NOT NULL,
+    seed          INTEGER NOT NULL,
+    -- Confirmation re-scores at one fixed seed, so the seed alone cannot key
+    -- separate draws; draw_idx does. Variance tooling that varies the seed
+    -- simply leaves this at 0.
+    draw_idx      INTEGER NOT NULL DEFAULT 0,
+    score         REAL,
+    affinity_probability_binary  REAL,
+    affinity_pred_value          REAL,
+    affinity_probability_binary1 REAL,
+    affinity_probability_binary2 REAL,
+    affinity_pred_value1         REAL,
+    affinity_pred_value2         REAL,
+    confidence_score REAL,
+    ligand_iptm      REAL,
+    complex_plddt    REAL,
+    iptm             REAL,
+    ptm              REAL,
+    scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (molecule_name, seed, draw_idx)
+)
+"""
+
+# Consensus columns added to scored_molecules. `score` keeps holding whatever
+# submit.py should rank on; `score_single` preserves the original one-shot draw.
+CONSENSUS_COLUMNS: Dict[str, str] = {
+    "score_single": "REAL",   # original single-draw score, never overwritten
+    "mu": "REAL",             # mean over replicates
+    "sigma": "REAL",          # std over replicates (population spread of a draw)
+    "sem": "REAL",            # standard error of the mean
+    "n_reps": "INTEGER",      # replicate count
+    "lcb": "REAL",            # mu - lambda*sigma, the risk-adjusted rank key
+    "ens_disagree": "REAL",   # |head1 - head2| ensemble disagreement (free proxy)
+    "ligand_iptm": "REAL",    # pose confidence (free proxy)
+    "confidence_score": "REAL",
+    # TRUE once the molecule has TOTAL_DRAWS confirmation draws on record, so
+    # later rounds skip it instead of paying to re-score it forever.
+    "rescored": "BOOLEAN DEFAULT FALSE",
+}
+
+_REPLICATE_UPSERT_SQL = """
+INSERT INTO molecule_replicates
+(molecule_name, seed, draw_idx, score,
+ affinity_probability_binary, affinity_pred_value,
+ affinity_probability_binary1, affinity_probability_binary2,
+ affinity_pred_value1, affinity_pred_value2,
+ confidence_score, ligand_iptm, complex_plddt, iptm, ptm)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(molecule_name, seed, draw_idx) DO UPDATE SET
+    score=excluded.score,
+    affinity_probability_binary=excluded.affinity_probability_binary,
+    affinity_pred_value=excluded.affinity_pred_value,
+    affinity_probability_binary1=excluded.affinity_probability_binary1,
+    affinity_probability_binary2=excluded.affinity_probability_binary2,
+    affinity_pred_value1=excluded.affinity_pred_value1,
+    affinity_pred_value2=excluded.affinity_pred_value2,
+    confidence_score=excluded.confidence_score,
+    ligand_iptm=excluded.ligand_iptm,
+    complex_plddt=excluded.complex_plddt,
+    iptm=excluded.iptm,
+    ptm=excluded.ptm,
+    scored_at=CURRENT_TIMESTAMP
+"""
+
+_COMPONENT_FIELDS = [
+    "affinity_probability_binary", "affinity_pred_value",
+    "affinity_probability_binary1", "affinity_probability_binary2",
+    "affinity_pred_value1", "affinity_pred_value2",
+    "confidence_score", "ligand_iptm", "complex_plddt", "iptm", "ptm",
+]
+
+
+def _migrate_replicates_add_draw_idx(conn: sqlite3.Connection) -> None:
+    """
+    Older DBs keyed molecule_replicates on (molecule_name, seed). SQLite cannot
+    ALTER a primary key, so rebuild the table and carry existing rows over as
+    draw_idx 0. No-op when the table is already current or absent.
+    """
+    cur = conn.cursor()
+    exists = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='molecule_replicates'"
+    ).fetchone()
+    if not exists:
+        return
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(molecule_replicates)").fetchall()}
+    if "draw_idx" in cols:
+        return
+    log.info("Migrating molecule_replicates to key (molecule_name, seed, draw_idx)")
+    cur.execute("ALTER TABLE molecule_replicates RENAME TO molecule_replicates_old")
+    cur.execute(REPLICATE_TABLE_SQL)
+    carried = sorted(cols & {
+        "molecule_name", "seed", "score", "scored_at", *_COMPONENT_FIELDS
+    })
+    collist = ", ".join(carried)
+    cur.execute(
+        f"INSERT INTO molecule_replicates ({collist}, draw_idx) "
+        f"SELECT {collist}, 0 FROM molecule_replicates_old"
+    )
+    cur.execute("DROP TABLE molecule_replicates_old")
+    conn.commit()
+
+
+def init_variance_tables(db_path: str) -> None:
+    """Add the replicate table and consensus columns (idempotent)."""
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(REPLICATE_TABLE_SQL)
+        _migrate_replicates_add_draw_idx(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rep_name "
+            "ON molecule_replicates(molecule_name)"
+        )
+        cur.execute(BASE_TABLE_SQL)
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(scored_molecules)").fetchall()}
+        for name, sqltype in CONSENSUS_COLUMNS.items():
+            if name not in cols:
+                cur.execute(f"ALTER TABLE scored_molecules ADD COLUMN {name} {sqltype}")
+        conn.commit()
+
+
+def _f(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+        return v if np.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def record_replicates(
+    db_path: str,
+    rows: Sequence[Dict[str, Any]],
+) -> int:
+    """
+    Persist one draw per (molecule, seed).
+
+    Each row: {'name', 'seed', 'score', optional 'draw_idx', **components}. Components come
+    straight from BoltzWrapper.per_molecule_components, which every miner
+    currently computes and then throws away.
+    """
+    if not rows:
+        return 0
+    payload = []
+    for r in rows:
+        name, seed = r.get("name"), r.get("seed")
+        if not name or seed is None:
+            continue
+        payload.append(
+            (name, int(seed), int(r.get("draw_idx", 0) or 0), _f(r.get("score")))
+            + tuple(_f(r.get(f)) for f in _COMPONENT_FIELDS)
+        )
+    if not payload:
+        return 0
+    try:
+        with connect(db_path) as conn:
+            conn.executemany(_REPLICATE_UPSERT_SQL, payload)
+            conn.commit()
+    except sqlite3.Error as e:
+        log.error("Error recording replicates in %s: %s", db_path, e)
+        return 0
+    return len(payload)
+
+
+def replicate_stats(db_path: str, rxn_id: Optional[int] = None) -> pd.DataFrame:
+    """Per-molecule replicate summary: n_reps, mu, sigma, sem, ens_disagree."""
+    empty = pd.DataFrame(
+        columns=["name", "n_reps", "mu", "sigma", "sem", "ens_disagree",
+                 "ligand_iptm", "confidence_score"]
+    )
+    if not os.path.exists(db_path):
+        return empty
+
+    query = """
+        SELECT molecule_name, score,
+               affinity_probability_binary1, affinity_probability_binary2,
+               ligand_iptm, confidence_score
+        FROM molecule_replicates
+        WHERE score IS NOT NULL
+    """
+    params: Tuple[Any, ...] = ()
+    if rxn_id is not None:
+        query += " AND molecule_name LIKE ?"
+        params = (f"rxn:{rxn_id}:%",)
+    try:
+        with connect(db_path) as conn:
+            rows = conn.execute(query, params).fetchall()
+    except sqlite3.Error as e:
+        log.error("replicate_stats: %s", e)
+        return empty
+    if not rows:
+        return empty
+
+    df = pd.DataFrame(
+        rows,
+        columns=["name", "score", "apb1", "apb2", "ligand_iptm", "confidence_score"],
+    )
+    df["ens_disagree"] = (df["apb1"] - df["apb2"]).abs()
+
+    grp = df.groupby("name")
+    out = pd.DataFrame({
+        "n_reps": grp["score"].size(),
+        "mu": grp["score"].mean(),
+        # ddof=1 needs >=2 draws; a single draw has no measurable spread yet.
+        "sigma": grp["score"].std(ddof=1),
+        "ens_disagree": grp["ens_disagree"].mean(),
+        "ligand_iptm": grp["ligand_iptm"].mean(),
+        "confidence_score": grp["confidence_score"].mean(),
+    }).reset_index()
+    out["sigma"] = out["sigma"].fillna(0.0)
+    out["sem"] = out["sigma"] / np.sqrt(out["n_reps"].clip(lower=1))
+    return out[["name", "n_reps", "mu", "sigma", "sem", "ens_disagree",
+                "ligand_iptm", "confidence_score"]]
+
+
+def commit_consensus(
+    db_path: str,
+    stats: pd.DataFrame,
+    lambda_sigma: float = 0.5,
+    rank_on: str = "lcb",
+) -> int:
+    """
+    Write consensus stats onto scored_molecules and re-point `score` at the
+    replicate-based estimate.
+
+    `score_single` keeps the original one-shot draw the first time a molecule
+    is committed, so nothing is lost. Because submit.py ranks on `score`, this
+    is what makes the robust set the one that actually gets submitted, with no
+    change to submit.py itself.
+
+    rank_on: 'lcb' (mu - lambda*sigma), 'mu', or 'none' (stats only).
+    """
+    if stats is None or stats.empty:
+        return 0
+
+    updates = []
+    for r in stats.itertuples(index=False):
+        mu = _f(r.mu)
+        if mu is None:
+            continue
+        sigma = _f(r.sigma) or 0.0
+        sem = _f(r.sem) or 0.0
+        lcb = mu - lambda_sigma * sigma
+        if rank_on == "lcb":
+            new_score = lcb
+        elif rank_on == "mu":
+            new_score = mu
+        else:
+            new_score = None
+        updates.append((
+            mu, sigma, sem, int(r.n_reps), lcb,
+            _f(r.ens_disagree), _f(r.ligand_iptm), _f(r.confidence_score),
+            new_score, new_score, r.name,
+        ))
+
+    if not updates:
+        return 0
+
+    try:
+        with connect(db_path) as conn:
+            conn.executemany(
+                """
+                UPDATE scored_molecules
+                SET score_single = COALESCE(score_single, score),
+                    mu = ?, sigma = ?, sem = ?, n_reps = ?, lcb = ?,
+                    ens_disagree = ?, ligand_iptm = ?, confidence_score = ?,
+                    score = CASE WHEN ? IS NULL THEN score ELSE ? END
+                WHERE molecule_name = ?
+                """,
+                updates,
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        log.error("commit_consensus: %s", e)
+        return 0
+    return len(updates)
+
+
+def load_consensus(db_path: str, rxn_id: Optional[int] = None) -> pd.DataFrame:
+    """Scored molecules joined with their consensus columns."""
+    empty = pd.DataFrame(columns=[
+        "name", "smiles", "inchikey", "score", "score_single",
+        "mu", "sigma", "sem", "n_reps", "lcb", "ens_disagree",
+        "ligand_iptm", "confidence_score",
+    ])
+    if not os.path.exists(db_path):
+        return empty
+    query = """
+        SELECT molecule_name, smiles, inchikey, score, score_single,
+               mu, sigma, sem, n_reps, lcb, ens_disagree,
+               ligand_iptm, confidence_score
+        FROM scored_molecules
+    """
+    params: Tuple[Any, ...] = ()
+    if rxn_id is not None:
+        query += " WHERE molecule_name LIKE ?"
+        params = (f"rxn:{rxn_id}:%",)
+    query += " ORDER BY score DESC"
+    try:
+        with connect(db_path) as conn:
+            rows = conn.execute(query, params).fetchall()
+    except sqlite3.Error as e:
+        log.error("load_consensus: %s", e)
+        return empty
+    return pd.DataFrame(rows, columns=list(empty.columns))
+
+
+def deflate_unmeasured(
+    db_path: str,
+    delta: float,
+    rxn_id: Optional[int] = None,
+) -> int:
+    """
+    Put un-replicated molecules on the same scale as replicated ones.
+
+    Committing consensus replaces `score` with mu (or mu - lambda*sigma) for the
+    molecules you re-scored. Those numbers are honest, and therefore LOWER than
+    a lucky single draw. If the rest of the pool keeps its inflated one-shot
+    scores, the molecules you never checked float to the top and submit.py picks
+    exactly the unverified ones — the opposite of what you wanted.
+
+    So subtract the expected winner's-curse premium `delta` from every molecule
+    that has no replicates. It is a uniform shift, so their order is untouched,
+    but they stop out-ranking measured molecules for free.
+
+    Idempotent: always recomputed from `score_single`, never from the current
+    `score`, so running it repeatedly does not compound.
+    """
+    if delta <= 0:
+        return 0
+    where = "(n_reps IS NULL OR n_reps < 1)"
+    params: List[Any] = [float(delta)]
+    if rxn_id is not None:
+        where += " AND molecule_name LIKE ?"
+        params.append(f"rxn:{rxn_id}:%")
+    try:
+        with connect(db_path) as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE scored_molecules
+                SET score_single = COALESCE(score_single, score),
+                    score = COALESCE(score_single, score) - ?
+                WHERE {where}
+                """,
+                params,
+            )
+            conn.commit()
+            return cur.rowcount
+    except sqlite3.Error as e:
+        log.error("deflate_unmeasured: %s", e)
+        return 0
+
+
+def revert_consensus(db_path: str, rxn_id: Optional[int] = None) -> int:
+    """
+    Undo commit_consensus/deflate_unmeasured: restore `score` from `score_single`.
+
+    Consensus rewrites the column submit.py ranks on, so there has to be a way
+    back. The replicate measurements themselves are kept — only the ranking key
+    is restored.
+    """
+    where = "score_single IS NOT NULL"
+    params: List[Any] = []
+    if rxn_id is not None:
+        where += " AND molecule_name LIKE ?"
+        params.append(f"rxn:{rxn_id}:%")
+    try:
+        with connect(db_path) as conn:
+            cur = conn.execute(
+                f"UPDATE scored_molecules SET score = score_single WHERE {where}",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount
+    except sqlite3.Error as e:
+        log.error("revert_consensus: %s", e)
+        return 0
+
+
+def existing_seeds(db_path: str, rxn_id: Optional[int] = None) -> Set[int]:
+    """
+    Seeds already recorded in molecule_replicates.
+
+    Replicates are keyed (molecule_name, seed), so re-running with the same
+    seed sequence overwrites the previous draws instead of adding to them --
+    you would believe you had 2K replicates and actually have K. Callers use
+    this to pick fresh seeds when topping a molecule up.
+    """
+    if not os.path.exists(db_path):
+        return set()
+    query = "SELECT DISTINCT seed FROM molecule_replicates"
+    params: Tuple[Any, ...] = ()
+    if rxn_id is not None:
+        query += " WHERE molecule_name LIKE ?"
+        params = (f"rxn:{rxn_id}:%",)
+    try:
+        with connect(db_path) as conn:
+            return {int(r[0]) for r in conn.execute(query, params).fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+# =============================================================================
+# Confirmation bookkeeping (rescored flag)
+# =============================================================================
+
+def replicate_counts(
+    db_path: str,
+    names: Optional[Iterable[str]] = None,
+) -> Dict[str, int]:
+    """How many draws each molecule already has on record."""
+    if not os.path.exists(db_path):
+        return {}
+    out: Dict[str, int] = {}
+    try:
+        with connect(db_path) as conn:
+            if names is None:
+                rows = conn.execute(
+                    "SELECT molecule_name, COUNT(*) FROM molecule_replicates "
+                    "WHERE score IS NOT NULL GROUP BY molecule_name"
+                ).fetchall()
+                out.update({n: int(c) for n, c in rows})
+            else:
+                todo = list(names)
+                for i in range(0, len(todo), 900):
+                    chunk = todo[i:i + 900]
+                    ph = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT molecule_name, COUNT(*) FROM molecule_replicates "
+                        f"WHERE score IS NOT NULL AND molecule_name IN ({ph}) "
+                        f"GROUP BY molecule_name",
+                        chunk,
+                    ).fetchall()
+                    out.update({n: int(c) for n, c in rows})
+    except sqlite3.Error as e:
+        log.debug("replicate_counts: %s", e)
+    return out
+
+
+def load_rescored_names(db_path: str, rxn_id: Optional[int] = None) -> Set[str]:
+    """Molecules already confirmed — never re-score these again."""
+    if not os.path.exists(db_path):
+        return set()
+    query = "SELECT molecule_name FROM scored_molecules WHERE rescored=TRUE"
+    params: Tuple[Any, ...] = ()
+    if rxn_id is not None:
+        query += " AND molecule_name LIKE ?"
+        params = (f"rxn:{rxn_id}:%",)
+    try:
+        with connect(db_path) as conn:
+            return {r[0] for r in conn.execute(query, params).fetchall()}
+    except sqlite3.Error as e:
+        log.debug("load_rescored_names: %s", e)
+        return set()
+
+
+def mark_rescored(db_path: str, names: Iterable[str]) -> int:
+    """Flag molecules as fully confirmed so future rounds skip them."""
+    todo = list(names)
+    if not todo:
+        return 0
+    try:
+        with connect(db_path) as conn:
+            conn.executemany(
+                "UPDATE scored_molecules SET rescored=TRUE WHERE molecule_name=?",
+                [(n,) for n in todo],
+            )
+            conn.commit()
+        return len(todo)
+    except sqlite3.Error as e:
+        log.error("mark_rescored: %s", e)
+        return 0
+
+
+def replicate_scores(
+    db_path: str,
+    names: Iterable[str],
+) -> Dict[str, List[float]]:
+    """
+    Every recorded draw per molecule, oldest first.
+
+    Confirmation seeds each molecule's running list from this so a run that was
+    interrupted resumes correctly: it tops up to the target count instead of
+    starting over, and the average covers every draw on record rather than just
+    the ones taken in the current round.
+    """
+    todo = list(names)
+    out: Dict[str, List[float]] = {}
+    if not todo or not os.path.exists(db_path):
+        return out
+    try:
+        with connect(db_path) as conn:
+            for i in range(0, len(todo), 900):
+                chunk = todo[i:i + 900]
+                ph = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT molecule_name, score FROM molecule_replicates "
+                    f"WHERE score IS NOT NULL AND molecule_name IN ({ph}) "
+                    f"ORDER BY molecule_name, seed, draw_idx",
+                    chunk,
+                ).fetchall()
+                for n, v in rows:
+                    out.setdefault(n, []).append(float(v))
+    except sqlite3.Error as e:
+        log.debug("replicate_scores: %s", e)
+    return out

@@ -1,0 +1,150 @@
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterHierarchyMatcher> already registered; second conversion method ignored.
+<frozen importlib._bootstrap>:488: RuntimeWarning: to-Python converter for boost::shared_ptr<RDKit::FilterCatalogEntry> already registered; second conversion method ignored.
+2026-08-25 15:31:11 | INFO     | DB=/tmp/claude-0/-root-workspace/83822b6c-1a5f-4de5-85d2-21c403772531/scratchpad/bf2.sqlite
+  available & score > 0.1 & not yet confirmed : 6
+  already confirmed in a previous run                      : 0
+2026-08-25 15:31:11 | INFO     |   plan: 6 molecules x 2 extra draws = 12 predictions (~0.1 h at 16s each), in chunks of 2
+2026-08-25 15:31:11 | INFO     |   score range: 0.11655 .. 0.11528
+2026-08-25 15:31:11 | INFO     | [CONFIRM] 2/2 molecules scored > 0.1; topping each up to 3 draws at seed 68, in batches of 10
+Seed set to 68
+[isolation] Boltz workspace -> /root/workspace/nova-4090/boltz/boltz_tmp_files/iso_backfill1686805
+[isolation] Boltz workspace -> /root/workspace/nova-4090/boltz/boltz_tmp_files/iso_confirm1686805
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 2 inputs with 1 threads.
+  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:00<00:00,  3.64it/s]100%|██████████| 2/2 [00:00<00:00,  3.92it/s]100%|██████████| 2/2 [00:00<00:00,  3.87it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/logger_connector/logger_connector.py:76: Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `pytorch_lightning` package, due to potential conflicts with other packages in the ML ecosystem. For this reason, `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard` or `tensorboardX` packages are found. Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default
+Running structure prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:06<00:06,  0.14it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:13<00:00,  0.15it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:13<00:00,  0.15it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:03<00:03,  0.27it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:07<00:00,  0.27it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:07<00:00,  0.27it/s]2026-08-25 15:31:58 | INFO     |    [confirm seed=68] batch 1/1: 2/2 scored | 47.8s
+2026-08-25 15:31:58 | INFO     | [CONFIRM] pass 1/2: 2/2 re-scored | 47.8s
+Seed set to 68
+
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 2 inputs with 1 threads.
+  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:00<00:00,  3.78it/s]100%|██████████| 2/2 [00:00<00:00,  4.05it/s]100%|██████████| 2/2 [00:00<00:00,  4.00it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:06<00:06,  0.16it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:06<00:06,  0.16it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]2026-08-25 15:32:48 | INFO     |    [confirm seed=68] batch 1/1: 2/2 scored | 49.9s
+2026-08-25 15:32:48 | INFO     | [CONFIRM] pass 2/2: 2/2 re-scored | 49.9s
+2026-08-25 15:32:48 | INFO     | [CONFIRM] averaged 2 molecules over 97.7s | mean change -0.004225 | 2/2 came down | 2 marked rescored
+2026-08-25 15:32:48 | INFO     |    rxn:2:146579:74704           0.116554 -> 0.116532  (-0.000021, n=3)
+2026-08-25 15:32:48 | INFO     |    rxn:2:128157:145209          0.116073 -> 0.107644  (-0.008429, n=3)
+2026-08-25 15:32:48 | INFO     | [1/3] chunk done in 98s | 2/6 molecules | elapsed 2m | eta 3m
+2026-08-25 15:32:48 | INFO     | [CONFIRM] 2/2 molecules scored > 0.1; topping each up to 3 draws at seed 68, in batches of 10
+Seed set to 68
+
+[isolation] Boltz workspace -> /root/workspace/nova-4090/boltz/boltz_tmp_files/iso_confirm1686805
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 2 inputs with 1 threads.
+  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:00<00:00,  4.04it/s]100%|██████████| 2/2 [00:00<00:00,  4.02it/s]100%|██████████| 2/2 [00:00<00:00,  4.03it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:04<00:04,  0.22it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:11<00:00,  0.18it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:11<00:00,  0.18it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:06<00:06,  0.16it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.15it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.15it/s]2026-08-25 15:33:34 | INFO     |    [confirm seed=68] batch 1/1: 2/2 scored | 45.6s
+2026-08-25 15:33:34 | INFO     | [CONFIRM] pass 1/2: 2/2 re-scored | 45.6s
+Seed set to 68
+
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 2 inputs with 1 threads.
+  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:00<00:00,  3.82it/s]100%|██████████| 2/2 [00:00<00:00,  3.88it/s]100%|██████████| 2/2 [00:00<00:00,  3.87it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/root/workspace/nova-4090/.venv/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:433: The 'predict_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=31` in the `DataLoader` to improve performance.
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:04<00:04,  0.23it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:08<00:00,  0.23it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:08<00:00,  0.23it/s]
+
+Predicting property: affinity
+
+Checking input data for affinity.
+Running affinity prediction for 2 inputs.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Predicting: |          | 0/? [00:00<?, ?it/s]Predicting: |          | 0/? [00:00<?, ?it/s]Predicting DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]Predicting DataLoader 0:  50%|█████     | 1/2 [00:06<00:06,  0.16it/s]Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]Number of failed examples: 0
+Predicting DataLoader 0: 100%|██████████| 2/2 [00:12<00:00,  0.16it/s]2026-08-25 15:34:22 | INFO     |    [confirm seed=68] batch 1/1: 2/2 scored | 47.9s
+2026-08-25 15:34:22 | INFO     | [CONFIRM] pass 2/2: 2/2 re-scored | 47.9s
+2026-08-25 15:34:22 | INFO     | [CONFIRM] averaged 2 molecules over 93.5s | mean change -0.002634 | 2/2 came down | 2 marked rescored
+2026-08-25 15:34:22 | INFO     |    rxn:2:123429:161792          0.115747 -> 0.114808  (-0.000939, n=3)
+2026-08-25 15:34:22 | INFO     |    rxn:2:70967:167920           0.115940 -> 0.111612  (-0.004329, n=3)
+2026-08-25 15:34:22 | INFO     | [2/3] chunk done in 93s | 4/6 molecules | elapsed 3m | eta 2m
+2026-08-25 15:34:22 | INFO     | [CONFIRM] 2/2 molecules scored > 0.1; topping each up to 3 draws at seed 68, in batches of 10
+Seed set to 68
+
+[isolation] Boltz workspace -> /root/workspace/nova-4090/boltz/boltz_tmp_files/iso_confirm1686805
+------------------------------------------------
+target: P40261, clip_interval: (2, 260)
+response status code: 200
+Checking input data.
+Processing 2 inputs with 1 threads.
+  0%|          | 0/2 [00:00<?, ?it/s] 50%|█████     | 1/2 [00:00<00:00,  3.56it/s]100%|██████████| 2/2 [00:00<00:00,  3.77it/s]100%|██████████| 2/2 [00:00<00:00,  3.73it/s]
+Using bfloat16 Automatic Mixed Precision (AMP)
+💡 Tip: For seamless cloud uploads and versioning, try installing [litmodels](https://pypi.org/project/litmodels/) to enable LitModelCheckpoint, which syncs automatically with the Lightning model registry.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+Running structure prediction for 2 inputs.

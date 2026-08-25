@@ -1,10 +1,26 @@
 import yaml
 import os
 
+# Repo root, so a relative config path resolves the same way no matter which
+# directory a searcher/tool was launched from.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
 def load_config(path: str = "config/config.yaml"):
     """
     Loads configuration from a YAML file.
+
+    A relative `path` is tried against the current directory first (previous
+    behaviour), then against the repo root. Without the fallback, running a
+    searcher from anywhere but the repo root raised FileNotFoundError, and
+    every caller that reads a threshold from config quietly dropped to its
+    hardcoded fallback instead.
     """
+    if not os.path.isabs(path) and not os.path.exists(path):
+        candidate = os.path.join(_REPO_ROOT, path)
+        if os.path.exists(candidate):
+            path = candidate
+
     if not os.path.exists(path):
         raise FileNotFoundError(f"Could not find config file at '{path}'")
 
