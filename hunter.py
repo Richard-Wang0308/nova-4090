@@ -87,10 +87,14 @@ try:
 except Exception:
     BoltzWrapper = None
 
+# logging.basicConfig defaults to stderr, which under pm2 sends every line to
+# <name>-error.log and leaves out.log holding nothing but Boltz's own prints.
+# Search progress is normal output, not errors — send it to stdout.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 log = logging.getLogger("hunter")
 
@@ -788,7 +792,17 @@ def cap_confirm_threshold(threshold: float, scores: Sequence[float],
 
 async def boltz_score(boltz, config: Dict[str, Any],
                       molecules: List[Dict[str, Any]],
-                      batch_size: int) -> List[Dict[str, Any]]:
+                      batch_size: int,
+                      mark_at: float = float("inf"),
+                      on_batch=None) -> List[Dict[str, Any]]:
+    """
+    Score `molecules` in batches.
+
+    `on_batch(records)` is called with each batch's results as soon as they are
+    read, before the next batch starts. hunter uses it to persist every batch
+    immediately: a round is ~43 minutes of GPU at budget 150, and writing only
+    at the end means a crash at molecule 149 throws away all 149 scores.
+    """
     if not molecules:
         return []
     targets = config["small_molecule_target"]
@@ -819,7 +833,7 @@ async def boltz_score(boltz, config: Dict[str, Any],
         if len(scores) != len(batch):
             fmap = getattr(boltz, "final_boltz_scores", {}).get(0, {}).get(targets[0], {})
             scores = [fmap.get(x["smiles"], -math.inf) for x in batch]
-        vals = []
+        vals, named, batch_scored_records = [], [], []
         for rec, sc in zip(batch, scores):
             try:
                 sc = float(sc)
@@ -830,7 +844,9 @@ async def boltz_score(boltz, config: Dict[str, Any],
             r = dict(rec)
             r["boltz_score"] = sc
             out.append(r)
+            batch_scored_records.append(r)
             vals.append(sc)
+            named.append((rec["name"], sc, rec.get("smiles", "")))
         if vals:
             log.info(
                 "  boltz %d-%d: %d/%d | best %.6f mean %.6f | %.0fs",
@@ -838,6 +854,31 @@ async def boltz_score(boltz, config: Dict[str, Any],
                 len(vals), len(batch), max(vals), float(np.mean(vals)),
                 time.time() - t0,
             )
+            # Every molecule, in the order Boltz saw it. Without this the log
+            # only shows batch aggregates, so a single strong hit is invisible
+            # until the round ends.
+            for i, (nm, sc, smi) in enumerate(named, start=start + 1):
+                mark = " <<<" if sc >= mark_at else ""
+                log.info("    [%4d/%d] %.6f  ha=%2d  %s%s",
+                         i, len(molecules), sc, heavy_atoms(smi) if smi else 0,
+                         nm, mark)
+
+        if on_batch is not None and batch_scored_records:
+            try:
+                on_batch(batch_scored_records)
+            except Exception as e:
+                log.error("could not persist batch: %s", e, exc_info=True)
+
+        # BoltzWrapper defines _cleanup_files() but never calls it, so inputs and
+        # prediction outputs accumulate for the life of the process — 65 MB in
+        # ten minutes on a live run, and Boltz rescans every stale input on each
+        # batch. Scores are already extracted from score_dict by this point, so
+        # the workspace can be dropped. Safe only because the directory is
+        # isolated per process; clear_boltz_workspace refuses a shared one.
+        try:
+            rescore.clear_boltz_workspace(boltz)
+        except Exception as e:
+            log.debug("could not clear boltz workspace: %s", e)
     return out
 
 
@@ -1133,11 +1174,28 @@ async def main() -> None:
             return
 
         payload = chosen[["name", "smiles", "source"]].to_dict("records")
-        new = await boltz_score(boltz, config, payload, args.batch_size)
-        if new:
-            score_store.write_scores_to_db(
-                db_path, new, rxn_id=rxn_id, round_no=round_no,
-                target_key=target_key, target_label=target_label, source="hunter")
+        # Mark anything that clears the current submittable frontier as it is
+        # scored, so a hit is visible in the log the moment it appears.
+        frontier = (float(before["score"].iloc[-1]) if len(before) >= 20
+                    else args.confirm_floor)
+        # Persist as each batch lands rather than at round end. A round is ~43
+        # minutes of GPU at budget 150; writing only at the end means a crash or
+        # a pm2 restart at molecule 149 discards all 149 scores. The DB also
+        # then reflects progress live instead of jumping once per round.
+        written = 0
+
+        def persist(records):
+            nonlocal written
+            n = score_store.write_scores_to_db(
+                db_path, records, rxn_id=rxn_id, round_no=round_no,
+                target_key=target_key, target_label=target_label,
+                source="hunter")
+            written += len(records)
+            log.info("    -> wrote %d molecules to DB (%d this round)",
+                     len(records), written)
+
+        new = await boltz_score(boltz, config, payload, args.batch_size,
+                                mark_at=frontier, on_batch=persist)
 
         if new and not args.no_confirm:
             # `before` is this round's pre-scoring submittable top-20, so the
@@ -1151,13 +1209,49 @@ async def main() -> None:
                      round_no, conf_thr, why, n_conf, len(new),
                      n_conf * args.confirm_extra_rounds)
             if n_conf:
-                await rescore.confirm_high_scorers(
+                pre = {r["name"]: float(r["boltz_score"]) for r in new}
+                averaged = await rescore.confirm_high_scorers(
                     boltz=boltz, config=config, scored=new,
                     threshold=conf_thr,
                     extra_rounds=args.confirm_extra_rounds,
                     batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
                     round_no=round_no, target_key=target_key,
                     target_label=target_label, source="hunter", logger=log)
+                if averaged:
+                    draws = score_store.replicate_scores(db_path, list(averaged))
+                    log.info("[round %d] confirmed %d molecules "
+                             "(score is now the mean of %d draws at seed 68):",
+                             round_no, len(averaged),
+                             args.confirm_extra_rounds + 1)
+                    log.info("    %-30s%10s%11s%10s   draws",
+                             "molecule", "single", "confirmed", "delta")
+                    for nm in sorted(averaged, key=lambda k: -averaged[k]):
+                        d = draws.get(nm, [])
+                        was = pre.get(nm, float("nan"))
+                        log.info("    %-30s%10.6f%11.6f%+10.6f   %s",
+                                 nm, was, averaged[nm], averaged[nm] - was,
+                                 " ".join(f"{x:.6f}" for x in d))
+                    moves = np.array([averaged[n] - pre.get(n, averaged[n])
+                                      for n in averaged], dtype=float)
+                    log.info("    net %+.6f | %d of %d came down | "
+                             "still above frontier %.5f: %d",
+                             float(moves.sum()), int((moves < 0).sum()),
+                             len(moves), frontier,
+                             sum(1 for v in averaged.values() if v > frontier))
+                    # Reflect the confirmed values in this round's own summary,
+                    # otherwise `best=` below reports a single draw that has
+                    # already been superseded.
+                    for r in new:
+                        if r["name"] in averaged:
+                            r["boltz_score"] = averaged[r["name"]]
+
+        if new:
+            # Batch writes already stored the single-draw values; re-write so any
+            # score replaced by a confirmation mean lands in the DB too.
+            score_store.write_scores_to_db(
+                db_path, new, rxn_id=rxn_id, round_no=round_no,
+                target_key=target_key, target_label=target_label,
+                source="hunter")
 
         after = submittable_top20(db_path, rxn_id, guard, target, config)
         export_top20(after, rxn_id, target)
