@@ -18,3 +18,5 @@ __pycache__/
 *.pyzwz
 *.pyzwzw
 .venv/
+# Searcher logs.
+logs/

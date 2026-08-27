@@ -175,11 +175,20 @@ class NoveltyGuard:
         # Pickle the fingerprint objects directly. ToBinary() paired with
         # CreateFromBinaryText() does NOT round-trip: a 2048-bit vector comes
         # back as 192 bits, which only surfaces as an error much later.
+        # Atomic: several searchers run concurrently and share this cache file.
+        # A partially-written pickle read by another process is unrecoverable,
+        # so write to a private temp file and rename it into place.
+        tmp = f"{self._cache_path}.{os.getpid()}.tmp"
         try:
-            with open(self._cache_path, "wb") as f:
+            with open(tmp, "wb") as f:
                 pickle.dump({"version": self.CACHE_VERSION, "fps": self.fps}, f)
+            os.replace(tmp, self._cache_path)
         except Exception as e:
             print(f"[novelty] could not write cache: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def refresh(self, allow_cache: bool = False) -> int:
         """Re-pull the archive. Call this periodically inside long runs."""

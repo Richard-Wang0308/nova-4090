@@ -1,0 +1,1055 @@
+#!/usr/bin/env python3
+"""
+hunter.py — SN68 NOVA small-molecule searcher, rebuilt around what was actually
+measured to be wrong with orchestrator.py.
+
+See PHASE1_FINDINGS.md and PHASE2_3_DESIGN.md for the measurements. In short:
+
+  * The orchestrator's component prior collapsed to 1.56x max/uniform, i.e.
+    random sampling over a 2e9 molecule space. That is the dominant defect —
+    a surrogate can only rank what generation proposes.
+  * Its RF/ET surrogate ranks well (spearman 0.83, 54x enrichment on `ei`) but
+    cannot extrapolate: mu.max()=0.091 against a frontier of 0.121, so
+    z=(mu-frontier)/sigma was negative for 100% of candidates.
+  * Its composite `acq` was the *worst* of the four available rules
+    (16.4x vs 23.7x for plain `ei`).
+  * 40% of every Boltz round went to a sigma slice (mean score 0.066) and a
+    quality-blind diversity slice, versus 0.103 for the exploit slice.
+  * `neurons/crossover.py`, doing nothing but elite-anchored generation, gets a
+    6.91% hit rate above 0.11 against the orchestrator's 0.82% — 8.4x better
+    Boltz efficiency.
+
+WHAT THIS DOES DIFFERENTLY
+
+  1. Generation is anchored on evidence, not sampled near-uniformly. Component
+     priors are RANK-based (scale-invariant, cannot collapse) over a UCB built
+     on each component's BEST observed score, blended from the local DB and the
+     field's validator-scored submissions in data/rxn{N}.csv.
+  2. Ranking is on the surrogate's posterior mean, never a composite. Measured
+     across all five reactions (3 trials each, held-out pool, budget 150): mu
+     beats the orchestrator's `acq` on every reaction (rxn1 +91%, rxn2 +96%,
+     rxn5 +60%) and beats expected improvement on four of five.
+  3. Budget goes 90% exploit / 10% diversity insurance. No sigma slice.
+  4. Heavy atoms are treated as what they are — the score's denominator.
+  5. Novelty is enforced before Boltz, and the top-20 is tracked in
+     *submittable* terms, which is the only number that pays.
+
+Run it exactly like the orchestrator:
+
+    python3 hunter.py --rxn-id 2
+    python3 hunter.py --rxn-id 2 --boltz-budget 180 --candidate-pool 40000
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import math
+import os
+import random
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import pandas as pd
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+for _p in (BASE_DIR, os.path.join(BASE_DIR, "miner"), os.path.join(BASE_DIR, "boltz")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Descriptors, Lipinski, rdFingerprintGenerator
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+
+from config.config_loader import load_config
+from molecules import MoleculeManager
+from utils.molecules import get_brenk_matches
+
+import field_prior
+import novelty
+import rescore
+import score_store
+
+try:
+    from tools import SynthonLibrary
+except Exception:
+    SynthonLibrary = None
+
+try:
+    from utils.molecules import compute_maccs_entropy
+except Exception:
+    compute_maccs_entropy = None
+
+try:
+    from boltz_wrapper import BoltzWrapper
+except Exception:
+    BoltzWrapper = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("hunter")
+
+MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
+OUTPUT_DIR = os.path.join(BASE_DIR, "top20_v2")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Confirmation of a round's winners — see rescore.py. One Boltz draw of the same
+# molecule at the same seed moves by up to 0.010, and acquisition deliberately
+# selects the top of that noise, so a round's leaders are the values least
+# likely to reproduce on the validator.
+CONFIRM_SCORE_THRESHOLD = 0.1
+CONFIRM_EXTRA_ROUNDS = 2
+
+# The score is (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
+# Heavy atoms are the denominator, so size is a direct penalty, not a neutral
+# property. Measured on rxn1: molecules above 40 heavy atoms have a mean score of
+# 0.026 and have never once produced a hit above 0.12, yet consumed 7.3% of the
+# Boltz budget because orchestrator.py sets max_heavy_atoms = 10**9.
+HEAVY_HARD_MAX = 42
+HEAVY_SWEET_LO, HEAVY_SWEET_HI = 26, 36
+
+_mol: Dict[str, Any] = {}
+_fp: Dict[str, np.ndarray] = {}
+_bv: Dict[str, Any] = {}
+_desc: Dict[str, np.ndarray] = {}
+_heavy: Dict[str, int] = {}
+
+
+def mol_of(smiles: str):
+    if smiles not in _mol:
+        try:
+            _mol[smiles] = Chem.MolFromSmiles(smiles)
+        except Exception:
+            _mol[smiles] = None
+    return _mol[smiles]
+
+
+def heavy_atoms(smiles: str) -> int:
+    v = _heavy.get(smiles)
+    if v is None:
+        m = mol_of(smiles)
+        v = m.GetNumHeavyAtoms() if m is not None else 0
+        _heavy[smiles] = v
+    return v
+
+
+def fp_array(smiles: str) -> Optional[np.ndarray]:
+    c = _fp.get(smiles)
+    if c is not None:
+        return c
+    m = mol_of(smiles)
+    if m is None:
+        return None
+    arr = np.zeros(2048, dtype=np.float32)
+    arr[list(MORGAN.GetFingerprint(m).GetOnBits())] = 1.0
+    _fp[smiles] = arr
+    return arr
+
+
+def fp_bv(smiles: str):
+    c = _bv.get(smiles)
+    if c is not None:
+        return c
+    m = mol_of(smiles)
+    if m is None:
+        return None
+    b = MORGAN.GetFingerprint(m)
+    _bv[smiles] = b
+    return b
+
+
+def descriptors(smiles: str) -> Optional[np.ndarray]:
+    c = _desc.get(smiles)
+    if c is not None:
+        return c
+    m = mol_of(smiles)
+    if m is None:
+        return None
+    ha = float(m.GetNumHeavyAtoms())
+    na = max(1.0, float(m.GetNumAtoms()))
+    arom = float(sum(1 for a in m.GetAtoms() if a.GetIsAromatic()))
+    v = np.array(
+        [
+            Descriptors.MolWt(m) / 1000.0,
+            Descriptors.MolLogP(m) / 10.0,
+            Descriptors.TPSA(m) / 250.0,
+            float(Lipinski.NumHDonors(m)) / 10.0,
+            float(Lipinski.NumHAcceptors(m)) / 20.0,
+            float(Descriptors.NumRotatableBonds(m)) / 15.0,
+            ha / 100.0,
+            float(Lipinski.RingCount(m)) / 10.0,
+            arom / na,
+            float(Lipinski.FractionCSP3(m)),
+            # 1/heavy_atoms enters the score directly; give the model the term.
+            1.0 / max(ha, 1.0) * 10.0,
+        ],
+        dtype=np.float32,
+    )
+    _desc[smiles] = v
+    return v
+
+
+def brenk_ok(smiles: str) -> bool:
+    m = mol_of(smiles)
+    return m is not None and not get_brenk_matches(m)
+
+
+def inchikey(smiles: str) -> str:
+    m = mol_of(smiles)
+    try:
+        return Chem.MolToInchiKey(m) if m is not None else ""
+    except Exception:
+        return ""
+
+
+def make_name(rxn: int, a: int, b: int, c: Optional[int]) -> str:
+    return f"rxn:{rxn}:{a}:{b}" if c is None else f"rxn:{rxn}:{a}:{b}:{c}"
+
+
+parse_components = field_prior.parse_components
+
+
+# =============================================================================
+# Surrogate
+# =============================================================================
+
+class Surrogate:
+    """
+    RandomForest + ExtraTrees over Morgan bits, physchem descriptors and
+    component priors.
+
+    Kept from the orchestrator because it measurably works — spearman 0.83 on
+    held-out data, 54x enrichment at the top 150. What changed is how its output
+    is used. Trees average leaf values and cannot predict above their training
+    mean, so comparing `mu` to the current #20 produced a negative z for 100% of
+    candidates and turned expected improvement into noise. The reference here is
+    a high quantile of the model's *own* predictions, which is attainable by
+    construction, so EI keeps its intended meaning.
+    """
+
+    def __init__(self, prior: field_prior.FieldPrior, min_train: int,
+                 train_cap: int, seed: int):
+        self.prior = prior
+        self.min_train = min_train
+        self.train_cap = train_cap
+        self.seed = seed
+        self.trained = False
+        self.reference = 0.0
+        self.true_frontier = -math.inf
+        self.rf = RandomForestRegressor(
+            n_estimators=200, max_depth=20, min_samples_leaf=2,
+            max_features="sqrt", n_jobs=-1, random_state=seed,
+            bootstrap=True, max_samples=0.85,
+        )
+        self.et = ExtraTreesRegressor(
+            n_estimators=200, max_depth=22, min_samples_leaf=2,
+            max_features="sqrt", n_jobs=-1, random_state=seed + 1,
+            bootstrap=True, max_samples=0.85,
+        )
+
+    def _features(self, name: str, smiles: str) -> Optional[np.ndarray]:
+        fp = fp_array(smiles)
+        d = descriptors(smiles)
+        if fp is None or d is None:
+            return None
+        a, b, c = parse_components(name)
+        ca = self.prior.component_scores("A")
+        cb = self.prior.component_scores("B")
+        cc = self.prior.component_scores("C")
+        # C is carried explicitly: rxn3 and rxn5 are three-component, and on
+        # rxn3 the C position holds 18,330 of the reaction's building blocks —
+        # more than A and B combined. Dropping it would blind the model to most
+        # of that reaction's variation.
+        comp = np.array(
+            [
+                ca.get(a, 0.0) if a is not None else 0.0,
+                cb.get(b, 0.0) if b is not None else 0.0,
+                cc.get(c, 0.0) if c is not None else 0.0,
+                self.prior.pair_bonus(a, b),
+                self.prior.hi_components("A").get(a, 0.0) if a is not None else 0.0,
+                self.prior.hi_components("B").get(b, 0.0) if b is not None else 0.0,
+                self.prior.hi_components("C").get(c, 0.0) if c is not None else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        return np.concatenate([fp, d, comp]).astype(np.float32)
+
+    def _subset(self, df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) <= self.train_cap:
+            return df.copy()
+        df = df.sort_values("score", ascending=False).reset_index(drop=True)
+        n_elite = int(self.train_cap * 0.45)
+        n_recent = int(self.train_cap * 0.25)
+        n_rand = self.train_cap - n_elite - n_recent
+        elite = df.head(n_elite)
+        recent = df.sort_values("round", ascending=False).head(n_recent)
+        rest = df.drop(index=set(elite.index) | set(recent.index), errors="ignore")
+        rand = rest.sample(n=min(n_rand, len(rest)), random_state=self.seed)
+        return pd.concat([elite, recent, rand], ignore_index=True) \
+                 .drop_duplicates("name").head(self.train_cap)
+
+    def fit(self, df: pd.DataFrame) -> None:
+        self.trained = False
+        if df.empty or len(df) < self.min_train:
+            return
+        s = df["score"].astype(float).sort_values(ascending=False)
+        self.true_frontier = float(s.iloc[19]) if len(s) >= 20 else float(s.iloc[-1])
+
+        train = self._subset(df)
+        p80 = float(np.quantile(train["score"], 0.80))
+        p95 = float(np.quantile(train["score"], 0.95))
+        X, y, w = [], [], []
+        for _, row in train.iterrows():
+            f = self._features(row["name"], row["smiles"])
+            if f is None:
+                continue
+            sc = float(row["score"])
+            X.append(f)
+            y.append(sc)
+            # Upweight the tail the model has to get right, but not so hard that
+            # it distorts the ranking that actually drives selection.
+            w.append(4.0 if sc >= self.true_frontier else
+                     2.5 if sc >= p95 else
+                     1.5 if sc >= p80 else 1.0)
+        if len(X) < self.min_train:
+            return
+        t0 = time.time()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=float)
+        w = np.asarray(w, dtype=float)
+        self.rf.fit(X, y, sample_weight=w)
+        self.et.fit(X, y, sample_weight=w)
+        self.trained = True
+        log.info(
+            "surrogate: trained on %d | true #20=%.6f | %.1fs",
+            len(X), self.true_frontier, time.time() - t0,
+        )
+
+    def predict(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        if not self.trained:
+            out = df.copy()
+            out["mu"] = 0.0
+            out["sigma"] = 1.0
+            out["ei"] = 0.0
+            return out
+
+        feats, keep = [], []
+        for idx, row in df.iterrows():
+            f = self._features(row["name"], row["smiles"])
+            if f is not None:
+                feats.append(f)
+                keep.append(idx)
+        if not feats:
+            return df.head(0)
+
+        X = np.asarray(feats, dtype=np.float32)
+        trees = np.vstack(
+            [np.vstack([t.predict(X) for t in self.rf.estimators_]),
+             np.vstack([t.predict(X) for t in self.et.estimators_])]
+        )
+        mu = trees.mean(axis=0)
+        sigma = trees.std(axis=0) + 1e-9
+
+        # An ATTAINABLE reference. Using the real #20 here is what broke the
+        # orchestrator: the model's ceiling sits below it, so every z was
+        # negative and EI degenerated into an uncertainty term.
+        self.reference = float(np.quantile(mu, 0.995))
+
+        z = (mu - self.reference) / sigma
+        Phi = 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
+        phi = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+        out = df.loc[keep].copy()
+        out["mu"] = mu
+        out["sigma"] = sigma
+        out["ei"] = (mu - self.reference) * Phi + sigma * phi
+        return out
+
+
+# =============================================================================
+# Generation
+# =============================================================================
+
+class Generator:
+    """
+    Evidence-anchored candidate generation.
+
+    The orchestrator drew A and B almost independently from a near-uniform
+    prior. Over 83,307 x 24,165 that is a lottery. Here every strategy commits
+    to something already known to work and varies the rest:
+
+      elite    — both positions drawn from the prior's elite set
+      anchor   — one position pinned to an elite component, the other explored
+      pair     — a field-observed high-scoring (A,B) pair, one side mutated
+      neighbour— synthon-similar variations of my own best molecules
+      broad    — prior-weighted sampling, the only strategy that can leave the
+                 region entirely; kept deliberately as insurance against the
+                 prior being wrong
+    """
+
+    def __init__(self, rxn_id: int, manager: MoleculeManager,
+                 prior: field_prior.FieldPrior, args):
+        self.rxn_id = rxn_id
+        self.manager = manager
+        self.sub = manager.for_rxn(rxn_id)
+        self.prior = prior
+        self.args = args
+        self.rng = np.random.default_rng(args.seed)
+        self.py = random.Random(args.seed)
+        self.three = bool(self.sub.is_three_component)
+        self.ids = {
+            "A": np.asarray(self.sub.moles_A_id, dtype=np.int64),
+            "B": np.asarray(self.sub.moles_B_id, dtype=np.int64),
+            "C": np.asarray(self.sub.moles_C_id, dtype=np.int64)
+                 if self.three else np.asarray([], dtype=np.int64),
+        }
+        self._w: Dict[str, Optional[np.ndarray]] = {}
+        self._elite: Dict[str, np.ndarray] = {}
+        self.synthon = None
+        if SynthonLibrary is not None:
+            try:
+                self.synthon = SynthonLibrary(self.sub)
+            except Exception as e:
+                log.warning("synthon library unavailable: %s", e)
+
+    def refresh(self) -> None:
+        self._w.clear()
+        self._elite.clear()
+        for role in ("A", "B", "C"):
+            if len(self.ids[role]) == 0:
+                continue
+            self._w[role] = self.prior.rank_weights(
+                self.ids[role], role,
+                temperature=self.args.prior_temperature,
+                floor=self.args.prior_floor,
+            )
+            el = [c for c in self.prior.elite(role, self.args.elite_quantile)
+                  if c in set(self.ids[role].tolist())]
+            self._elite[role] = np.asarray(el, dtype=np.int64)
+        log.info(
+            "generator: elite pools A=%d B=%d%s | prior sharpness A=%.1fx B=%.1fx%s",
+            len(self._elite.get("A", [])), len(self._elite.get("B", [])),
+            f" C={len(self._elite.get('C', []))}" if self.three else "",
+            self._sharpness("A"), self._sharpness("B"),
+            f" C={self._sharpness('C'):.1f}x" if self.three else "",
+        )
+
+    def _sharpness(self, role: str) -> float:
+        w = self._w.get(role)
+        return float(w.max() * len(w)) if w is not None else 1.0
+
+    def _draw(self, role: str, n: int) -> np.ndarray:
+        arr = self.ids[role]
+        if len(arr) == 0 or n <= 0:
+            return np.asarray([], dtype=np.int64)
+        return self.rng.choice(arr, size=n, replace=True, p=self._w.get(role))
+
+    def _draw_elite(self, role: str, n: int) -> np.ndarray:
+        el = self._elite.get(role)
+        if el is None or len(el) == 0:
+            return self._draw(role, n)
+        return self.rng.choice(el, size=n, replace=True)
+
+    def _emit(self, A, B, C) -> List[str]:
+        if self.three and C is not None:
+            return [make_name(self.rxn_id, int(a), int(b), int(c))
+                    for a, b, c in zip(A, B, C)]
+        return [make_name(self.rxn_id, int(a), int(b), None) for a, b in zip(A, B)]
+
+    def elite_pairs(self, n: int) -> List[str]:
+        if n <= 0:
+            return []
+        return self._emit(self._draw_elite("A", n), self._draw_elite("B", n),
+                          self._draw_elite("C", n) if self.three else None)
+
+    def anchored(self, n: int) -> List[str]:
+        """
+        Pin one position to an elite component and explore the others.
+
+        The anchored position rotates across every position present, including
+        C. Pinning C to its elite set on every draw would be crippling for a
+        three-component reaction — rxn3 has 18,330 C components against an
+        elite pool of ~283, so C carries most of that reaction's degrees of
+        freedom and has to be explorable.
+        """
+        if n <= 0:
+            return []
+        roles = ["A", "B"] + (["C"] if self.three else [])
+        per = n // len(roles)
+        out: List[str] = []
+        for i, pin in enumerate(roles):
+            k = per if i < len(roles) - 1 else n - per * (len(roles) - 1)
+            if k <= 0:
+                continue
+            draw = {r: (self._draw_elite(r, k) if r == pin else self._draw(r, k))
+                    for r in roles}
+            out += self._emit(draw["A"], draw["B"],
+                              draw.get("C") if self.three else None)
+        return out
+
+    def pair_mutants(self, n: int) -> List[str]:
+        """Take (A,B) pairs the field scored highly and mutate one side."""
+        if n <= 0 or not self.prior.pairs:
+            return []
+        best = sorted(self.prior.pairs.items(), key=lambda kv: -kv[1][2])
+        best = best[: max(200, self.args.pair_anchors)]
+        if not best:
+            return []
+        okA = set(self.ids["A"].tolist())
+        okB = set(self.ids["B"].tolist())
+        best = [(p, v) for p, v in best if p[0] in okA and p[1] in okB]
+        if not best:
+            return []
+        mutA = self._draw("A", n)
+        mutB = self._draw("B", n)
+        # Field pairs are (A,B) only, so C is drawn fresh — half elite, half
+        # explored, rather than pinned. On rxn3 C is the largest position and
+        # pinning it would collapse the strategy to a few hundred molecules.
+        eliC = self._draw_elite("C", n) if self.three else None
+        expC = self._draw("C", n) if self.three else None
+        out = []
+        for i in range(n):
+            (a, b), _ = best[self.py.randrange(len(best))]
+            if self.py.random() < 0.5:
+                a = int(mutA[i])
+            else:
+                b = int(mutB[i])
+            c = None
+            if self.three:
+                c = int(eliC[i]) if self.py.random() < 0.5 else int(expC[i])
+            out.append(make_name(self.rxn_id, int(a), int(b), c))
+        return out
+
+    def neighbours(self, scored: pd.DataFrame, n: int) -> List[str]:
+        if n <= 0 or self.synthon is None or scored.empty:
+            return []
+        seeds = scored.nlargest(min(self.args.elite_anchors, len(scored)),
+                                "score")["name"].tolist()
+        if not seeds:
+            return []
+        try:
+            out = self.synthon.generate_similar_molecules(
+                seeds,
+                n_per_base=max(2, int(math.ceil(n / len(seeds)))),
+                min_similarity=self.args.neighbour_min_sim,
+            )
+        except Exception as e:
+            log.warning("synthon neighbours failed: %s", e)
+            return []
+        if len(out) > n:
+            self.py.shuffle(out)
+            out = out[:n]
+        return out
+
+    def broad(self, n: int) -> List[str]:
+        if n <= 0:
+            return []
+        return self._emit(self._draw("A", n), self._draw("B", n),
+                          self._draw("C", n) if self.three else None)
+
+    def generate(self, scored: pd.DataFrame, seen: Set[str],
+                 n_total: int) -> pd.DataFrame:
+        t0 = time.time()
+        self.refresh()
+        warm = len(scored) >= self.args.min_train
+        mix = ({"elite": 0.30, "anchored": 0.25, "pair": 0.15,
+                "neighbour": 0.10, "broad": 0.20}
+               if warm else
+               {"elite": 0.25, "anchored": 0.20, "pair": 0.10,
+                "neighbour": 0.05, "broad": 0.40})
+
+        names: List[str] = []
+        for label, frac in mix.items():
+            k = int(n_total * frac)
+            t = time.time()
+            if label == "elite":
+                got = self.elite_pairs(k)
+            elif label == "anchored":
+                got = self.anchored(k)
+            elif label == "pair":
+                got = self.pair_mutants(k)
+            elif label == "neighbour":
+                got = self.neighbours(scored, k)
+            else:
+                got = self.broad(k)
+            log.info("  gen/%-10s %6d candidates | %.2fs", label, len(got),
+                     time.time() - t)
+            names += got
+
+        uniq, local = [], set()
+        for nm in names:
+            if nm in seen or nm in local:
+                continue
+            local.add(nm)
+            uniq.append(nm)
+        if not uniq:
+            return pd.DataFrame(columns=["name", "smiles"])
+
+        cfg = dict(self.manager.config) if hasattr(self.manager, "config") else {}
+        cfg = dict(_CONFIG)
+        cfg["allowed_reaction"] = f"rxn:{self.rxn_id}"
+        cfg["max_heavy_atoms"] = HEAVY_HARD_MAX
+        valid = self.manager.validate_molecules(cfg, pd.DataFrame({"name": uniq}))
+        if valid.empty:
+            return valid
+
+        n0 = len(valid)
+        valid = valid[valid["smiles"].map(brenk_ok)]
+        n1 = len(valid)
+        if valid.empty:
+            return valid
+        valid = valid[valid["smiles"].map(lambda s: heavy_atoms(s) <= HEAVY_HARD_MAX)]
+        valid["inchikey"] = valid["smiles"].map(inchikey)
+        valid = valid[valid["inchikey"] != ""].drop_duplicates("inchikey")
+        log.info(
+            "  gen/total   %6d proposed -> %d valid -> %d post-BRENK -> %d unique | %.1fs",
+            len(uniq), n0, n1, len(valid), time.time() - t0,
+        )
+        return valid.reset_index(drop=True)
+
+
+# =============================================================================
+# Selection
+# =============================================================================
+
+def size_multiplier(smiles: str) -> float:
+    """
+    Mild preference for the measured sweet spot. Deliberately gentle — the
+    surrogate already sees 1/heavy_atoms as a feature, and a hard preference
+    would forbid the large-but-excellent molecules that do exist.
+    """
+    h = heavy_atoms(smiles)
+    if HEAVY_SWEET_LO <= h <= HEAVY_SWEET_HI:
+        return 1.0
+    if h < HEAVY_SWEET_LO:
+        return 0.97
+    return max(0.80, 1.0 - 0.02 * (h - HEAVY_SWEET_HI))
+
+
+def select_batch(ranked: pd.DataFrame, budget: int,
+                 explore_frac: float, rng: np.random.Generator,
+                 key: str = "mu") -> pd.DataFrame:
+    """
+    90% by expected improvement, 10% diversity insurance.
+
+    The orchestrator spent 25% of every round on its most-uncertain candidates,
+    whose mean score was 0.066 against 0.103 for its exploit slice, plus 15% on
+    a diversity term that barely weighted quality. Uncertainty sampling is the
+    right move when the model is the bottleneck; here generation was, and the
+    model already ranks at 20-50x enrichment. The exploration that remains is
+    aimed at *archive* distance — being far from what other miners submit is
+    what earns, because the validator divides a score by the number of UIDs
+    submitting the same molecule. Structural novelty for its own sake does not.
+
+    The first version of this used 25%, and a held-out measurement showed that
+    was the same mistake in smaller form: going 0.25 -> 0.00 recovered 13 hits
+    above 0.11 on rxn5 and 5 on rxn2. It is not zero because the validator
+    requires MACCS entropy >= 0.1 across the submitted 20, and a pure-exploit
+    portfolio can fail that. Note a single-round offline test can see this
+    slice's cost but not its across-round benefit, so 0.10 is a deliberate
+    compromise rather than the measured optimum.
+    """
+    if ranked.empty:
+        return ranked
+    if len(ranked) <= budget:
+        return ranked.copy()
+
+    ranked = ranked.copy()
+    base = ranked[key] if key in ranked.columns else ranked["mu"]
+    # The size multiplier scales a positive quality estimate. Applying it to a
+    # value that can go negative would invert the preference for large
+    # molecules, so shift onto a non-negative footing first.
+    shifted = base - min(0.0, float(base.min()))
+    ranked["rank_adj"] = shifted * ranked["smiles"].map(size_multiplier)
+
+    n_exploit = int(round(budget * (1.0 - explore_frac)))
+    top = ranked.nlargest(n_exploit, "rank_adj")
+    picked = list(top.index)
+
+    rest = ranked.drop(index=picked, errors="ignore")
+    n_explore = budget - len(picked)
+    if n_explore > 0 and not rest.empty:
+        # Among candidates that are still plausibly good, prefer those least
+        # like what has already been picked this round.
+        floor = float(rest["mu"].quantile(0.70))
+        pool = rest[rest["mu"] >= floor]
+        if pool.empty:
+            pool = rest
+        pool = pool.sample(n=min(len(pool), max(1500, n_explore * 20)),
+                           random_state=int(rng.integers(1 << 31)))
+        chosen_fps = [fp_bv(s) for s in top["smiles"].head(200)]
+        chosen_fps = [f for f in chosen_fps if f is not None]
+        rows = []
+        for idx, row in pool.iterrows():
+            f = fp_bv(row["smiles"])
+            if f is None:
+                continue
+            sim = (max(DataStructs.BulkTanimotoSimilarity(f, chosen_fps))
+                   if chosen_fps else 0.0)
+            rows.append(((1.0 - sim) + 0.5 * float(row["mu"]) /
+                         max(abs(float(ranked["mu"].max())), 1e-9), idx))
+        rows.sort(reverse=True)
+        for _, idx in rows[:n_explore]:
+            picked.append(idx)
+
+    if len(picked) < budget:
+        for idx in ranked.nlargest(budget * 2, "rank_adj").index:
+            if idx not in picked:
+                picked.append(idx)
+            if len(picked) >= budget:
+                break
+    return ranked.loc[picked[:budget]].reset_index(drop=True)
+
+
+# =============================================================================
+# Boltz
+# =============================================================================
+
+async def boltz_score(boltz, config: Dict[str, Any],
+                      molecules: List[Dict[str, Any]],
+                      batch_size: int) -> List[Dict[str, Any]]:
+    if not molecules:
+        return []
+    targets = config["small_molecule_target"]
+    subnet = {
+        "small_molecule_target": targets,
+        "small_molecule_target_clip_interval":
+            config["small_molecule_target_clip_interval"],
+        "boltz_mode": config.get("boltz_mode", "max"),
+        "boltz_metric": config.get(
+            "boltz_metric",
+            ["affinity_probability_binary", "affinity_pred_value"]),
+        "combination_strategy": config.get(
+            "combination_strategy", "heavy_atom_normalization"),
+    }
+    out: List[Dict[str, Any]] = []
+    for start in range(0, len(molecules), batch_size):
+        batch = molecules[start:start + batch_size]
+        vm = {0: {"smiles": [x["smiles"] for x in batch],
+                  "names": [x["name"] for x in batch]}}
+        sd = {0: {"target_scores": [[]], "antitarget_scores": [[]],
+                  "entropy": None, "entropy_boltz": None,
+                  "block_submitted": None, "push_time": ""}}
+        t0 = time.time()
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: boltz.score_molecules(vm, sd, subnet))
+        got = sd.get(0, {}).get("molecule_scores", [])
+        scores = got[0] if got else []
+        if len(scores) != len(batch):
+            fmap = getattr(boltz, "final_boltz_scores", {}).get(0, {}).get(targets[0], {})
+            scores = [fmap.get(x["smiles"], -math.inf) for x in batch]
+        vals = []
+        for rec, sc in zip(batch, scores):
+            try:
+                sc = float(sc)
+            except Exception:
+                continue
+            if not np.isfinite(sc):
+                continue
+            r = dict(rec)
+            r["boltz_score"] = sc
+            out.append(r)
+            vals.append(sc)
+        if vals:
+            log.info(
+                "  boltz %d-%d: %d/%d | best %.6f mean %.6f | %.0fs",
+                start + 1, min(start + len(batch), len(molecules)),
+                len(vals), len(batch), max(vals), float(np.mean(vals)),
+                time.time() - t0,
+            )
+    return out
+
+
+# =============================================================================
+# Submittable top-20
+# =============================================================================
+
+def submittable_top20(db_path: str, rxn_id: int, guard: novelty.NoveltyGuard,
+                      target: str, config: Dict[str, Any],
+                      scan: int = 4000) -> pd.DataFrame:
+    """
+    The only number that pays.
+
+    orchestrator.py's `final_top20` walks the score-ordered DB but stops after
+    `max(100, 20*5)` rows. When most high scorers are already archived — which
+    is the normal state, since every molecule anyone submits enters the archive
+    — it runs out of rows before finding 20 submittable ones and reports a
+    top-20 that cannot actually be submitted. Scanning deeper is cheap and makes
+    the reported number honest.
+    """
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT molecule_name, smiles, score FROM scored_molecules "
+            "WHERE available=TRUE AND smiles IS NOT NULL AND smiles!='' "
+            "AND molecule_name LIKE ? ORDER BY score DESC LIMIT ?",
+            (f"rxn:{rxn_id}:%", scan),
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["name", "smiles", "score"])
+
+    n = int(config.get("num_molecules", 20))
+    keep, seen_ik = [], set()
+    for name, smiles, score in rows:
+        if len(keep) >= n:
+            break
+        ik = inchikey(smiles)
+        if not ik or ik in seen_ik:
+            continue
+        if not brenk_ok(smiles):
+            continue
+        if not novelty.is_unique(smiles, target):
+            continue
+        if guard.max_similarity_to_archive(smiles) >= guard.max_similarity:
+            continue
+        seen_ik.add(ik)
+        keep.append({"name": name, "smiles": smiles, "score": float(score)})
+    return pd.DataFrame(keep)
+
+
+def export_top20(df: pd.DataFrame, rxn_id: int, target: str) -> None:
+    if df.empty:
+        return
+    csv = os.path.join(OUTPUT_DIR, f"TOP20_rxn{rxn_id}_{target}.csv")
+    txt = os.path.join(OUTPUT_DIR, f"TOP20_rxn{rxn_id}_{target}.txt")
+    df.to_csv(csv, index=False)
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write(",".join(df["name"].tolist()))
+    log.info("=" * 74)
+    log.info("SUBMITTABLE TOP %d | sum=%.6f | #%d=%.6f",
+             len(df), float(df["score"].sum()), len(df),
+             float(df["score"].iloc[-1]))
+    for i, (_, r) in enumerate(df.iterrows(), 1):
+        log.info("  %02d  %.6f  %s", i, float(r["score"]), r["name"])
+    log.info("csv=%s", csv)
+    log.info("=" * 74)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+_CONFIG: Dict[str, Any] = {}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--rxn-id", type=int, required=True, choices=[1, 2, 3, 4, 5])
+    p.add_argument("--boltz-budget", type=int, default=150)
+    p.add_argument("--candidate-pool", type=int, default=30000)
+    p.add_argument("--batch-size", type=int, default=10)
+    p.add_argument("--min-train", type=int, default=500)
+    p.add_argument("--train-cap", type=int, default=30000)
+    p.add_argument("--elite-anchors", type=int, default=40)
+    p.add_argument("--pair-anchors", type=int, default=400)
+    p.add_argument("--neighbour-min-sim", type=float, default=0.35)
+    p.add_argument("--elite-quantile", type=float, default=0.90,
+                   help="component quality quantile that counts as elite")
+    p.add_argument("--prior-temperature", type=float, default=6.0,
+                   help="prior sharpness; ~T times uniform weight on the best "
+                        "component (orchestrator.py achieved 1.56)")
+    p.add_argument("--prior-floor", type=float, default=0.10,
+                   help="uniform mass kept so nothing is unreachable")
+    p.add_argument("--field-weight", type=float, default=0.5,
+                   help="blend between field CSV and local DB component stats; "
+                        "a field-only prior measured WORSE than random at the "
+                        "top of the ranking, so this stays at or below 0.5")
+    p.add_argument("--rank-key", choices=["mu", "ei"], default="mu",
+                   help="acquisition key. Measured over all 5 reactions x 3 "
+                        "trials: mu beats ei on 4 of 5 and beats the "
+                        "orchestrator's composite acq on all 5. EI degenerates "
+                        "here because the tree ensemble cannot predict above "
+                        "its training mean, so almost every candidate sits "
+                        "below any useful reference and the sigma term takes "
+                        "over")
+    p.add_argument("--explore-frac", type=float, default=0.10,
+                   help="fraction of the Boltz budget spent away from the top of "
+                        "the ranking. Measured cost of 0.25 on a held-out pool: "
+                        "13 hits >0.11 on rxn5, 5 on rxn2. Kept non-zero only "
+                        "because the validator requires MACCS entropy >= 0.1 "
+                        "across the submitted 20, so an all-exploit portfolio "
+                        "risks failing that check")
+    p.add_argument("--strict-pool-mult", type=int, default=6)
+    p.add_argument("--max-rounds", type=int, default=10 ** 9)
+    p.add_argument("--seed", type=int, default=68)
+    p.add_argument("--sleep", type=float, default=1.0)
+    p.add_argument("--no-confirm", action="store_true",
+                   help="skip the 3-draw confirmation of this round's winners")
+    p.add_argument("--dry-run", action="store_true",
+                   help="generate, rank and report — no Boltz, no DB writes")
+    return p.parse_args()
+
+
+async def main() -> None:
+    global _CONFIG
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    config = load_config()
+    _CONFIG = config
+    rxn_id = args.rxn_id
+    target = config["small_molecule_target"][0]
+    target_key, target_label = score_store.target_identity(config)
+    db_path = score_store.score_db_path(rxn_id)
+
+    cfg = dict(config)
+    cfg["allowed_reaction"] = f"rxn:{rxn_id}"
+    cfg["max_heavy_atoms"] = HEAVY_HARD_MAX
+    manager = MoleculeManager(config=cfg, db_path=DB_PATH)
+
+    if not args.dry_run:
+        score_store.init_score_results_db(db_path, rxn_id, target_key, target_label)
+        score_store.init_variance_tables(db_path)
+
+    prior = field_prior.FieldPrior(
+        rxn_id, db_path=db_path, field_weight=args.field_weight, logger=log)
+    log.info(prior.summary())
+
+    guard = novelty.NoveltyGuard(target, novelty.config_threshold(config))
+    surrogate = Surrogate(prior, args.min_train, args.train_cap, args.seed)
+    generator = Generator(rxn_id, manager, prior, args)
+    rng = np.random.default_rng(args.seed)
+
+    boltz = None
+    if not args.dry_run:
+        if BoltzWrapper is None:
+            raise SystemExit("BoltzWrapper unavailable — run from the nova-4090 root "
+                             "in the same environment miner/miner.py uses.")
+        boltz = BoltzWrapper()
+        # BoltzWrapper hardcodes boltz/boltz_tmp_files/{inputs,outputs} for every
+        # instance, and its _cleanup_files() deletes every *.yaml in that input
+        # directory plus the whole results tree. Two searchers sharing it will
+        # delete each other's inputs mid-prediction. Give this process its own
+        # workspace before anything is written.
+        try:
+            rescore.isolate_boltz_workspace(
+                boltz, tag=f"hunter{rxn_id}_{os.getpid()}")
+            log.info("boltz workspace: %s", boltz.input_dir)
+        except Exception as e:
+            raise SystemExit(
+                f"could not isolate a Boltz workspace ({e}). Refusing to run on "
+                f"the shared directory — concurrent searchers would corrupt each "
+                f"other's predictions.")
+
+    log.info("hunter | rxn=%d target=%s | A=%d B=%d%s",
+             rxn_id, target_label,
+             len(generator.ids["A"]), len(generator.ids["B"]),
+             f" C={len(generator.ids['C'])}" if generator.three else "")
+    log.info("similarity gate=%.2f (from config) | heavy atoms <= %d | db=%s",
+             guard.max_similarity, HEAVY_HARD_MAX, db_path)
+
+    for round_no in range(1, args.max_rounds + 1):
+        t_round = time.time()
+        scored = score_store.load_all_scored(db_path, rxn_id)
+        if not scored.empty:
+            scored = scored[np.isfinite(scored["score"])]
+        seen = set(scored["name"].tolist()) if not scored.empty else set()
+
+        surrogate.fit(scored)
+        if round_no == 1 or round_no % 5 == 0:
+            prior.__init__(rxn_id, db_path=db_path,
+                           field_weight=args.field_weight, logger=None)
+
+        before = submittable_top20(db_path, rxn_id, guard, target, config)
+        sum_before = float(before["score"].sum()) if len(before) else 0.0
+
+        raw = generator.generate(scored, seen, args.candidate_pool)
+        if raw.empty:
+            log.info("[round %d] nothing generated", round_no)
+            await asyncio.sleep(args.sleep)
+            continue
+
+        ranked = surrogate.predict(raw)
+        if ranked.empty:
+            await asyncio.sleep(args.sleep)
+            continue
+
+        # Novelty is expensive, so apply it to an acquisition-ordered shortlist
+        # rather than the whole pool — but apply it BEFORE Boltz, never after.
+        #
+        # Widen the shortlist until the budget is actually filled. A fixed
+        # shortlist silently under-fills whenever the archive is dense: on a
+        # live rxn1 round a budget of 40 came back with 21 molecules, wasting
+        # half the GPU slot for that round.
+        key = args.rank_key if surrogate.trained else "mu"
+        order = ranked.sort_values(key, ascending=False)
+        novel = ranked.head(0)
+        taken = 0
+        step = max(args.boltz_budget * args.strict_pool_mult, 400)
+        while taken < len(order) and len(novel) < args.boltz_budget:
+            chunk = order.iloc[taken:taken + step]
+            taken += step
+            if chunk.empty:
+                break
+            sims = guard.similarities(chunk["smiles"].tolist())
+            ok = chunk[sims < guard.max_similarity]
+            if not ok.empty:
+                ok = ok[ok["smiles"].map(lambda s: novelty.is_unique(s, target))]
+            if not ok.empty:
+                novel = pd.concat([novel, ok]) if len(novel) else ok
+        log.info("[round %d] pool=%d -> screened=%d -> submittable=%d (budget %d)",
+                 round_no, len(ranked), min(taken, len(order)), len(novel),
+                 args.boltz_budget)
+        if novel.empty:
+            await asyncio.sleep(args.sleep)
+            continue
+
+        chosen = select_batch(novel, args.boltz_budget, args.explore_frac, rng,
+                              key=key)
+        chosen["source"] = "hunter"
+
+        if args.dry_run:
+            log.info("[round %d] DRY RUN — would score %d molecules (key=%s):",
+                     round_no, len(chosen), key)
+            for _, r in chosen.head(15).iterrows():
+                log.info("    mu=%.6f ei=%.6f ha=%2d  %s",
+                         r["mu"], r["ei"], heavy_atoms(r["smiles"]), r["name"])
+            return
+
+        payload = chosen[["name", "smiles", "source"]].to_dict("records")
+        new = await boltz_score(boltz, config, payload, args.batch_size)
+        if new:
+            score_store.write_scores_to_db(
+                db_path, new, rxn_id=rxn_id, round_no=round_no,
+                target_key=target_key, target_label=target_label, source="hunter")
+
+        if new and not args.no_confirm:
+            await rescore.confirm_high_scorers(
+                boltz=boltz, config=config, scored=new,
+                threshold=CONFIRM_SCORE_THRESHOLD,
+                extra_rounds=CONFIRM_EXTRA_ROUNDS,
+                batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
+                round_no=round_no, target_key=target_key,
+                target_label=target_label, source="hunter", logger=log)
+
+        after = submittable_top20(db_path, rxn_id, guard, target, config)
+        export_top20(after, rxn_id, target)
+        sum_after = float(after["score"].sum()) if len(after) else 0.0
+
+        vals = [float(r["boltz_score"]) for r in new] if new else []
+        hits = sum(1 for v in vals if v > CONFIRM_SCORE_THRESHOLD)
+        log.info(
+            "[round %d done] scored=%d | >%.2f: %d (%.2f%% hit rate) | "
+            "best=%.6f | submittable top20 %.6f -> %.6f (%+.6f) | %.0fs",
+            round_no, len(vals), CONFIRM_SCORE_THRESHOLD, hits,
+            100.0 * hits / max(len(vals), 1), max(vals) if vals else 0.0,
+            sum_before, sum_after, sum_after - sum_before, time.time() - t_round,
+        )
+        await asyncio.sleep(args.sleep)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("stopped by user")
