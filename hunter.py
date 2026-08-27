@@ -103,7 +103,20 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # molecule at the same seed moves by up to 0.010, and acquisition deliberately
 # selects the top of that noise, so a round's leaders are the values least
 # likely to reproduce on the validator.
-CONFIRM_SCORE_THRESHOLD = 0.1
+#
+# The threshold is NOT a constant. What deserves three draws is anything that
+# could enter the submittable top 20, and that bar differs per reaction and
+# rises as the search progresses. Measured today:
+#
+#     rxn1  #20 = 0.09119   a fixed 0.1 confirms NOTHING — every hit is missed
+#     rxn2  #20 = 0.10606   a fixed 0.1 confirms ~19% of a round, most of it
+#     rxn4  #20 = 0.10199   unable to reach the top 20 — wasted GPU
+#     rxn5  #20 = 0.11097
+#
+# `--confirm-threshold auto` (the default) tracks the reaction's own submittable
+# #20 minus a margin for single-draw noise; a literal float overrides it. This
+# value is only the fallback when no frontier exists yet.
+CONFIRM_FALLBACK_THRESHOLD = 0.1
 CONFIRM_EXTRA_ROUNDS = 2
 
 # The score is (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
@@ -710,6 +723,66 @@ def select_batch(ranked: pd.DataFrame, budget: int,
 
 
 # =============================================================================
+# Confirmation threshold
+# =============================================================================
+
+def resolve_confirm_threshold(args, top20: pd.DataFrame) -> Tuple[float, str]:
+    """
+    Decide what score earns three draws this round.
+
+    `--confirm-threshold auto` returns (submittable #20) - margin. That adapts on
+    both axes the operator asked about: across reactions, because each has its
+    own frontier (0.091 on rxn1 vs 0.111 on rxn5), and across search progress,
+    because #20 climbs as the top 20 improves and the bar climbs with it.
+
+    The margin exists because the frontier is itself measured from single draws.
+    A molecule sitting just under #20 may really be above it — measured Boltz
+    spread at a fixed seed is ~0.0025 typically and up to 0.0102 worst case — so
+    a catch radius of about two typical noise widths is the point.
+
+    Returns (threshold, human-readable reason) so the round log can explain
+    itself rather than printing a bare number.
+    """
+    raw = str(args.confirm_threshold).strip().lower()
+    if raw not in ("auto", "adaptive"):
+        return float(raw), "fixed by --confirm-threshold"
+
+    n_needed = int(_CONFIG.get("num_molecules", 20))
+    if top20 is None or len(top20) < n_needed:
+        return (args.confirm_floor,
+                f"floor — only {0 if top20 is None else len(top20)}/{n_needed} "
+                f"submittable so far, no frontier yet")
+
+    frontier = float(top20["score"].iloc[-1])
+    thr = max(args.confirm_floor, frontier - args.confirm_margin)
+    why = f"auto: submittable #{n_needed}={frontier:.5f} - margin {args.confirm_margin}"
+    if thr <= args.confirm_floor + 1e-12 and frontier - args.confirm_margin < args.confirm_floor:
+        why += f" (clamped up to floor {args.confirm_floor})"
+    return thr, why
+
+
+def cap_confirm_threshold(threshold: float, scores: Sequence[float],
+                          max_frac: float) -> Tuple[float, int]:
+    """
+    Stop a weak round from spending its whole GPU slot on confirmation.
+
+    Each confirmed molecule costs two extra Boltz calls, so confirming 50% of a
+    150-molecule round adds 150 predictions — as long as the round itself. If
+    more than `max_frac` of the round clears the threshold, raise it to the
+    matching quantile and confirm only the best of them.
+    """
+    vals = np.asarray([v for v in scores if np.isfinite(v)], dtype=float)
+    if not len(vals) or max_frac >= 1.0:
+        return threshold, int((vals > threshold).sum()) if len(vals) else 0
+    n_over = int((vals > threshold).sum())
+    allowed = max(1, int(math.floor(len(vals) * max_frac)))
+    if n_over <= allowed:
+        return threshold, n_over
+    raised = float(np.quantile(vals, 1.0 - max_frac))
+    return max(threshold, raised), int((vals > max(threshold, raised)).sum())
+
+
+# =============================================================================
 # Boltz
 # =============================================================================
 
@@ -882,6 +955,30 @@ def parse_args():
     p.add_argument("--max-rounds", type=int, default=10 ** 9)
     p.add_argument("--seed", type=int, default=68)
     p.add_argument("--sleep", type=float, default=1.0)
+    p.add_argument("--confirm-threshold", default="auto", metavar="FLOAT|auto",
+                   help="score above which a molecule is re-scored to 3 draws "
+                        "and its score replaced by the mean. 'auto' (default) "
+                        "uses this reaction's own submittable #20 minus "
+                        "--confirm-margin, so it adapts both per reaction and as "
+                        "the search progresses. Measured #20 today: rxn1 0.091, "
+                        "rxn2 0.106, rxn4 0.102, rxn5 0.111 — a fixed 0.1 "
+                        "confirms nothing on rxn1 and wastes GPU on rxn2/4/5")
+    p.add_argument("--confirm-margin", type=float, default=0.005,
+                   help="how far below the frontier still earns confirmation. "
+                        "Boltz spread at a fixed seed is ~0.0025 typical and "
+                        "0.0102 worst, so the default is about two typical "
+                        "noise widths (default 0.005)")
+    p.add_argument("--confirm-floor", type=float, default=0.08,
+                   help="threshold never drops below this, so an early or weak "
+                        "round does not confirm everything it scored")
+    p.add_argument("--confirm-max-frac", type=float, default=0.30,
+                   help="hard cap on the fraction of a round that gets "
+                        "confirmed; above it the threshold is raised to the "
+                        "matching quantile. Each confirmation costs 2 extra "
+                        "Boltz calls (default 0.30)")
+    p.add_argument("--confirm-extra-rounds", type=int, default=CONFIRM_EXTRA_ROUNDS,
+                   help="extra draws per confirmed molecule (default 2, giving "
+                        "3 total)")
     p.add_argument("--no-confirm", action="store_true",
                    help="skip the 3-draw confirmation of this round's winners")
     p.add_argument("--dry-run", action="store_true",
@@ -908,6 +1005,25 @@ async def main() -> None:
     manager = MoleculeManager(config=cfg, db_path=DB_PATH)
 
     if not args.dry_run:
+        # Refuse to write into a damaged file. score_results_3.sqlite developed
+        # B-tree corruption during concurrent testing and still answered simple
+        # SELECTs for a while — the failure only surfaced on a query that
+        # touched the bad pages. Writing more rows into that state risks
+        # compounding the damage, and a silent partial DB is worse than a hard
+        # stop.
+        import sqlite3 as _sq
+        if os.path.exists(db_path):
+            try:
+                with _sq.connect(db_path) as _c:
+                    verdict = _c.execute("PRAGMA quick_check").fetchone()[0]
+            except Exception as e:
+                verdict = f"unreadable: {e}"
+            if verdict != "ok":
+                raise SystemExit(
+                    f"{db_path} failed its integrity check:\n  {verdict}\n"
+                    f"Refusing to write. Recover it first — salvage readable "
+                    f"rows into a fresh file (see PHASE5_ALL_REACTIONS.md) "
+                    f"rather than continuing on a damaged B-tree.")
         score_store.init_score_results_db(db_path, rxn_id, target_key, target_label)
         score_store.init_variance_tables(db_path)
 
@@ -1024,24 +1140,40 @@ async def main() -> None:
                 target_key=target_key, target_label=target_label, source="hunter")
 
         if new and not args.no_confirm:
-            await rescore.confirm_high_scorers(
-                boltz=boltz, config=config, scored=new,
-                threshold=CONFIRM_SCORE_THRESHOLD,
-                extra_rounds=CONFIRM_EXTRA_ROUNDS,
-                batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
-                round_no=round_no, target_key=target_key,
-                target_label=target_label, source="hunter", logger=log)
+            # `before` is this round's pre-scoring submittable top-20, so the
+            # threshold reflects the bar the round actually had to beat.
+            conf_thr, why = resolve_confirm_threshold(args, before)
+            conf_thr, n_conf = cap_confirm_threshold(
+                conf_thr, [float(r["boltz_score"]) for r in new],
+                args.confirm_max_frac)
+            log.info("[round %d] confirm threshold %.5f (%s) -> %d/%d molecules "
+                     "= %d extra predictions",
+                     round_no, conf_thr, why, n_conf, len(new),
+                     n_conf * args.confirm_extra_rounds)
+            if n_conf:
+                await rescore.confirm_high_scorers(
+                    boltz=boltz, config=config, scored=new,
+                    threshold=conf_thr,
+                    extra_rounds=args.confirm_extra_rounds,
+                    batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
+                    round_no=round_no, target_key=target_key,
+                    target_label=target_label, source="hunter", logger=log)
 
         after = submittable_top20(db_path, rxn_id, guard, target, config)
         export_top20(after, rxn_id, target)
         sum_after = float(after["score"].sum()) if len(after) else 0.0
 
         vals = [float(r["boltz_score"]) for r in new] if new else []
-        hits = sum(1 for v in vals if v > CONFIRM_SCORE_THRESHOLD)
+        # Report the hit rate against the bar that actually matters — the
+        # submittable frontier — not a fixed number that may sit far from it.
+        bar = (float(before["score"].iloc[-1]) if len(before) >= 20
+               else args.confirm_floor)
+        hits = sum(1 for v in vals if v > bar)
         log.info(
-            "[round %d done] scored=%d | >%.2f: %d (%.2f%% hit rate) | "
-            "best=%.6f | submittable top20 %.6f -> %.6f (%+.6f) | %.0fs",
-            round_no, len(vals), CONFIRM_SCORE_THRESHOLD, hits,
+            "[round %d done] scored=%d | >%.5f (submittable #20): %d "
+            "(%.2f%% hit rate) | best=%.6f | submittable top20 %.6f -> %.6f "
+            "(%+.6f) | %.0fs",
+            round_no, len(vals), bar, hits,
             100.0 * hits / max(len(vals), 1), max(vals) if vals else 0.0,
             sum_before, sum_after, sum_after - sum_before, time.time() - t_round,
         )

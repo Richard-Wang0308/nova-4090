@@ -145,3 +145,80 @@ validator pays on. That is a multi-round property — each round's winners are
 consumed by the archive — and cannot be established by single-round tests. It
 needs hunter running for several epochs against the live submission cycle.
 
+
+---
+
+## Adaptive confirmation threshold
+
+A fixed `CONFIRM_SCORE_THRESHOLD = 0.1` was wrong on every reaction, in both
+directions. What deserves three draws is anything that could enter the
+*submittable* top 20, and that bar is reaction-specific and moves as the search
+progresses:
+
+| rxn | submittable #20 | a fixed 0.1 |
+|---|---|---|
+| 1 | 0.09119 | confirms **nothing** — every real hit is missed |
+| 2 | 0.10606 | confirms ~19% of a round, most of it unable to reach top 20 |
+| 4 | 0.10199 | same waste |
+| 5 | 0.11097 | same waste |
+
+`--confirm-threshold auto` (the default) resolves to `submittable #20 - margin`
+each round, so it adapts across reactions *and* across progress as #20 climbs.
+The margin (default 0.005) exists because the frontier is itself measured from
+single draws — Boltz spread at a fixed seed is ~0.0025 typical, 0.0102 worst —
+so molecules just under #20 may really be above it.
+
+Guards: `--confirm-floor` (default 0.08) keeps an early or weak round from
+confirming everything; `--confirm-max-frac` (default 0.30) raises the threshold
+to the matching quantile if too much of a round would qualify, since each
+confirmation costs two extra Boltz calls.
+
+Verified live on rxn1 — the reaction where a fixed 0.1 confirmed nothing:
+
+```
+[round 1] confirm threshold 0.08619 (auto: submittable #20=0.09119 - margin 0.005)
+          -> 1/12 molecules = 2 extra predictions
+[CONFIRM] averaged 1 molecules | mean change +0.000114 | 1 marked rescored
+```
+
+The round-completion line now reports the hit rate against the submittable
+frontier rather than a fixed number, so "0% hit rate" means what it says.
+
+## SQLite corruption — what happened and how to recover
+
+`score_results_3.sqlite` developed B-tree corruption during the concurrent
+testing above (`invalid page number` in Tree 2, the `scored_molecules` table
+itself). It kept answering simple `SELECT`s; the failure only surfaced on a
+query that touched the damaged pages.
+
+**Cause: not established.** Disk had 765 GB free and dmesg showed no filesystem
+errors. The plausible candidates are a process killed mid-checkpoint, or
+`tools/check.py`'s `fix_available_column()` — which does a full
+CREATE/INSERT-SELECT/DROP/RENAME table rebuild — running while another process
+held the database. Do not run `tools/check.py` against a database a searcher is
+writing.
+
+**Recovery** (64,835 of 64,840 rows salvaged; max score, `>0.11` count and
+metadata all matched the pre-corruption values exactly):
+
+```python
+# walk by rowid so one bad page loses only its own rows, committing as you go
+src = sqlite3.connect("score_results_N.sqlite")
+dst = sqlite3.connect("recovered.sqlite")
+# copy DDL from src's sqlite_master, then for each 500-rowid block:
+#   try the block; on failure retry row by row and skip what will not read
+# finally copy metadata and molecule_replicates, and PRAGMA integrity_check
+```
+
+The full script is `scratchpad/recover3b.py` from that session.
+
+**Prevention:** hunter now runs `PRAGMA quick_check` at startup and refuses to
+write to a damaged database rather than compounding the damage. Check all five
+at any time with:
+
+```bash
+for r in 1 2 3 4 5; do
+  printf "rxn$r: "
+  ./.venv/bin/python -c "import sqlite3;print(sqlite3.connect('score_results_$r.sqlite').execute('PRAGMA integrity_check').fetchone()[0])"
+done
+```
