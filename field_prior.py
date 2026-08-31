@@ -47,9 +47,32 @@ import pandas as pd
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# A component needs at least this many observations before its mean is trusted
-# at face value; below it the UCB bonus dominates and it stays explorable.
-MIN_OBS = 3
+# A component needs at least this many observations before it may enter the
+# elite pool. This was 3, which permanently disqualified any building block
+# whose one trial happened to be unlucky. Epoch 24796's winner drew 18 of its 20
+# molecules from A in {45185,45224,45235,45257} x B in {6067,6070,6071,6074};
+# this DB had scored 45224 exactly once (0.0190), 45257 once (0.0049), 45185
+# twice (best 0.0325) and 6074 never -- so at min_obs=3 not one of them could
+# ever reach the elite pool that feeds 55% of generation. One observation is
+# information, not disqualification; the shrinkage in _ucb is what stops a
+# single lucky draw from dominating instead.
+MIN_OBS = 1
+
+# --- UCB calibration ---------------------------------------------------------
+# Multiplier on a component's standard error, sd/sqrt(n). Expressing the bonus
+# in standard errors rather than as beta*sqrt(log(N)/n) makes it self-calibrating
+# per reaction: it lands in the same units as the spread of the shrunk means it
+# has to compete with, so it needs no per-reaction tuning.
+UCB_BETA = 0.5
+
+# Shrinkage strength toward the position's grand mean, in pseudo-observations.
+# n=1 lands ~89% of the way to the grand mean, n=8 halfway, n>=100 essentially
+# on its own mean.
+PRIOR_M = 8.0
+
+# How much of a component's sample-size-corrected best observation survives into
+# its score. See _ucb for why the raw maximum cannot be used directly.
+UPSIDE_WEIGHT = 0.15
 
 # Scores at or below this are Boltz failures / degenerate structures, not signal.
 # The reactant summaries contain entries like avg_score = -17.79 from these.
@@ -83,6 +106,13 @@ class ComponentTable:
     # Fraction of this component's molecules that cleared the "useful" bar.
     hit: Dict[int, float] = field(default_factory=dict)
 
+    # Position-wide statistics over this source's scores. _ucb uses grand_mean
+    # as its shrinkage target and grand_sd as the scale for both the
+    # extreme-value correction and the exploration bonus, which is what makes
+    # the prior self-calibrating across reactions.
+    grand_mean: float = 0.0
+    grand_sd: float = 0.0
+
     def ids(self) -> Set[int]:
         return set(self.n)
 
@@ -100,6 +130,12 @@ def _tabulate(
     t.best = g.max().to_dict()
     t.hit = (df.assign(_h=df[score_col] > hit_threshold)
                .groupby(col)["_h"].mean().to_dict())
+    vals = df[score_col].to_numpy(dtype=float)
+    t.grand_mean = float(vals.mean()) if len(vals) else 0.0
+    # ddof=0: this is the whole population of what this source has seen, not a
+    # sample drawn from it. Floored so a degenerate table cannot zero out the
+    # exploration bonus and silently restore the old collapse.
+    t.grand_sd = max(float(vals.std()) if len(vals) > 1 else 0.0, 1e-4)
     return t
 
 
@@ -140,11 +176,13 @@ class FieldPrior:
         self.field_hi: Dict[str, Dict[int, float]] = {}
 
         self._score_cache: Dict[Tuple[str, float], Dict[int, float]] = {}
+        self._impute_cache: Dict[str, float] = {}
         self._load_field(data_dir)
         if db_path:
             self._load_local(db_path)
         # Tables are complete now; drop anything cached during ingestion.
         self._score_cache.clear()
+        self._impute_cache.clear()
 
     # -- ingestion ---------------------------------------------------------
 
@@ -243,33 +281,74 @@ class FieldPrior:
 
     # -- component scoring -------------------------------------------------
 
-    def _ucb(self, table: ComponentTable, cid: int, total: int, beta: float) -> Optional[float]:
+    def _ucb(self, table: ComponentTable, cid: int, total: int,
+             beta: float = UCB_BETA) -> Optional[float]:
         """
-        Upper confidence bound on a component's *reachable* quality.
+        Optimistic estimate of a component's quality, corrected for how often it
+        has been tried.
 
-        The base is the component's BEST observed score, not its mean. This is
-        the empirically-supported choice: in Phase-1 testing,
-        `spearman(field-max, my score) = +0.36` for B components, and selecting
-        molecules whose A and B both had a field max above 0.125 lifted
-        P(>0.11) from 1.23% to 7.52%. Component means carry far less signal —
-        a great block paired with 700 mediocre partners still has a mediocre
-        mean, and that is precisely the block worth pairing well.
+        WHY THIS IS NOT `best` ANY MORE
+        -------------------------------
+        The previous version returned the component's BEST observed score plus
+        `0.01 * sqrt(log(N)/n)`. The maximum of n draws is an extreme-value
+        statistic whose expectation grows like `sd * sqrt(2 ln n)`, so `best`
+        measures sampling effort at least as much as it measures quality.
+        Measured on this repo's own score DBs:
 
-        The UCB bonus keeps rarely-tried components reachable. `ComponentStats`
-        had this backwards: shrinking toward the global mean made rare
-        components *less* likely to be tried, not more.
+            rxn1 slot0   n=1 -> mean(best)=0.033    n>=300 -> 0.128
+            rxn1 slot1   n=1 -> mean(best)=0.020    n>=300 -> 0.124
+            rxn2 slot0   n=1 -> mean(best)=0.027    n>=300 -> 0.114
+            rxn4 slot1   n=1 -> mean(best)=0.025    n>=300 -> 0.120
+
+            spearman(n_evals, best) = +0.65 / +0.59 / +0.72 / +0.81
+            spearman(n_evals, mean) = +0.25 / +0.26 / +0.46 / +0.37
+
+        `best` was therefore 50-80% explained by prior sampling effort, while
+        the exploration bonus that was meant to offset it was worth at most
+        0.033 against a `base` gap of 0.09-0.11 -- an order of magnitude too
+        small. The result was a rich-get-richer loop: a heavily-sampled
+        component ranked high, so it was sampled more, so it ranked higher. By
+        28 Aug the searcher was touching 0.0% new B components per day on rxn2
+        and 0.6% new A components on rxn4, against pool coverage of 37% and 26%.
+
+        WHAT IT DOES INSTEAD
+        --------------------
+        1. Shrink the component's MEAN toward the position's grand mean with
+           `PRIOR_M` pseudo-observations. A single unlucky draw no longer
+           condemns a component, and a single lucky one no longer crowns it.
+        2. Keep a small slice of `best` as an upside signal -- the field-max
+           signal really did transfer (spearman +0.36 for B) -- but subtract
+           its sample-size-driven expectation first, so it contributes the part
+           of the maximum that is NOT explained by having been tried often.
+        3. Make the exploration bonus a multiple of the standard error,
+           `sd/sqrt(n)`. That is in the same units as the spread of the shrunk
+           means it competes against, so it is self-calibrating per reaction
+           and needs no hand-tuning. `total` is retained for API compatibility.
         """
         n = table.n.get(cid)
         if not n:
             return None
-        base = table.best.get(cid, 0.0)
+
+        sd = table.grand_sd or 1e-4
+
+        # 1. shrunk mean
+        mean_c = table.mean.get(cid, table.grand_mean)
+        shrunk = ((n * mean_c) + (PRIOR_M * table.grand_mean)) / (n + PRIOR_M)
+
+        # 2. sample-size-corrected upside
+        expected_max = sd * math.sqrt(2.0 * math.log(max(n, 2)))
+        upside = UPSIDE_WEIGHT * (table.best.get(cid, 0.0) - expected_max)
+
         # A little weight on the hit rate separates "one lucky draw" from
         # "reliably produces useful molecules".
-        base += 0.25 * self.hit_threshold * table.hit.get(cid, 0.0)
-        bonus = beta * math.sqrt(math.log(max(total, 2)) / n)
-        return base + bonus
+        upside += 0.25 * self.hit_threshold * table.hit.get(cid, 0.0)
 
-    def component_scores(self, role: str, beta: float = 0.01) -> Dict[int, float]:
+        # 3. exploration bonus, in standard errors
+        bonus = beta * sd / math.sqrt(n)
+
+        return shrunk + upside + bonus
+
+    def component_scores(self, role: str, beta: float = UCB_BETA) -> Dict[int, float]:
         """
         Blended field+local quality estimate per component id.
 
@@ -307,6 +386,43 @@ class FieldPrior:
         self._score_cache[ck] = out
         return out
 
+    def n_obs(self, role: str, cid: Optional[int]) -> int:
+        """
+        How many scored molecules this component appears in, across both
+        sources. The surrogate carries this as a feature so the model can learn
+        "few observations" as uncertainty rather than inferring it from a low
+        score it was never shown.
+        """
+        if cid is None:
+            return 0
+        total = 0
+        ft = self.field.get(role)
+        lt = self.local.get(role)
+        if ft:
+            total += int(ft.n.get(cid, 0))
+        if lt:
+            total += int(lt.n.get(cid, 0))
+        return total
+
+    def impute_value(self, role: str) -> float:
+        """
+        What an UNOBSERVED component is worth.
+
+        Unknown is not the same as bad, so it sits just below the observed
+        median rather than at the bottom. This is the single source of truth for
+        that choice: rank_weights and hunter's Surrogate._features must agree,
+        because a generator that imputes at the 40th percentile feeding a model
+        that imputes at 0.0 is a generator whose novel proposals are ranked last
+        and never scored.
+        """
+        cached = self._impute_cache.get(role)
+        if cached is not None:
+            return cached
+        scores = self.component_scores(role)
+        val = float(np.quantile(list(scores.values()), 0.40)) if scores else 0.0
+        self._impute_cache[role] = val
+        return val
+
     def rank_weights(self, ids: Sequence[int], role: str, *,
                      temperature: float = 6.0,
                      floor: float = 0.10) -> Optional[np.ndarray]:
@@ -334,7 +450,7 @@ class FieldPrior:
         known = np.isfinite(vals)
         if known.sum() < 2:
             return None
-        vals[~known] = np.quantile(vals[known], 0.40)
+        vals[~known] = self.impute_value(role)
 
         order = np.argsort(np.argsort(vals))          # 0 = worst
         r = order / max(len(order) - 1, 1)            # 0..1

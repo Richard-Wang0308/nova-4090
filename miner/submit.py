@@ -13,8 +13,9 @@ Workflow:
     no InChIKey duplicates within the set, and MACCS entropy >= min_entropy
     (same checks the validator applies).
     PREPARE all payloads (comma-separated molecule names, timelock-encrypted),
-    fire ALL chain commits in parallel, then BATCH-UPLOAD all successfully-
-    committed files to GitHub in a SINGLE commit. Mark submitted molecules
+    fire ALL chain commits concurrently over ONE persistent AsyncSubtensor
+    connection, then BATCH-UPLOAD all successfully-committed files to GitHub
+    in a SINGLE commit. Mark submitted molecules
     unavailable.
 4. Repeat.
 """
@@ -266,7 +267,7 @@ def setup_logging(config: argparse.Namespace) -> None:
     bt.logging.info(f"⏰ Trigger: IMMEDIATELY on startup, then on every epoch change")
     bt.logging.info(f"📊 Epoch length: {EPOCH_LENGTH} blocks")
     bt.logging.info(
-        f"⚡ Parallel CHAIN COMMIT (per-wallet connections) | GitHub upload "
+        f"⚡ Concurrent CHAIN COMMIT (one persistent connection) | GitHub upload "
         f"batched into ONE commit after chain commit | "
         f"{_cfg_val(config, 'num_molecules', 20)} molecules/wallet | "
         f"HF unique + BRENK + similarity<{MAX_SIMILARITY_TO_HISTORICAL} + "
@@ -284,138 +285,175 @@ async def setup_bittensor_objects(
     config: argparse.Namespace
 ) -> Tuple[List[Any], List[Any], Any, Any, List[int], int]:
     """
-    Initializes multiple wallets (potentially different wallet names and hotkeys),
-    ONE DEDICATED AsyncSubtensor connection PER WALLET (used only for the
-    time-critical set_commitment call so concurrent commits are never
-    serialized on a shared websocket), a shared subtensor for general reads
-    (get_current_block, metagraph, etc.), and metagraph.
+    Initialize wallets/hotkeys and ONE persistent AsyncSubtensor connection.
+
+    Why a single connection:
+      * The public Finney RPC can reject rapid/repeated WebSocket handshakes
+        with HTTP 429.
+      * AsyncSubtensor/async-substrate-interface supports concurrent async RPC
+        calls over one connection, so separate WebSockets are unnecessary here.
+      * websocket_shutdown_timer=None keeps the connection alive between the
+        6-second block polls instead of allowing an idle-close/reconnect cycle.
+
+    `wallet_subtensors` is retained as a compatibility alias for the existing
+    submission pipeline. Every entry intentionally points to the SAME shared
+    AsyncSubtensor instance.
 
     Returns:
         (wallets_list, wallet_subtensors_list, shared_subtensor, metagraph,
-        miner_uids_list, epoch_length)
+         miner_uids_list, epoch_length)
     """
-    bt.logging.info("🔧 Setting up Bittensor objects with multiple wallets/hotkeys...")
+    bt.logging.info(
+        "🔧 Setting up Bittensor objects with one persistent WebSocket connection..."
+    )
 
     max_retries = 10
     retry_delay = 5
+    max_retry_delay = 120
 
     for attempt in range(max_retries):
+        subtensor = None
         try:
             bt.logging.info(
                 f"   Attempting connection (attempt {attempt + 1}/{max_retries})..."
             )
 
-            subtensor = bt.AsyncSubtensor(network=config.network)
-
-            async with subtensor:
-                metagraph = await subtensor.metagraph(config.netuid)
-                await metagraph.sync()
-                bt.logging.info("   ✅ Metagraph synced successfully\n")
-
-                # Create wallet objects for each (wallet_name, hotkey_name) pair
-                bt.logging.info(
-                    f"   📋 Initializing {len(WALLET_HOTKEY_PAIRS)} wallet/hotkey pairs:"
-                )
-                wallets: List[Any] = []
-                miner_uids: List[int] = []
-
-                for idx, (wallet_name, hotkey_name) in enumerate(WALLET_HOTKEY_PAIRS, 1):
-                    label = f"{wallet_name}/{hotkey_name}"
-                    try:
-                        wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
-
-                        # Verify the hotkey exists on disk before querying metagraph
-                        _ = wallet.hotkey  # raises if key file missing
-
-                        miner_uid = metagraph.hotkeys.index(
-                            wallet.hotkey.ss58_address
-                        )
-
-                        wallets.append(wallet)
-                        miner_uids.append(miner_uid)
-
-                        bt.logging.info(
-                            f"      {idx:>2}. ✅ {label:<22} → UID {miner_uid:>3} "
-                            f"({wallet.hotkey.ss58_address[:10]}...)"
-                        )
-
-                    except ValueError:
-                        bt.logging.warning(
-                            f"      {idx:>2}. ⚠️  {label:<22} → NOT FOUND in metagraph (skipping)"
-                        )
-                        continue
-                    except FileNotFoundError:
-                        bt.logging.warning(
-                            f"      {idx:>2}. ⚠️  {label:<22} → Hotkey file not found on disk (skipping)"
-                        )
-                        continue
-                    except Exception as e:
-                        bt.logging.error(
-                            f"      {idx:>2}. ❌ {label:<22} → ERROR: {e}"
-                        )
-                        continue
-
-                if not wallets:
-                    raise ValueError(
-                        "❌ No valid wallet/hotkey pairs found in metagraph! "
-                        "Please check your WALLET_HOTKEY_PAIRS configuration."
-                    )
-
-                bt.logging.info(
-                    f"\n   ✅ Successfully initialized "
-                    f"{len(wallets)}/{len(WALLET_HOTKEY_PAIRS)} wallet/hotkey pairs\n"
-                )
-
-            # Reinitialize shared subtensor for main loop (used for reads:
-            # get_current_block, determine_block_hash, etc.)
-            subtensor = bt.AsyncSubtensor(network=config.network)
+            # IMPORTANT: keep this single AsyncSubtensor alive for the lifetime
+            # of the miner.  Passing websocket_shutdown_timer=None prevents the
+            # SDK from closing it during short idle periods between block polls.
+            subtensor = bt.AsyncSubtensor(
+                network=config.network,
+                config=config,
+                websocket_shutdown_timer=None,
+            )
             await subtensor.initialize()
 
-            # Create ONE DEDICATED connection per wallet, used ONLY for
-            # set_commitment, so that concurrent commits from different
-            # wallets are never queued behind each other on a shared
-            # websocket/transport.
+            # AsyncSubtensor.metagraph() already returns a synced metagraph.
+            # Do NOT call metagraph.sync() again here; it is redundant traffic.
+            metagraph = await subtensor.metagraph(config.netuid)
+            bt.logging.info("   ✅ Persistent Subtensor connected")
+            bt.logging.info("   ✅ Metagraph synced successfully\n")
+
             bt.logging.info(
-                f"   🔌 Opening {len(wallets)} dedicated connection(s) "
-                f"for parallel chain commits..."
+                f"   📋 Initializing {len(WALLET_HOTKEY_PAIRS)} wallet/hotkey pairs:"
             )
-            wallet_subtensors: List[Any] = []
+
+            wallets: List[Any] = []
+            miner_uids: List[int] = []
+
             for idx, (wallet_name, hotkey_name) in enumerate(
-                WALLET_HOTKEY_PAIRS[:len(wallets)], 1
+                WALLET_HOTKEY_PAIRS, 1
             ):
-                ws = bt.AsyncSubtensor(network=config.network)
-                await ws.initialize()
-                wallet_subtensors.append(ws)
-                bt.logging.info(
-                    f"      {idx:>2}. ✅ Dedicated commit-connection ready "
-                    f"for {wallet_name}/{hotkey_name}"
-                )
-            bt.logging.info("")
+                label = f"{wallet_name}/{hotkey_name}"
+                try:
+                    wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
 
-            return wallets, wallet_subtensors, subtensor, metagraph, miner_uids, EPOCH_LENGTH
+                    # Verify the hotkey exists on disk before querying metagraph.
+                    _ = wallet.hotkey
 
-        except (ConnectionError, TimeoutError) as e:
-            if attempt < max_retries - 1:
-                wait_time = retry_delay * (2 ** attempt)
-                bt.logging.warning(
-                    f"   ⚠️  Connection attempt {attempt + 1} failed: {e}. "
-                    f"Retrying in {wait_time} seconds..."
+                    miner_uid = metagraph.hotkeys.index(
+                        wallet.hotkey.ss58_address
+                    )
+
+                    wallets.append(wallet)
+                    miner_uids.append(miner_uid)
+
+                    bt.logging.info(
+                        f"      {idx:>2}. ✅ {label:<22} → UID {miner_uid:>3} "
+                        f"({wallet.hotkey.ss58_address[:10]}...)"
+                    )
+
+                except ValueError:
+                    bt.logging.warning(
+                        f"      {idx:>2}. ⚠️  {label:<22} → NOT FOUND in metagraph (skipping)"
+                    )
+                    continue
+                except FileNotFoundError:
+                    bt.logging.warning(
+                        f"      {idx:>2}. ⚠️  {label:<22} → Hotkey file not found on disk (skipping)"
+                    )
+                    continue
+                except Exception as e:
+                    bt.logging.error(
+                        f"      {idx:>2}. ❌ {label:<22} → ERROR: {e}"
+                    )
+                    continue
+
+            if not wallets:
+                raise ValueError(
+                    "❌ No valid wallet/hotkey pairs found in metagraph! "
+                    "Please check your WALLET_HOTKEY_PAIRS configuration."
                 )
-                await asyncio.sleep(wait_time)
-            else:
-                bt.logging.error(
-                    f"   ❌ Failed to connect after {max_retries} attempts: {e}"
-                )
-                raise
+
+            bt.logging.info(
+                f"\n   ✅ Successfully initialized "
+                f"{len(wallets)}/{len(WALLET_HOTKEY_PAIRS)} wallet/hotkey pairs"
+            )
+
+            # Keep the old list-based interface so the rest of the submission
+            # code does not need invasive changes. All entries reference the
+            # SAME persistent AsyncSubtensor. asyncio.gather() can still issue
+            # the set_commitment calls concurrently.
+            wallet_subtensors: List[Any] = [subtensor for _ in wallets]
+
+            bt.logging.info(
+                f"   🔌 Using ONE persistent WebSocket for reads and "
+                f"{len(wallets)} concurrent wallet commit task(s)\n"
+            )
+
+            return (
+                wallets,
+                wallet_subtensors,
+                subtensor,
+                metagraph,
+                miner_uids,
+                EPOCH_LENGTH,
+            )
 
         except Exception as e:
-            bt.logging.error(f"   ❌ Unexpected error during setup: {e}")
-            bt.logging.error(traceback.format_exc())
-            if attempt < max_retries - 1:
-                wait_time = retry_delay * (2 ** attempt)
-                await asyncio.sleep(wait_time)
-            else:
+            # Always close a partially-created connection before retrying.
+            if subtensor is not None:
+                try:
+                    await subtensor.close()
+                except Exception:
+                    pass
+
+            error_text = str(e)
+            is_rate_limited = (
+                "HTTP 429" in error_text
+                or "Too Many Requests" in error_text
+                or "429" in error_text
+            )
+
+            if attempt >= max_retries - 1:
+                bt.logging.error(
+                    f"   ❌ Failed to initialize Bittensor after "
+                    f"{max_retries} attempts: {e}"
+                )
+                bt.logging.error(traceback.format_exc())
                 raise
+
+            wait_time = min(
+                max_retry_delay,
+                retry_delay * (2 ** attempt),
+            )
+
+            # A 429 means the gateway explicitly asked us to slow connection
+            # attempts. Give it a larger minimum cooldown than ordinary errors.
+            if is_rate_limited:
+                wait_time = max(30, wait_time)
+                bt.logging.warning(
+                    f"   ⚠️  Finney RPC WebSocket rate-limited this process "
+                    f"(HTTP 429). Retrying in {wait_time}s using the same "
+                    f"single-connection architecture..."
+                )
+            else:
+                bt.logging.warning(
+                    f"   ⚠️  Bittensor setup attempt {attempt + 1} failed: {e}. "
+                    f"Retrying in {wait_time}s..."
+                )
+
+            await asyncio.sleep(wait_time)
 
 
 # ============================================================================
@@ -1175,8 +1213,8 @@ async def commit_only(
 ) -> bool:
     """
     THE TIME-CRITICAL CALL. Nothing but the chain extrinsic happens here.
-    Uses a connection dedicated to this wallet so it is never queued
-    behind another wallet's commit on a shared websocket.
+    All wallet commit coroutines may share the same persistent AsyncSubtensor;
+    async-substrate-interface multiplexes concurrent requests on that transport.
     """
     label = payload["label"]
     miner_uid = payload["miner_uid"]
@@ -1382,13 +1420,14 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         return
 
     # ==========================================================
-    # STEP 3b: FIRE ALL CHAIN COMMITS IN PARALLEL — TIME CRITICAL
-    # Each wallet uses its OWN dedicated AsyncSubtensor connection so
-    # concurrent commits are not serialized on a shared websocket.
+    # STEP 3b: FIRE ALL CHAIN COMMITS CONCURRENTLY — TIME CRITICAL
+    # All wallets intentionally reuse ONE persistent AsyncSubtensor/WebSocket.
+    # This avoids public-RPC handshake bursts / HTTP 429 while asyncio.gather()
+    # still dispatches the independent set_commitment coroutines concurrently.
     # ==========================================================
     bt.logging.info(
-        f"   ⚡ Firing {len(payloads)} chain commit(s) in PARALLEL "
-        f"(dedicated connection per wallet)..."
+        f"   ⚡ Firing {len(payloads)} chain commit(s) CONCURRENTLY "
+        f"over one persistent WebSocket..."
     )
 
     commit_tasks = [
@@ -1601,9 +1640,9 @@ async def run_miner(config: argparse.Namespace) -> None:
             'config':           config,
             'github_path':      load_github_path(),
             'wallets':           wallets,
-            'wallet_subtensors': wallet_subtensors,  # dedicated per-wallet connections for parallel commits
+            'wallet_subtensors': wallet_subtensors,  # aliases to one persistent connection for concurrent commits
             'miner_uids':        miner_uids,
-            'subtensor':         subtensor,           # shared connection for reads (get_current_block, etc.)
+            'subtensor':         subtensor,           # one persistent connection for reads + commits
             'metagraph':         metagraph,
             'epoch_length':      epoch_length,
             'bdt':               QuicknetBittensorDrandTimelock(),
@@ -1616,21 +1655,28 @@ async def run_miner(config: argparse.Namespace) -> None:
         bt.logging.error(traceback.format_exc())
         raise
     finally:
-        # Close the shared subtensor connection
-        if subtensor is not None:
-            try:
-                await subtensor.close()
-                bt.logging.info("✅ Shared subtensor connection closed")
-            except Exception:
-                pass
+        # wallet_subtensors intentionally contains aliases to the same shared
+        # object. Close each distinct AsyncSubtensor object exactly once.
+        connections_to_close: List[Any] = []
+        seen_connection_ids = set()
 
-        # Close all dedicated per-wallet commit connections
-        for idx, ws in enumerate(wallet_subtensors, 1):
+        for conn in [subtensor, *wallet_subtensors]:
+            if conn is None:
+                continue
+            conn_id = id(conn)
+            if conn_id in seen_connection_ids:
+                continue
+            seen_connection_ids.add(conn_id)
+            connections_to_close.append(conn)
+
+        for idx, conn in enumerate(connections_to_close, 1):
             try:
-                await ws.close()
-                bt.logging.info(f"✅ Wallet commit-connection {idx} closed")
-            except Exception:
-                pass
+                await conn.close()
+                bt.logging.info(
+                    f"✅ Bittensor connection {idx}/{len(connections_to_close)} closed"
+                )
+            except Exception as e:
+                bt.logging.debug(f"Connection close ignored: {e}")
 
 
 def main():

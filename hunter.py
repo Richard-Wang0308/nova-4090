@@ -23,8 +23,8 @@ WHAT THIS DOES DIFFERENTLY
 
   1. Generation is anchored on evidence, not sampled near-uniformly. Component
      priors are RANK-based (scale-invariant, cannot collapse) over a UCB built
-     on each component's BEST observed score, blended from the local DB and the
-     field's validator-scored submissions in data/rxn{N}.csv.
+     from the local DB and the field's validator-scored submissions in
+     data/rxn{N}.csv.
   2. Ranking is on the surrogate's posterior mean, never a composite. Measured
      across all five reactions (3 trials each, held-out pool, budget 150): mu
      beats the orchestrator's `acq` on every reaction (rxn1 +91%, rxn2 +96%,
@@ -33,6 +33,37 @@ WHAT THIS DOES DIFFERENTLY
   4. Heavy atoms are treated as what they are — the score's denominator.
   5. Novelty is enforced before Boltz, and the top-20 is tracked in
      *submittable* terms, which is the only number that pays.
+
+WHAT CHANGED AFTER EPOCHS 24793-24796 (UID 14 ranked 15/51, 12/41, 11/42, 22/50)
+
+  The first version of the above raised the MEAN quality of what we score
+  (rxn2 0.045 -> 0.074 in two days) and simultaneously shut exploration off.
+  From 28 Aug it touched 0.0% new B components per day on rxn2 and 0.6% new A
+  components on rxn4, having covered 37% and 26% of those pools; the maximum
+  score stopped moving entirely (rxn1: 0-1 molecules above 0.10 per day on
+  4,000-6,000 evaluations) and the submittable frontier flattened to a plateau
+  0.004 wide against a winner's spread of 0.026. Four fixes, all measured:
+
+  P0.1 field_prior._ucb no longer ranks components by their BEST observed
+       score. That statistic was 50-80% explained by sampling effort
+       (spearman(n, best) = +0.48..+0.81), so the prior was a ranking of what
+       we had already tried, and it fed itself. It is now a shrunk mean plus a
+       sample-size-corrected upside plus a standard-error bonus:
+       spearman(n, prior) is now -0.12..+0.31. MIN_OBS 3 -> 1.
+  P0.2 Surrogate._features no longer encodes an unseen component as 0.0 —
+       strictly below every observed one, which made it impossible for any
+       candidate containing a novel building block to survive mu-ranking.
+       Unknown is imputed at the same 40th percentile the generator uses, and
+       missingness is passed to the model as its own feature.
+  P0.3 New `block` operator: 2-D reactant-neighbourhood cross products. See
+       Generator's docstring — this is what won epoch 24796 for someone else.
+  P0.4 Round-leader 3-draw confirmation is off by default. It shrank a 0.0034
+       variance component while the sd of (validator - us) is 0.0095, for
+       6-11% of the GPU budget. Confirmation now runs once, on the submittable
+       top-20 only, where the -0.0028/molecule regression actually costs us.
+  P0.5 The novelty archive is refreshed inside the round loop. It never was,
+       and one stale molecule voids all 20 (the validator's check is
+       all-or-nothing).
 
 Run it exactly like the orchestrator:
 
@@ -102,6 +133,12 @@ MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 DB_PATH = os.path.join(BASE_DIR, "combinatorial_db", "molecules.sqlite")
 OUTPUT_DIR = os.path.join(BASE_DIR, "top20_v2")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Morgan fingerprints of the REACTANTS themselves (not the products), used by
+# Generator.block_scan to find each building block's structural neighbours.
+# A reaction's building-block set never changes, so this is built once and
+# reused for the life of the installation.
+REACTANT_FP_DIR = os.path.join(BASE_DIR, "data", "reactant_fp_cache")
+os.makedirs(REACTANT_FP_DIR, exist_ok=True)
 
 # Confirmation of a round's winners — see rescore.py. One Boltz draw of the same
 # molecule at the same seed moves by up to 0.010, and acquisition deliberately
@@ -121,7 +158,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # #20 minus a margin for single-draw noise; a literal float overrides it. This
 # value is only the fallback when no frontier exists yet.
 CONFIRM_FALLBACK_THRESHOLD = 0.1
-CONFIRM_EXTRA_ROUNDS = 2
+# Extra draws per confirmed molecule, for the ROUND-LEADER confirmation. Now 0
+# — see --confirm-extra-rounds. The remaining confirmation happens once, on the
+# submittable top-20 only, where it is bounded at 20 predictions per round.
+CONFIRM_EXTRA_ROUNDS = 0
 
 # The score is (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
 # Heavy atoms are the denominator, so size is a direct penalty, not a neutral
@@ -271,23 +311,62 @@ class Surrogate:
         )
 
     def _features(self, name: str, smiles: str) -> Optional[np.ndarray]:
+        """
+        Morgan bits + physchem descriptors + component evidence.
+
+        WHY THE COMPONENT BLOCK LOOKS LIKE THIS
+        ---------------------------------------
+        The previous version wrote `ca.get(a, 0.0)` — an unobserved component
+        entered the model as 0.0, which is strictly below every observed
+        component's score. The trees, trained on data where a low component
+        prior really does mean a low score, learned exactly that, and gave the
+        bottom `mu` to every candidate containing a building block we had never
+        tried. Since `select_batch` picks by `mu` and even its exploration slice
+        is gated at `mu >= quantile(0.70)`, there was NO path through this file
+        by which a molecule containing a novel reactant could reach the GPU.
+        Measured consequence: on 28 and 29 Aug the rxn2 searcher touched 0.0%
+        new B components, having covered 37% of that pool; rxn4 touched 0.6%
+        new A components against 26% coverage.
+
+        This was also inconsistent with the generator, which imputes unknown
+        components at the 40th percentile on the explicit ground that "unknown
+        is not the same as bad" (FieldPrior.rank_weights). Both now call
+        FieldPrior.impute_value(), so proposal and ranking agree.
+
+        Missingness is instead handed to the model as what it is: three flags
+        saying "this value was imputed" and three log-counts saying how much
+        evidence stands behind it. A tree can then represent "few observations"
+        as uncertainty rather than having to infer it from a score it was never
+        shown.
+        """
         fp = fp_array(smiles)
         d = descriptors(smiles)
         if fp is None or d is None:
             return None
         a, b, c = parse_components(name)
-        ca = self.prior.component_scores("A")
-        cb = self.prior.component_scores("B")
-        cc = self.prior.component_scores("C")
         # C is carried explicitly: rxn3 and rxn5 are three-component, and on
         # rxn3 the C position holds 18,330 of the reaction's building blocks —
         # more than A and B combined. Dropping it would blind the model to most
         # of that reaction's variation.
+        vals, miss, obs = [], [], []
+        for role, cid in (("A", a), ("B", b), ("C", c)):
+            if cid is None:
+                vals.append(0.0)
+                miss.append(0.0)
+                obs.append(0.0)
+                continue
+            table = self.prior.component_scores(role)
+            v = table.get(cid)
+            n = self.prior.n_obs(role, cid)
+            if v is None:
+                vals.append(self.prior.impute_value(role))
+                miss.append(1.0)
+            else:
+                vals.append(v)
+                miss.append(0.0)
+            obs.append(math.log1p(n))
         comp = np.array(
-            [
-                ca.get(a, 0.0) if a is not None else 0.0,
-                cb.get(b, 0.0) if b is not None else 0.0,
-                cc.get(c, 0.0) if c is not None else 0.0,
+            vals + miss + obs + [
                 self.prior.pair_bonus(a, b),
                 self.prior.hi_components("A").get(a, 0.0) if a is not None else 0.0,
                 self.prior.hi_components("B").get(b, 0.0) if b is not None else 0.0,
@@ -410,6 +489,26 @@ class Generator:
       broad    — prior-weighted sampling, the only strategy that can leave the
                  region entirely; kept deliberately as insurance against the
                  prior being wrong
+      block    — 2-D SAR matrix scan: expand BOTH reactants of a good molecule
+                 to their structural neighbours and emit the full cross product
+
+    `block` is the operator this file was missing. Every other strategy varies
+    one position at a time against a globally-drawn partner, so none of them can
+    express an A-family x B-family interaction — quality that exists only in the
+    intersection of two homologous series and is invisible in either marginal.
+
+    Epoch 24796 was lost to exactly that. The winner (UID 18, 2.1675 against our
+    1.7854) drew 18 of its 20 molecules from one crossed block:
+
+        A in {45185, 45191, 45202, 45213, 45224, 45235, 45257}   N-alkyl
+             homologues of 3-chloro-4-hydroxy-pyrrolinone
+        B in {6038, 6062, 6067, 6070, 6071, 6074, 6075}          N-alkyl /
+             O-CH2-cyclopropyl homologues of a pyrazolyl-triazole
+
+    Individually those blocks look mediocre in this DB — 45224 scored once at
+    0.0190, 45257 once at 0.0049, 6074 never. This DB held 112 molecules with an
+    A from that range and 67 with a B from it, and ZERO with both. The winning
+    cell had never been sampled once.
     """
 
     def __init__(self, rxn_id: int, manager: MoleculeManager,
@@ -430,6 +529,10 @@ class Generator:
         }
         self._w: Dict[str, Optional[np.ndarray]] = {}
         self._elite: Dict[str, np.ndarray] = {}
+        # Reactant-space fingerprint index for block_scan, built lazily per role
+        # and memoised on disk: {role: (ids ndarray, [fingerprints])}.
+        self._rfp: Dict[str, Optional[Tuple[np.ndarray, List[Any]]]] = {}
+        self._knn: Dict[Tuple[str, int, int], List[int]] = {}
         self.synthon = None
         if SynthonLibrary is not None:
             try:
@@ -566,6 +669,157 @@ class Generator:
             out = out[:n]
         return out
 
+    # -- block scan --------------------------------------------------------
+
+    def _reactant_index(self, role: str) -> Optional[Tuple[np.ndarray, List[Any]]]:
+        """
+        (ids, fingerprints) for every building block valid at `role`.
+
+        Built once and pickled: a reaction's building-block set is fixed, and
+        rebuilding 83,307 Morgan fingerprints on every process start would cost
+        more than the operator saves.
+        """
+        if role in self._rfp:
+            return self._rfp[role]
+
+        import pickle
+        path = os.path.join(REACTANT_FP_DIR, f"rxn{self.rxn_id}_{role}.pkl")
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    blob = pickle.load(f)
+                if blob.get("n_bits") == 2048 and blob.get("ids") is not None:
+                    self._rfp[role] = (np.asarray(blob["ids"], dtype=np.int64),
+                                       blob["fps"])
+                    log.info("block: reactant index %s = %d fingerprints (cache)",
+                             role, len(blob["fps"]))
+                    return self._rfp[role]
+            except Exception as e:
+                log.warning("block: reactant cache unreadable (%s); rebuilding", e)
+
+        mols = {"A": getattr(self.sub, "molecules_A", None),
+                "B": getattr(self.sub, "molecules_B", None),
+                "C": getattr(self.sub, "molecules_C", None)}.get(role)
+        if not mols:
+            self._rfp[role] = None
+            return None
+
+        t0 = time.time()
+        ids, fps = [], []
+        for row in mols:
+            cid, smi = int(row[0]), row[1]
+            m = Chem.MolFromSmiles(smi) if smi else None
+            if m is None:
+                continue          # attachment-point dummies parse fine; junk does not
+            ids.append(cid)
+            fps.append(MORGAN.GetFingerprint(m))
+        if not fps:
+            self._rfp[role] = None
+            return None
+
+        self._rfp[role] = (np.asarray(ids, dtype=np.int64), fps)
+        try:
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump({"n_bits": 2048, "ids": ids, "fps": fps}, f)
+            os.replace(tmp, path)   # atomic: five hunters share this directory
+        except Exception as e:
+            log.warning("block: could not cache reactant index: %s", e)
+        log.info("block: reactant index %s = %d fingerprints | %.1fs",
+                 role, len(fps), time.time() - t0)
+        return self._rfp[role]
+
+    def _reactant_knn(self, role: str, cid: Optional[int], k: int) -> List[int]:
+        """`cid` plus its k nearest building blocks by Tanimoto, same role."""
+        if cid is None:
+            return [None]
+        if k <= 0:
+            return [int(cid)]
+        ck = (role, int(cid), int(k))
+        hit = self._knn.get(ck)
+        if hit is not None:
+            return hit
+        idx = self._reactant_index(role)
+        if idx is None:
+            self._knn[ck] = [int(cid)]
+            return self._knn[ck]
+        ids, fps = idx
+        pos = np.flatnonzero(ids == int(cid))
+        if not len(pos):
+            self._knn[ck] = [int(cid)]
+            return self._knn[ck]
+        p = int(pos[0])
+        sims = np.asarray(DataStructs.BulkTanimotoSimilarity(fps[p], fps),
+                          dtype=np.float32)
+        sims[p] = -1.0                                  # exclude self, re-added first
+        take = min(k, len(sims) - 1)
+        near = np.argpartition(-sims, take)[:take]
+        near = near[np.argsort(-sims[near])]
+        out = [int(cid)] + [int(ids[j]) for j in near]
+        self._knn[ck] = out
+        return out
+
+    def block_scan(self, scored: pd.DataFrame, seen: Set[str], n: int) -> List[str]:
+        """
+        Enumerate the CROSS PRODUCT of each seed molecule's reactant
+        neighbourhoods — the operator that finds A-family x B-family effects.
+
+        Cells already in `seen` are skipped, so a block that has been mined out
+        costs nothing and the walk moves on to the next seed. That doubles as a
+        cheap dead-block memory: re-seeding on an exhausted region yields no
+        candidates instead of re-proposing molecules that get filtered later.
+        """
+        if n <= 0 or scored.empty:
+            return []
+        k = max(0, int(self.args.block_k))
+
+        # Seeds are walked in score order but capped per reactant. Taking the
+        # plain top-N would seed every block from the same over-mined building
+        # block: rxn1's highest scorers are almost all `59225:*`, a component
+        # this DB has evaluated 2,017 times, and its neighbourhood is mined out.
+        # A first pass with these caps returned 236 candidates against a quota
+        # of 1,800 for exactly that reason. Capping seed reuse spreads the scan
+        # over distinct chemistry and fills the quota from live blocks.
+        reuse = max(1, int(self.args.block_seed_reuse))
+        pool = scored.nlargest(min(self.args.block_seed_pool, len(scored)),
+                               "score")["name"].tolist()
+        used_a: Dict[int, int] = {}
+        used_b: Dict[int, int] = {}
+
+        out: List[str] = []
+        local: Set[str] = set()
+        n_seeds = 0
+        for nm in pool:
+            if len(out) >= n or n_seeds >= self.args.block_seeds:
+                break
+            a, b, c = parse_components(nm)
+            if a is None or b is None:
+                continue
+            if used_a.get(a, 0) >= reuse or used_b.get(b, 0) >= reuse:
+                continue
+            used_a[a] = used_a.get(a, 0) + 1
+            used_b[b] = used_b.get(b, 0) + 1
+            n_seeds += 1
+
+            An = self._reactant_knn("A", a, k)
+            Bn = self._reactant_knn("B", b, k)
+            Cn = self._reactant_knn("C", c, k) if self.three else [None]
+            for aa in An:
+                for bb in Bn:
+                    for cc in Cn:
+                        if aa is None or bb is None:
+                            continue
+                        m = make_name(self.rxn_id, aa, bb, cc)
+                        if m in seen or m in local:
+                            continue
+                        local.add(m)
+                        out.append(m)
+        log.info("  block: %d seeds -> %d unscored cells", n_seeds, len(out))
+        if len(out) > n:
+            self.py.shuffle(out)
+            out = out[:n]
+        return out
+
     def broad(self, n: int) -> List[str]:
         if n <= 0:
             return []
@@ -577,17 +831,45 @@ class Generator:
         t0 = time.time()
         self.refresh()
         warm = len(scored) >= self.args.min_train
-        mix = ({"elite": 0.30, "anchored": 0.25, "pair": 0.15,
-                "neighbour": 0.10, "broad": 0.20}
-               if warm else
-               {"elite": 0.25, "anchored": 0.20, "pair": 0.10,
-                "neighbour": 0.05, "broad": 0.40})
+        # Weights measured, not guessed. For each reaction, 250 top-1% molecules
+        # were expanded by each move and the resulting cells' hit rate at the
+        # reaction's own p99.5 frontier compared against the same expansion of
+        # 250 RANDOM scored molecules (a paired design, so the bias from both
+        # arms being already-scored largely cancels):
+        #
+        #     move                      rxn1   rxn2   rxn3   rxn4   rxn5
+        #     one-sided, same A         1.5x   1.3x   0.7x   0.5x   0.6x
+        #     one-sided, same B         2.9x   0.6x   0.8x   0.6x   0.3x
+        #     block (both sides, k=2)  21.1x   4.8x   5.2x   4.1x   2.8x
+        #
+        # `elite`, `anchored` and `pair` are all one-sided moves — they pin or
+        # vary one position and draw the partner from the prior — and they are
+        # at or BELOW the random-block baseline in four of five reactions.
+        # `pair` is the weakest of the three and takes the largest cut. What
+        # they are still worth is reaching regions `block` cannot see at all:
+        # block only proposes cells adjacent to something already scored, so it
+        # harvests, and `broad` + `anchored` are what discover. Hence the share
+        # moved out of `pair`/`elite` goes mostly to `broad`, which with the
+        # de-biased prior (field_prior._ucb) is no longer near-random sampling.
+        base = ({"elite": 0.12, "anchored": 0.22, "pair": 0.06,
+                 "neighbour": 0.06, "broad": 0.34}
+                if warm else
+                {"elite": 0.12, "anchored": 0.22, "pair": 0.06,
+                 "neighbour": 0.06, "broad": 0.54})
+        bf = float(np.clip(self.args.block_frac if warm
+                           else self.args.block_frac * 0.5, 0.0, 0.9))
+        scale = (1.0 - bf) / sum(base.values())
+        mix = {"block": bf}
+        mix.update({k: v * scale for k, v in base.items()})
 
         names: List[str] = []
+        origin: Dict[str, str] = {}
         for label, frac in mix.items():
             k = int(n_total * frac)
             t = time.time()
-            if label == "elite":
+            if label == "block":
+                got = self.block_scan(scored, seen, k)
+            elif label == "elite":
                 got = self.elite_pairs(k)
             elif label == "anchored":
                 got = self.anchored(k)
@@ -599,6 +881,21 @@ class Generator:
                 got = self.broad(k)
             log.info("  gen/%-10s %6d candidates | %.2fs", label, len(got),
                      time.time() - t)
+            for nm in got:
+                origin.setdefault(nm, label)
+            names += got
+
+        # `block` and `neighbour` can both come up short — a block whose cells
+        # are all already scored yields nothing, which is the correct behaviour
+        # but must not silently shrink the round's pool.
+        shortfall = n_total - len(names)
+        if shortfall > n_total * 0.05:
+            t = time.time()
+            got = self.broad(shortfall)
+            log.info("  gen/%-10s %6d candidates | %.2fs (top-up)", "broad+",
+                     len(got), time.time() - t)
+            for nm in got:
+                origin.setdefault(nm, "broad")
             names += got
 
         uniq, local = [], set()
@@ -626,6 +923,7 @@ class Generator:
         valid = valid[valid["smiles"].map(lambda s: heavy_atoms(s) <= HEAVY_HARD_MAX)]
         valid["inchikey"] = valid["smiles"].map(inchikey)
         valid = valid[valid["inchikey"] != ""].drop_duplicates("inchikey")
+        valid["strategy"] = valid["name"].map(origin).fillna("unknown")
         log.info(
             "  gen/total   %6d proposed -> %d valid -> %d post-BRENK -> %d unique | %.1fs",
             len(uniq), n0, n1, len(valid), time.time() - t0,
@@ -963,6 +1261,32 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=10)
     p.add_argument("--min-train", type=int, default=500)
     p.add_argument("--train-cap", type=int, default=30000)
+    p.add_argument("--block-frac", type=float, default=0.30,
+                   help="fraction of the candidate pool built by the 2-D "
+                        "reactant-block scan. This is the only operator that "
+                        "can express an A-family x B-family interaction; epoch "
+                        "24796's winner took 18 of 20 molecules from one such "
+                        "block and this DB had never sampled a single cell of "
+                        "it (112 molecules with that A range, 67 with that B "
+                        "range, 0 with both)")
+    p.add_argument("--block-seeds", type=int, default=400,
+                   help="cap on blocks expanded per round. block_scan is meant "
+                        "to be SUPPLY-limited, not seed-limited: it stops as "
+                        "soon as --block-frac is met, and the cap only prevents "
+                        "a runaway on a reaction with tiny blocks. At 60 it was "
+                        "the binding constraint and starved the operator")
+    p.add_argument("--block-seed-pool", type=int, default=3000,
+                   help="how deep into the score-ordered DB block_scan may look "
+                        "for seeds that still pass the per-reactant cap")
+    p.add_argument("--block-seed-reuse", type=int, default=1,
+                   help="how many times one reactant may anchor a block in a "
+                        "single round. 1 forces every block onto distinct "
+                        "chemistry; without it rxn1 would seed nearly every "
+                        "block from component 59225, which has already taken "
+                        "2,017 evaluations and whose neighbourhood is exhausted")
+    p.add_argument("--block-k", type=int, default=6,
+                   help="structural neighbours per reactant position, so a "
+                        "two-component block is (k+1)^2 = 49 cells")
     p.add_argument("--elite-anchors", type=int, default=40)
     p.add_argument("--pair-anchors", type=int, default=400)
     p.add_argument("--neighbour-min-sim", type=float, default=0.35)
@@ -1012,16 +1336,44 @@ def parse_args():
     p.add_argument("--confirm-floor", type=float, default=0.08,
                    help="threshold never drops below this, so an early or weak "
                         "round does not confirm everything it scored")
-    p.add_argument("--confirm-max-frac", type=float, default=0.30,
+    p.add_argument("--confirm-max-frac", type=float, default=0.08,
                    help="hard cap on the fraction of a round that gets "
                         "confirmed; above it the threshold is raised to the "
                         "matching quantile. Each confirmation costs 2 extra "
                         "Boltz calls (default 0.30)")
     p.add_argument("--confirm-extra-rounds", type=int, default=CONFIRM_EXTRA_ROUNDS,
-                   help="extra draws per confirmed molecule (default 2, giving "
-                        "3 total)")
+                   help="extra draws per ROUND-LEADER molecule. Default is now "
+                        "0 (was 2). Measured: our own same-seed replicate "
+                        "spread is sd=0.0034 (rxn1 .0033 rxn2 .0026 rxn3 .0033 "
+                        "rxn4 .0046), but the sd of (validator score - our "
+                        "score) is 0.0095 on n=519 molecules other miners "
+                        "submitted that we had also scored. Averaging three "
+                        "local draws therefore moves selection error from "
+                        "~0.0100 to ~0.0097 — about 9%% of the variance that "
+                        "decides our score — for 6-11%% of the GPU budget "
+                        "(measured from molecule_replicates: 28 Aug rxn2 wrote "
+                        "834 extra predictions against 7,310 fresh ones). It is "
+                        "also one-sided: only molecules above the threshold are "
+                        "re-drawn, so it can demote a lucky molecule but never "
+                        "promote an unlucky one, which fixes the reported "
+                        "number without repairing the ranking. See "
+                        "--top20-confirm-draws for the confirmation that is "
+                        "actually worth paying for")
     p.add_argument("--no-confirm", action="store_true",
-                   help="skip the 3-draw confirmation of this round's winners")
+                   help="skip the confirmation of this round's leaders")
+    p.add_argument("--top20-confirm-draws", type=int, default=1,
+                   help="extra draws given to any molecule that has entered the "
+                        "SUBMITTABLE TOP 20 and has not been confirmed before. "
+                        "This is the only set that is ever submitted, so it is "
+                        "the only set whose noise costs anything: our top-20 "
+                        "regressed by -0.0028 per molecule against the "
+                        "validator across epochs 24793-24796 (-0.079, -0.024, "
+                        "-0.067, -0.091 on the sum), and in 24793 and 24795 "
+                        "that loss alone exceeded the gap to the winner. Cost "
+                        "is bounded at 20 predictions per round and falls to "
+                        "~0 once the frontier stops moving, because "
+                        "rescore.confirm_high_scorers never pays twice for the "
+                        "same molecule. 0 disables")
     p.add_argument("--dry-run", action="store_true",
                    help="generate, rank and report — no Boltz, no DB writes")
     return p.parse_args()
@@ -1112,10 +1464,42 @@ async def main() -> None:
             scored = scored[np.isfinite(scored["score"])]
         seen = set(scored["name"].tolist()) if not scored.empty else set()
 
-        surrogate.fit(scored)
-        if round_no == 1 or round_no % 5 == 0:
+        # The archive grows every epoch — roughly 900 new molecules from ~45
+        # miners — and a molecule that was novel when it was scored stops being
+        # novel the moment anyone submits it. novelty.py documents refresh() as
+        # "call this periodically inside long runs" and this loop never did, so
+        # a searcher running for days screened against a days-old archive.
+        #
+        # That is not a cosmetic error: the validator's molecule check is
+        # all-or-nothing (molecule_validity.py — one molecule failing any test
+        # `break`s the loop and the whole 20-molecule submission is discarded),
+        # which is the shape of the 14 consecutive -999.99 epochs 24760-24773.
+        if round_no == 1 or round_no % 2 == 0:
+            try:
+                n_arch = guard.refresh()
+                # The InChIKey half of the gate has its own cache, and it goes
+                # stale in exactly the same way.
+                novelty._INCHIKEY_CACHE.pop(target, None)
+                log.info("novelty: archive refreshed — %d fingerprints", n_arch)
+            except Exception as e:
+                log.warning("novelty: archive refresh failed (%s); "
+                            "continuing on the cached archive", e)
+
+        # Refreshed every other round rather than every fifth: a round is ~43
+        # minutes, so the old cadence left component statistics up to 3.5 hours
+        # behind the DB they are computed from, and block_scan seeds off exactly
+        # those statistics.
+        #
+        # This has to happen BEFORE fit(). The surrogate's component features are
+        # read from this object, so refreshing between fit() and predict() would
+        # train on one prior and rank with another — harmless when the features
+        # were raw maxima, but not now that they carry an imputed value for
+        # unobserved components and a log-count of the evidence behind each one.
+        if round_no == 1 or round_no % 2 == 0:
             prior.__init__(rxn_id, db_path=db_path,
                            field_weight=args.field_weight, logger=None)
+
+        surrogate.fit(scored)
 
         before = submittable_top20(db_path, rxn_id, guard, target, config)
         sum_before = float(before["score"].sum()) if len(before) else 0.0
@@ -1164,6 +1548,10 @@ async def main() -> None:
         chosen = select_batch(novel, args.boltz_budget, args.explore_frac, rng,
                               key=key)
         chosen["source"] = "hunter"
+        if "strategy" in chosen.columns:
+            share = chosen["strategy"].value_counts()
+            log.info("[round %d] selected by strategy: %s", round_no,
+                     " ".join(f"{k}={v}" for k, v in share.items()))
 
         if args.dry_run:
             log.info("[round %d] DRY RUN — would score %d molecules (key=%s):",
@@ -1197,7 +1585,7 @@ async def main() -> None:
         new = await boltz_score(boltz, config, payload, args.batch_size,
                                 mark_at=frontier, on_batch=persist)
 
-        if new and not args.no_confirm:
+        if new and not args.no_confirm and args.confirm_extra_rounds > 0:
             # `before` is this round's pre-scoring submittable top-20, so the
             # threshold reflects the bar the round actually had to beat.
             conf_thr, why = resolve_confirm_threshold(args, before)
@@ -1254,6 +1642,35 @@ async def main() -> None:
                 source="hunter")
 
         after = submittable_top20(db_path, rxn_id, guard, target, config)
+
+        # Confirm the only set that is ever submitted. Round-leader confirmation
+        # re-measured hundreds of molecules that were never going to be
+        # submitted; this pays for at most `num_molecules` predictions and only
+        # for molecules that have actually reached the submittable frontier.
+        # confirm_high_scorers skips anything already flagged `rescored`, so the
+        # steady-state cost is one draw per NEW entrant to the top 20.
+        if (not args.dry_run and args.top20_confirm_draws > 0
+                and boltz is not None and len(after)):
+            records = after.assign(source="hunter").to_dict("records")
+            averaged = await rescore.confirm_high_scorers(
+                boltz=boltz, config=config, scored=records,
+                threshold=-math.inf,
+                extra_rounds=args.top20_confirm_draws,
+                batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
+                round_no=round_no, target_key=target_key,
+                target_label=target_label, source="hunter", logger=log)
+            if averaged:
+                moved = np.array(
+                    [averaged[n] - float(after.loc[after["name"] == n, "score"].iloc[0])
+                     for n in averaged if (after["name"] == n).any()], dtype=float)
+                log.info("[round %d] top-20 gate: confirmed %d new entrant(s) | "
+                         "net %+.6f | %d came down",
+                         round_no, len(averaged),
+                         float(moved.sum()) if len(moved) else 0.0,
+                         int((moved < 0).sum()) if len(moved) else 0)
+                # Confirmed values can reorder the frontier, so re-read it.
+                after = submittable_top20(db_path, rxn_id, guard, target, config)
+
         export_top20(after, rxn_id, target)
         sum_after = float(after["score"].sum()) if len(after) else 0.0
 
