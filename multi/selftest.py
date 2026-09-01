@@ -88,8 +88,19 @@ def main() -> int:
     if len(scores) != len(mols):
         print(f"    FAIL: molecule_scores has {len(scores)} entries for {len(mols)} inputs")
         ok = False
-    if not finite:
-        print("    FAIL: nothing scored — check the worker traceback above")
+    # Every molecule must score. An earlier version only failed when NOTHING
+    # scored, so the first 4x5090 run printed PASS having lost 3 of 4 chunks to
+    # corrupted checkpoints -- the one outcome this tool exists to catch.
+    if len(finite) < len(mols):
+        lost = len(mols) - len(finite)
+        print(f"    FAIL: {lost}/{len(mols)} molecule(s) did not score.")
+        print( "          Scroll up for the worker traceback. Most likely causes:")
+        print( "            - 'PytorchStreamReader failed reading zip archive' -> the")
+        print( "              model cache is corrupt. Delete the bad file and re-run:")
+        print( "                rm -f ~/.boltz/boltz2_conf.ckpt ~/.boltz/boltz2_aff.ckpt")
+        print( "              The pool now warms the cache in one worker first, so a")
+        print( "              cold machine no longer races 8 downloads onto one path.")
+        print( "            - 'CUDA out of memory' -> lower NOVA_MULTI_WORKERS_PER_GPU")
         ok = False
 
     # Order is the contract orchestrator.py relies on explicitly.

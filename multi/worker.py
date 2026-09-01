@@ -101,6 +101,32 @@ def _stop_bt_log_listener() -> None:
         pass
 
 
+def warm_model_cache() -> str:
+    """Populate ~/.boltz before any concurrent predict() runs.
+
+    boltz downloads its CCD data and both checkpoints on first use, INSIDE
+    predict(), straight to fixed paths under the cache directory. Nothing
+    coordinates that, so N workers starting together on a fresh machine all
+    download to the same files at once and most then read a half-written zip:
+
+        Downloading the Boltz-2 weights to /root/.boltz/boltz2_conf.ckpt
+        ...
+        RuntimeError: PytorchStreamReader failed reading zip archive:
+        failed finding central directory
+
+    That is what happened on the first 4x5090 run: 8 workers, 3 of 4 chunks lost,
+    one survivor. download_boltz2() is guarded by exists() checks, so calling it
+    here is free once the cache is warm; the pool calls it in ONE worker and
+    waits before starting the others.
+    """
+    from pathlib import Path
+    from boltz.main import download_boltz2
+    cache = Path(os.environ.get("BOLTZ_CACHE", "~/.boltz")).expanduser()
+    cache.mkdir(parents=True, exist_ok=True)
+    download_boltz2(cache)
+    return str(cache)
+
+
 def worker_main(gpu_id: int, worker_id: int, base_dir: str,
                 task_q, result_q, ready_q) -> None:
     # Must happen before torch is imported anywhere in this process.
@@ -113,12 +139,18 @@ def worker_main(gpu_id: int, worker_id: int, base_dir: str,
             sys.path.insert(0, p)
 
     tag = f"multi{os.getpid()}_w{worker_id}"
+    warm = os.environ.get("NOVA_MULTI_WARM_CACHE") == "1"
     try:
         from boltz_wrapper import BoltzWrapper
         boltz = BoltzWrapper()
         _isolate(boltz, tag)
+        if warm:
+            # This worker is the pool's designated cache warmer; the others are
+            # not started until it reports ready.
+            warm_model_cache()
         ready_q.put({"worker_id": worker_id, "gpu": gpu_id, "ok": True,
-                     "pid": os.getpid(), "workspace": boltz.input_dir})
+                     "pid": os.getpid(), "workspace": boltz.input_dir,
+                     "warmed": warm})
     except Exception as e:
         ready_q.put({"worker_id": worker_id, "gpu": gpu_id, "ok": False,
                      "pid": os.getpid(),

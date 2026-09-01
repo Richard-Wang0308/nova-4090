@@ -54,6 +54,10 @@ CHUNKS_PER_WORKER = 2
 # that only a genuinely wedged worker trips it.
 CHUNK_TIMEOUT_S = 2700.0
 WORKER_START_TIMEOUT_S = 600.0
+# A cold cache downloads ~6 GiB (mols.tar, both checkpoints) before the first
+# worker can report ready. Generous, because the alternative is a corrupted
+# checkpoint and a lost round.
+WARM_CACHE_TIMEOUT_S = 3600.0
 
 log = get_logger("multi.pool")
 
@@ -171,14 +175,32 @@ class BoltzPool:
         # these loggers) after this module was first imported.
         ensure_visible()
         self.log.info("multi: starting %s", topology.describe(self.plan))
-        for wid, gpu in enumerate(self.plan):
+        # Worker 0 goes first and populates ~/.boltz while the others wait. On a
+        # warm cache this costs a couple of seconds; on a fresh machine it is the
+        # difference between working and losing most of the first round to
+        # concurrent downloads corrupting the checkpoint (see warm_model_cache).
+        self._spawn(0, self.plan[0], warm_cache=True)
+        first = None
+        try:
+            first = self.ready_q.get(timeout=WARM_CACHE_TIMEOUT_S)
+        except queue.Empty:
+            self.log.error("multi: cache-warming worker did not report within "
+                           "%.0fs; starting the rest anyway", WARM_CACHE_TIMEOUT_S)
+        if first is not None and first.get("ok"):
+            self.log.info("multi: model cache ready (worker %d on GPU %d)",
+                          first["worker_id"], first["gpu"])
+        for wid, gpu in list(enumerate(self.plan))[1:]:
             self._spawn(wid, gpu)
         # Wait for each worker to report that its BoltzWrapper constructed.
         # A worker that cannot import boltz should fail here, once, rather than
         # on every chunk.
         deadline = time.time() + WORKER_START_TIMEOUT_S
-        alive = 0
-        for _ in range(len(self.plan)):
+        alive = 1 if (first is not None and first.get("ok")) else 0
+        if first is not None and not first.get("ok"):
+            self.log.error("multi: worker %s failed to start: %s",
+                           first.get("worker_id"), first.get("error"))
+            self.log.debug("%s", first.get("tb", ""))
+        for _ in range(len(self.plan) - 1):
             try:
                 msg = self.ready_q.get(timeout=max(1.0, deadline - time.time()))
             except queue.Empty:
@@ -200,15 +222,25 @@ class BoltzPool:
                              alive, len(self.plan))
         self._started = True
 
-    def _spawn(self, wid: int, gpu: int) -> None:
+    def _spawn(self, wid: int, gpu: int, warm_cache: bool = False) -> None:
+        # Passed through the environment because the child is forked from the
+        # forkserver, which inherits it.
+        prev = os.environ.get("NOVA_MULTI_WARM_CACHE")
+        os.environ["NOVA_MULTI_WARM_CACHE"] = "1" if warm_cache else "0"
         p = self.ctx.Process(
             target=worker_main,
             args=(gpu, wid, BASE_DIR, self.task_q, self.result_q, self.ready_q),
             daemon=False,        # boltz's DataLoader needs to fork children
             name=f"boltz-w{wid}-gpu{gpu}",
         )
-        with _no_main_fixup():
-            p.start()
+        try:
+            with _no_main_fixup():
+                p.start()
+        finally:
+            if prev is None:
+                os.environ.pop("NOVA_MULTI_WARM_CACHE", None)
+            else:
+                os.environ["NOVA_MULTI_WARM_CACHE"] = prev
         self.procs[wid] = p
 
     def shutdown(self) -> None:
