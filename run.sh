@@ -10,6 +10,7 @@
 #   ./run.sh restart 4      restart with fresh env
 #   ./run.sh logs 4         follow one reaction
 #   ./run.sh status         pm2 list + per-reaction progress
+#   ./run.sh plan 2         show what start would launch, without launching
 #   ./run.sh save           persist the process list across reboot
 #
 #   MULTI=0 ./run.sh start 4          single-GPU path (the original BoltzWrapper)
@@ -83,6 +84,27 @@ WORKERS_PER_GPU="${WORKERS_PER_GPU:-}"
 
 # How many workers the planner will actually start on this machine, asked once
 # so the batch size can be matched to it.
+# Everything the launch sizing decides, in one place, so `./run.sh plan` reports
+# exactly what `./run.sh start` will use. Emits shell assignments to be eval'd.
+size_launch() {
+  local flags="$1" workers budget batch base_pool pool
+  if [ "$MULTI" != "1" ]; then
+    printf 'workers=1 budget=%s batch=%s pool=; SIZED_FLAGS=%q\n' \
+      "$HUNTER_BUDGET" "$HUNTER_BATCH" "$flags"
+    return
+  fi
+  workers=$(plan_count)
+  budget=$(autoscale_budget "$workers")
+  batch=$(autoscale_batch "$workers" "$budget")
+  base_pool=$(printf '%s' "$flags" | grep -oE -- '--candidate-pool [0-9]+' | awk '{print $2}')
+  pool=$(autoscale_pool "$workers" "$base_pool")
+  if [ -n "$base_pool" ] && [ -n "$pool" ]; then
+    flags=$(printf '%s' "$flags" | sed -E "s/--candidate-pool $base_pool/--candidate-pool $pool/")
+  fi
+  printf 'workers=%s budget=%s batch=%s pool=%s; SIZED_FLAGS=%q\n' \
+    "$workers" "$budget" "$batch" "${pool:-$base_pool}" "$flags"
+}
+
 plan_count() {
   local n
   n=$(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU" \
@@ -91,24 +113,62 @@ plan_count() {
   case "$n" in ''|*[!0-9]*) echo 1 ;; *) echo "$n" ;; esac
 }
 
-# Boltz reloads its checkpoints on every call, costing ~22 s regardless of how
-# many molecules the call carries. The pool splits a call into ~2 chunks per
-# worker, so the batch has to grow with the worker count or those chunks shrink
-# below the point where the setup is amortised:
+# THREE nested quantities, and only the middle one is a real "batch":
 #
-#   8 workers, batch 60  -> chunks of 8   -> 26% of wall clock is setup
-#   8 workers, batch 240 -> chunks of 15  -> 8.6%
+#   --boltz-budget   molecules per ROUND (surrogate refit, top-20 recompute)
+#   --batch-size     molecules per score_molecules() call
+#   pool chunk       molecules per predict() call, = ceil(batch / (workers*2)),
+#                    clamped to [8, 48] by multi/pool.py
+#   Boltz DataLoader batch_size=1, hardcoded in boltz/.../inferencev2.py:391 --
+#                    Boltz scores one molecule at a time and has no batch arg.
 #
-# 30 molecules per worker keeps every chunk in the efficient range on any box.
+# The ~22 s of checkpoint loading is paid per predict() call, i.e. per CHUNK, so
+# chunk size is the only one that governs overhead. Keeping it at 30 costs 8.6%.
+#
+# Budget must scale with workers, not just batch. A fixed 150-molecule round
+# split 8 ways is ~19 molecules per worker, which cannot amortise the setup no
+# matter how the batch is sized:
+#
+#   workers  chunk  setup%  speedup       (budget fixed at 150)
+#      1       30     8.6    1.00x
+#      2       15    15.8    1.84x
+#      4       15    15.8    3.07x
+#      8       10    22.0    6.40x   <- 20% of an 8-GPU box lost to setup
+#
+# Scaling the budget with the worker count holds chunk at 30 and restores linear
+# scaling (1.00 / 2.00 / 4.00 / 8.00x). It also keeps a round at roughly the same
+# WALL CLOCK (~21 min) whatever the hardware, so the search re-fits its surrogate
+# and refreshes its frontier just as often in time as it does on one GPU.
+autoscale_budget() {
+  local workers="$1"
+  if [ "$MULTI" != "1" ]; then echo "$HUNTER_BUDGET"; return; fi
+  echo $(( HUNTER_BUDGET * workers ))
+}
+
+# 60 per worker, because the pool makes 2 chunks per worker: chunk lands on 30.
 autoscale_batch() {
-  local workers="$1" b
+  local workers="$1" budget="$2" b
   if [ "$MULTI" != "1" ]; then echo "$HUNTER_BATCH"; return; fi
-  b=$(( workers * 30 ))
+  b=$(( workers * 60 ))
   [ "$b" -lt "$HUNTER_BATCH" ] && b="$HUNTER_BATCH"
-  # Never exceed the round budget; a batch larger than the round is pointless
-  # and costs more work on a crash.
-  [ "$b" -gt "$HUNTER_BUDGET" ] && b="$HUNTER_BUDGET"
+  [ "$b" -gt "$budget" ] && b="$budget"
   echo "$b"
+}
+
+# Scoring more molecules per round means reaching further down the surrogate's
+# ranking, so the candidate pool has to grow too or selectivity falls: 22,000
+# candidates for 150 slots is 150:1, but for 1,200 slots it is 19:1.
+#
+# Capped at 3x because generation and ranking are CPU-bound and serialised ahead
+# of the GPU work (~50 s per 28,000 candidates measured on rxn2). Beyond ~3x they
+# become the next bottleneck -- worth measuring on the real box before raising.
+autoscale_pool() {
+  local workers="$1" base="$2" mult="$workers"
+  # No --candidate-pool in this reaction's flags: nothing to scale.
+  case "$base" in ''|*[!0-9]*) echo ""; return ;; esac
+  if [ "$MULTI" != "1" ]; then echo "$base"; return; fi
+  [ "$mult" -gt 3 ] && mult=3
+  echo $(( base * mult ))
 }
 
 # Reaction -> GPU index, used ONLY on the single-GPU path (MULTI=0).
@@ -159,18 +219,17 @@ start_one() {
   fi
   local interp_args=()
   local -a envs=()
-  local batch="$HUNTER_BATCH"
+  local batch budget workers pool
+  eval "$(size_launch "$flags")"
+  flags="$SIZED_FLAGS"
   if [ "$MULTI" = "1" ]; then
-    local workers
-    workers=$(plan_count)
-    batch=$(autoscale_batch "$workers")
     interp_args=(--interpreter-args "-m multi.run")
     # No CUDA_VISIBLE_DEVICES: the pool must see every card to spread across
     # them. It sets CUDA_VISIBLE_DEVICES itself, per worker, to one id.
     envs=()
     [ -n "$WORKERS_PER_GPU" ] && envs+=(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU")
     [ -n "${GPU_IDS:-}" ] && envs+=(NOVA_MULTI_GPU_IDS="$GPU_IDS")
-    echo "starting $name via multi.run | ${workers} worker(s) auto-planned, batch ${batch}, GPUs: ${GPU_IDS:-all detected}"
+    echo "starting $name via multi.run | ${workers} worker(s) auto-planned | budget ${budget} batch ${batch} pool ${pool:-$base_pool} | GPUs: ${GPU_IDS:-all detected}"
   else
     envs=(CUDA_VISIBLE_DEVICES="$gpu")
     echo "starting $name on GPU $gpu (single-GPU path, batch ${batch})"
@@ -187,7 +246,7 @@ start_one() {
       --max-restarts 10 \
       --kill-timeout 30000 \
       -- --rxn-id "$r" \
-         --boltz-budget "$HUNTER_BUDGET" \
+         --boltz-budget "$budget" \
          --batch-size "$batch" \
          $flags
 }
@@ -216,6 +275,17 @@ case "$cmd" in
     # --update-env so a changed CUDA_VISIBLE_DEVICES actually takes effect.
     for r in $(expand "${@:-all}"); do
       CUDA_VISIBLE_DEVICES="$(GPU_FOR "$r")" pm2 restart "$(NAME_FOR "$r")" --update-env 2>/dev/null
+    done
+    ;;
+  plan)
+    # What `start` would launch, without launching it.
+    for r in $(expand "${@:-2}"); do
+      flags="$(opts_for "$r")" || continue
+      eval "$(size_launch "$flags")"
+      echo "rxn$r:"
+      echo "  $("$PY" -m multi.topology 2>/dev/null | head -1)"
+      echo "  workers=$workers  --boltz-budget $budget  --batch-size $batch  --candidate-pool $pool"
+      echo "  chunk per predict() = $("$PY" -c "import sys;sys.path.insert(0,'.');from multi.pool import choose_chunk_size as c;print(c($batch,$workers))") molecules"
     done
     ;;
   logs)
