@@ -12,6 +12,10 @@
 #   ./run.sh status         pm2 list + per-reaction progress
 #   ./run.sh save           persist the process list across reboot
 #
+#   MULTI=0 ./run.sh start 4          single-GPU path (the original BoltzWrapper)
+#   WORKERS_PER_GPU=2 ./run.sh start 4
+#   GPU_IDS=0,1 ./run.sh start 4      restrict the pool to some cards
+#
 # -----------------------------------------------------------------------------
 # INTERPRETER: it must be the venv python, NOT the system python3.
 #   /usr/bin/python3 -c "import rdkit"  ->  ModuleNotFoundError
@@ -52,8 +56,39 @@ BASE="$(pwd -P)"
 PY="$BASE/.venv/bin/python"
 source "$BASE/hunter_opts.sh"
 
-# Reaction -> GPU index. One card here, so everything goes to 0.
-# With five cards, change to:  echo $(( $1 - 1 ))
+# ---------------------------------------------------------------------------
+# MULTI-GPU
+# ---------------------------------------------------------------------------
+# MULTI=1 routes the searcher through `python -m multi.run`, which swaps the
+# name `boltz_wrapper` for a pool of single-GPU worker processes. hunter.py is
+# NOT modified; see multi/README.md.
+#
+# WORKERS_PER_GPU defaults to 1 on this box, not to multi/'s own default of 2,
+# and that is deliberate. Two workers next to a long-running hunter took this
+# machine out of RAM on 31 Aug and the kernel killed the searcher mid-round:
+# 60 GiB total, and hunter.py grows to ~50 GiB RSS over 14 hours (14.6 GiB at
+# 28 minutes). VRAM was never the constraint -- 26 of 32 GiB were free.
+#
+# At WORKERS_PER_GPU=1 the pool still pays for itself, because HUNTER_BATCH=60
+# is chunked into 2 calls of 30 instead of 6 calls of 10: per-call setup drops
+# from 22% of wall clock to ~8.6%.
+#
+# Raise it to 2+ once the memory growth is understood, or on a box with more
+# RAM. `python3 -m multi.bench` measures the right value on an idle machine.
+MULTI="${MULTI:-1}"
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+
+# Reaction -> GPU index, used ONLY on the single-GPU path (MULTI=0).
+#
+# With MULTI=1 this is not used and CUDA_VISIBLE_DEVICES is deliberately NOT
+# set: the pool has to see every card in order to place workers across them.
+# Pinning here would silently confine a 4-GPU box to one card --
+#
+#   4 GPUs, unpinned              -> plan [0, 1, 2, 3, ...]
+#   4 GPUs, CUDA_VISIBLE_DEVICES=0 -> plan [0, 0]
+#
+# To restrict the pool to some cards, use NOVA_MULTI_GPU_IDS=0,2 instead, which
+# multi/topology.py honours without hiding the others from detection.
 GPU_FOR() { echo 0; }
 
 NAME_FOR() { echo "hunter-rxn$1"; }
@@ -89,11 +124,25 @@ start_one() {
   if pm2 describe "$name" >/dev/null 2>&1; then
     echo "$name already in pm2 — use './run.sh restart $r'"; return 0
   fi
-  echo "starting $name on GPU $gpu"
+  local interp_args=()
+  local -a envs=()
+  if [ "$MULTI" = "1" ]; then
+    interp_args=(--interpreter-args "-m multi.run")
+    # No CUDA_VISIBLE_DEVICES: the pool must see every card to spread across
+    # them. It sets CUDA_VISIBLE_DEVICES itself, per worker, to one id.
+    envs=(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU")
+    [ -n "${GPU_IDS:-}" ] && envs+=(NOVA_MULTI_GPU_IDS="$GPU_IDS")
+    echo "starting $name via multi.run (${WORKERS_PER_GPU} worker/GPU, batch ${HUNTER_BATCH}, GPUs: ${GPU_IDS:-all detected})"
+  else
+    envs=(CUDA_VISIBLE_DEVICES="$gpu")
+    echo "starting $name on GPU $gpu (single-GPU path, batch ${HUNTER_BATCH})"
+  fi
   # shellcheck disable=SC2086
-  CUDA_VISIBLE_DEVICES="$gpu" pm2 start hunter.py \
+  env "${envs[@]}" \
+  pm2 start hunter.py \
       --name "$name" \
       --interpreter "$PY" \
+      "${interp_args[@]}" \
       --cwd "$BASE" \
       --time \
       --restart-delay 30000 \

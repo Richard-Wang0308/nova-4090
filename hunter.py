@@ -171,59 +171,165 @@ CONFIRM_EXTRA_ROUNDS = 0
 HEAVY_HARD_MAX = 42
 HEAVY_SWEET_LO, HEAVY_SWEET_HI = 26, 36
 
-_mol: Dict[str, Any] = {}
-_fp: Dict[str, np.ndarray] = {}
-_bv: Dict[str, Any] = {}
-_desc: Dict[str, np.ndarray] = {}
-_heavy: Dict[str, int] = {}
+# =============================================================================
+# Per-molecule caches — BOUNDED
+# =============================================================================
+# These were plain dicts and never evicted anything. Every round generates
+# ~22,000 molecules that have never been seen before (they are novel by
+# construction — `seen` filtering guarantees it), and each one is parsed,
+# fingerprinted and described, so each round permanently added ~22,000 entries
+# to five caches.
+#
+# Measured cost per molecule, on 10,000 real SMILES from score_results_2:
+#
+#     _mol   (RDKit Mol)          17.56 KiB     65%
+#     _fp    (float32 x 2048)      8.17 KiB     30%
+#     _desc                        0.77 KiB
+#     _bv    (ExplicitBitVect)     0.49 KiB
+#     _heavy                       0.03 KiB
+#     ----------------------------------------
+#                                 27.01 KiB  ->  ~604 MiB per round
+#
+# That is ~18 GiB over a 14-hour run, and it matched the observed growth of the
+# rxn2 searcher from 5 GiB to ~50 GiB RSS. It is also what makes multi-GPU
+# scaling impossible: eight Boltz workers need ~48 GiB on a 60 GiB box, leaving
+# nothing for a parent that grows without bound.
+#
+# Two changes. The caches are now LRU-bounded, and the fingerprint is stored as
+# uint8 rather than float32 — a 4x saving for a bit vector that only ever holds
+# 0 and 1. `Surrogate._features` concatenates it with float32 arrays and casts
+# the result, so the promotion happens exactly where it did before.
+# neurons/genetic.py and neurons/miner.py already store their fingerprints as
+# uint8; this brings hunter into line with them.
+#
+# Caps are sized so a round's working set still hits. The passes in generate()
+# are column-wise (`map(brenk_ok)` over every row, then `map(heavy_atoms)`, then
+# `map(inchikey)`), so a cache smaller than one round's pool thrashes between
+# passes rather than degrading gracefully. `_mol` is the exception: it is only
+# ever a stepping stone to _fp/_desc/_heavy, and re-parsing 20,000 SMILES costs
+# ~2 s against a ~1,600 s round, so it gets the smallest cap and saves the most.
+def _cap(name: str, default: int) -> int:
+    try:
+        return max(1024, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+class _Lru:
+    """Insertion-ordered cache with a hard entry cap.
+
+    Stores a sentinel for "computed and the answer was None", so an unparseable
+    SMILES is not re-parsed on every pass.
+    """
+
+    __slots__ = ("_d", "cap")
+
+    MISS = object()
+    NONE = object()
+
+    def __init__(self, cap: int):
+        from collections import OrderedDict
+        self._d = OrderedDict()
+        self.cap = cap
+
+    def get(self, key):
+        v = self._d.get(key, self.MISS)
+        if v is self.MISS:
+            return self.MISS
+        self._d.move_to_end(key)
+        return None if v is self.NONE else v
+
+    def put(self, key, value):
+        self._d[key] = self.NONE if value is None else value
+        self._d.move_to_end(key)
+        while len(self._d) > self.cap:
+            self._d.popitem(last=False)
+        return value
+
+    def clear(self):
+        self._d.clear()
+
+    def __len__(self):
+        return len(self._d)
+
+
+_mol = _Lru(_cap("HUNTER_MOL_CACHE", 20_000))        # ~350 MiB at 17.6 KiB each
+_fp = _Lru(_cap("HUNTER_FP_CACHE", 100_000))         # ~200 MiB at 2.05 KiB each
+_bv = _Lru(_cap("HUNTER_BV_CACHE", 100_000))         # ~50 MiB
+_desc = _Lru(_cap("HUNTER_DESC_CACHE", 100_000))     # ~77 MiB
+_heavy = _Lru(_cap("HUNTER_HEAVY_CACHE", 500_000))   # ~15 MiB
+
+
+def _rss_mib() -> int:
+    """Resident set size of this process, for the per-round growth log."""
+    try:
+        with open(f"/proc/{os.getpid()}/statm", "r", encoding="utf-8") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    except Exception:
+        return 0
+
+
+def _malloc_trim() -> None:
+    """Return freed arena memory to the OS.
+
+    glibc keeps freed blocks in per-thread arenas rather than handing them back,
+    and a round allocates and frees several hundred MiB (the feature matrix, the
+    candidate pool, two tree ensembles). Without this the caches can be bounded
+    and RSS still only ratchets upward.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def mol_of(smiles: str):
-    if smiles not in _mol:
-        try:
-            _mol[smiles] = Chem.MolFromSmiles(smiles)
-        except Exception:
-            _mol[smiles] = None
-    return _mol[smiles]
+    v = _mol.get(smiles)
+    if v is not _Lru.MISS:
+        return v
+    try:
+        m = Chem.MolFromSmiles(smiles)
+    except Exception:
+        m = None
+    return _mol.put(smiles, m)
 
 
 def heavy_atoms(smiles: str) -> int:
     v = _heavy.get(smiles)
-    if v is None:
-        m = mol_of(smiles)
-        v = m.GetNumHeavyAtoms() if m is not None else 0
-        _heavy[smiles] = v
-    return v
+    if v is not _Lru.MISS and v is not None:
+        return v
+    m = mol_of(smiles)
+    return _heavy.put(smiles, m.GetNumHeavyAtoms() if m is not None else 0)
 
 
 def fp_array(smiles: str) -> Optional[np.ndarray]:
     c = _fp.get(smiles)
-    if c is not None:
+    if c is not _Lru.MISS:
         return c
     m = mol_of(smiles)
     if m is None:
         return None
-    arr = np.zeros(2048, dtype=np.float32)
-    arr[list(MORGAN.GetFingerprint(m).GetOnBits())] = 1.0
-    _fp[smiles] = arr
-    return arr
+    # uint8, not float32: 2,048 bytes instead of 8,192 for a vector of 0s and 1s.
+    arr = np.zeros(2048, dtype=np.uint8)
+    arr[list(MORGAN.GetFingerprint(m).GetOnBits())] = 1
+    return _fp.put(smiles, arr)
 
 
 def fp_bv(smiles: str):
     c = _bv.get(smiles)
-    if c is not None:
+    if c is not _Lru.MISS:
         return c
     m = mol_of(smiles)
     if m is None:
         return None
-    b = MORGAN.GetFingerprint(m)
-    _bv[smiles] = b
-    return b
+    return _bv.put(smiles, MORGAN.GetFingerprint(m))
 
 
 def descriptors(smiles: str) -> Optional[np.ndarray]:
     c = _desc.get(smiles)
-    if c is not None:
+    if c is not _Lru.MISS:
         return c
     m = mol_of(smiles)
     if m is None:
@@ -248,8 +354,7 @@ def descriptors(smiles: str) -> Optional[np.ndarray]:
         ],
         dtype=np.float32,
     )
-    _desc[smiles] = v
-    return v
+    return _desc.put(smiles, v)
 
 
 def brenk_ok(smiles: str) -> bool:
@@ -1680,13 +1785,17 @@ async def main() -> None:
         bar = (float(before["score"].iloc[-1]) if len(before) >= 20
                else args.confirm_floor)
         hits = sum(1 for v in vals if v > bar)
+        # Hand freed arena memory back before reporting, so the number logged is
+        # the steady-state footprint rather than this round's high-water mark.
+        _malloc_trim()
         log.info(
             "[round %d done] scored=%d | >%.5f (submittable #20): %d "
             "(%.2f%% hit rate) | best=%.6f | submittable top20 %.6f -> %.6f "
-            "(%+.6f) | %.0fs",
+            "(%+.6f) | %.0fs | rss=%dMiB cache mol/fp=%d/%d",
             round_no, len(vals), bar, hits,
             100.0 * hits / max(len(vals), 1), max(vals) if vals else 0.0,
             sum_before, sum_after, sum_after - sum_before, time.time() - t_round,
+            _rss_mib(), len(_mol), len(_fp),
         )
         await asyncio.sleep(args.sleep)
 

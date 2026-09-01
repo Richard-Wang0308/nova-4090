@@ -4,8 +4,30 @@
 #
 # Derivation of every value is documented in the header of run_all.sh.
 
-HUNTER_BUDGET=150      # Boltz molecules per round (~38 min/round at ~15 s/molecule)
-HUNTER_BATCH=10
+HUNTER_BUDGET=150      # Boltz molecules per round
+
+# Molecules handed to Boltz per call. Raised from 10 to 60.
+#
+# boltz.main.predict() reloads the structure and affinity checkpoints and
+# re-checks the manifest on EVERY call. Measured on the live rxn2 log:
+#
+#   12 s  manifest check + structure checkpoint   (GPU idle)
+#   41 s  structure prediction                    (GPU busy)
+#   10 s  affinity checkpoint                     (GPU idle)
+#   37 s  affinity prediction                     (GPU busy)
+#  ----
+#  101 s  for 10 molecules  ->  22 s of fixed setup per call, 22% of wall clock
+#
+# That 22 s is paid once per call regardless of batch size, so:
+#
+#   batch 10 -> 22% overhead      batch 30 -> 8.6%
+#   batch 20 -> 12%               batch 60 -> 4.6% (split into 2 chunks: 8.6%)
+#
+# This is worth ~15% on a SINGLE GPU, with or without multi/. The cost is that a
+# crash loses the in-flight batch rather than 10 molecules, and that batch
+# composition perturbs individual scores (see multi/README.md) -- so do not
+# compare scores across a change to this value.
+HUNTER_BATCH=60
 
 opts_for() {
   case "$1" in
