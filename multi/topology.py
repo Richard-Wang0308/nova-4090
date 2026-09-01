@@ -264,6 +264,14 @@ def describe(plan: Optional[List[int]] = None) -> str:
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="GPU detection and worker placement")
+    ap.add_argument("--count", action="store_true",
+                    help="print only the number of workers, for shell scripts")
+    a = ap.parse_args()
     p = plan_workers()
-    print(describe(p))
-    print("plan:", p)
+    if a.count:
+        print(len(p))
+    else:
+        print(describe(p))
+        print("plan:", p)

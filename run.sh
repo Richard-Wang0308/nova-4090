@@ -76,7 +76,40 @@ source "$BASE/hunter_opts.sh"
 # Raise it to 2+ once the memory growth is understood, or on a box with more
 # RAM. `python3 -m multi.bench` measures the right value on an idle machine.
 MULTI="${MULTI:-1}"
-WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+# Empty = let multi/topology.py decide from free VRAM and free host RAM. It was
+# pinned to 1 while hunter.py leaked ~600 MiB per round; that is fixed (the
+# per-molecule caches are LRU-bounded now), so the planner can be trusted.
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-}"
+
+# How many workers the planner will actually start on this machine, asked once
+# so the batch size can be matched to it.
+plan_count() {
+  local n
+  n=$(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU" \
+      ${GPU_IDS:+NOVA_MULTI_GPU_IDS="$GPU_IDS"} \
+      "$PY" -m multi.topology --count 2>/dev/null | tail -1)
+  case "$n" in ''|*[!0-9]*) echo 1 ;; *) echo "$n" ;; esac
+}
+
+# Boltz reloads its checkpoints on every call, costing ~22 s regardless of how
+# many molecules the call carries. The pool splits a call into ~2 chunks per
+# worker, so the batch has to grow with the worker count or those chunks shrink
+# below the point where the setup is amortised:
+#
+#   8 workers, batch 60  -> chunks of 8   -> 26% of wall clock is setup
+#   8 workers, batch 240 -> chunks of 15  -> 8.6%
+#
+# 30 molecules per worker keeps every chunk in the efficient range on any box.
+autoscale_batch() {
+  local workers="$1" b
+  if [ "$MULTI" != "1" ]; then echo "$HUNTER_BATCH"; return; fi
+  b=$(( workers * 30 ))
+  [ "$b" -lt "$HUNTER_BATCH" ] && b="$HUNTER_BATCH"
+  # Never exceed the round budget; a batch larger than the round is pointless
+  # and costs more work on a crash.
+  [ "$b" -gt "$HUNTER_BUDGET" ] && b="$HUNTER_BUDGET"
+  echo "$b"
+}
 
 # Reaction -> GPU index, used ONLY on the single-GPU path (MULTI=0).
 #
@@ -126,16 +159,21 @@ start_one() {
   fi
   local interp_args=()
   local -a envs=()
+  local batch="$HUNTER_BATCH"
   if [ "$MULTI" = "1" ]; then
+    local workers
+    workers=$(plan_count)
+    batch=$(autoscale_batch "$workers")
     interp_args=(--interpreter-args "-m multi.run")
     # No CUDA_VISIBLE_DEVICES: the pool must see every card to spread across
     # them. It sets CUDA_VISIBLE_DEVICES itself, per worker, to one id.
-    envs=(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU")
+    envs=()
+    [ -n "$WORKERS_PER_GPU" ] && envs+=(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU")
     [ -n "${GPU_IDS:-}" ] && envs+=(NOVA_MULTI_GPU_IDS="$GPU_IDS")
-    echo "starting $name via multi.run (${WORKERS_PER_GPU} worker/GPU, batch ${HUNTER_BATCH}, GPUs: ${GPU_IDS:-all detected})"
+    echo "starting $name via multi.run | ${workers} worker(s) auto-planned, batch ${batch}, GPUs: ${GPU_IDS:-all detected}"
   else
     envs=(CUDA_VISIBLE_DEVICES="$gpu")
-    echo "starting $name on GPU $gpu (single-GPU path, batch ${HUNTER_BATCH})"
+    echo "starting $name on GPU $gpu (single-GPU path, batch ${batch})"
   fi
   # shellcheck disable=SC2086
   env "${envs[@]}" \
@@ -150,7 +188,7 @@ start_one() {
       --kill-timeout 30000 \
       -- --rxn-id "$r" \
          --boltz-budget "$HUNTER_BUDGET" \
-         --batch-size "$HUNTER_BATCH" \
+         --batch-size "$batch" \
          $flags
 }
 

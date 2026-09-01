@@ -31,9 +31,11 @@ pm2 start hunter.py --name hunter-rxn4 \
     --cwd /root/workspace/nova-4090 -- --rxn-id 4 --batch-size 60
 ```
 
-## Raise `--batch-size` when you use this
+## Batch size is scaled automatically
 
-This is the one setting you must change, and it matters more than the GPU count.
+`run.sh` sizes `--batch-size` from the planned worker count (30 molecules per
+worker, floored at 60, capped at the round budget). If you launch `multi.run`
+by hand, set it yourself — it matters more than the GPU count.
 
 The searchers drive Boltz in batches of `--batch-size` (default **10**), and the
 pool can only parallelise what it is given in one call. Ten molecules across
@@ -51,8 +53,7 @@ paid once per chunk no matter how many GPUs are running:
 | 30 | 8.6% |
 | 48 | 5.6% |
 
-Set `--batch-size` to at least `30 × n_workers` (with 4 GPUs × 2 workers that is
-240; a whole round of 150 in one call is better still). This is worth ~15% on a
+Hence `30 × n_workers`, which `run.sh` computes for you. This is worth ~15% on a
 **single** GPU too, independent of anything in this directory.
 
 ## Why a worker pool rather than `predict(devices=N)`
