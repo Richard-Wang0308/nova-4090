@@ -4,7 +4,23 @@
 #
 # Derivation of every value is documented in the header of run_all.sh.
 
-HUNTER_BUDGET=150      # Boltz molecules per round
+HUNTER_BUDGET=150      # Boltz molecules per round, single-GPU path (MULTI=0)
+
+# Molecules per round PER WORKER, used by run.sh's autoscale_budget when the
+# multi-GPU pool is active: budget = this x workers.
+#
+#   1 worker   ->  300      2 workers ->  600
+#   8 workers  -> 2400     16 workers -> 4800
+#
+# Because it scales with the worker count, a round takes about the same WALL
+# CLOCK on any box -- ~43 min at the measured 22 s setup + 7.8 s/molecule with
+# chunks of 30. Raising this lengthens the round everywhere rather than only on
+# large machines, which is the point: the round is the unit at which the
+# surrogate re-fits and the submittable frontier is recomputed.
+#
+# A hard override is available and skips the scaling entirely:
+#   BOLTZ_BUDGET=2400 ./run.sh start 2
+HUNTER_BUDGET_PER_WORKER=300
 
 # Molecules handed to Boltz per call. Raised from 10 to 60.
 #

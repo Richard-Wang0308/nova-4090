@@ -16,6 +16,7 @@
 #   MULTI=0 ./run.sh start 4          single-GPU path (the original BoltzWrapper)
 #   WORKERS_PER_GPU=2 ./run.sh start 4
 #   GPU_IDS=0,1 ./run.sh start 4      restrict the pool to some cards
+#   BOLTZ_BUDGET=2400 ./run.sh start 2   pin the round budget, no scaling
 #
 # -----------------------------------------------------------------------------
 # INTERPRETER: it must be the venv python, NOT the system python3.
@@ -141,8 +142,10 @@ plan_count() {
 # and refreshes its frontier just as often in time as it does on one GPU.
 autoscale_budget() {
   local workers="$1"
+  # Explicit pin wins over everything, on either path.
+  if [ -n "${BOLTZ_BUDGET:-}" ]; then echo "$BOLTZ_BUDGET"; return; fi
   if [ "$MULTI" != "1" ]; then echo "$HUNTER_BUDGET"; return; fi
-  echo $(( HUNTER_BUDGET * workers ))
+  echo $(( ${HUNTER_BUDGET_PER_WORKER:-$HUNTER_BUDGET} * workers ))
 }
 
 # 60 per worker, because the pool makes 2 chunks per worker: chunk lands on 30.
@@ -229,6 +232,16 @@ start_one() {
     envs=()
     [ -n "$WORKERS_PER_GPU" ] && envs+=(NOVA_MULTI_WORKERS_PER_GPU="$WORKERS_PER_GPU")
     [ -n "${GPU_IDS:-}" ] && envs+=(NOVA_MULTI_GPU_IDS="$GPU_IDS")
+    # hunter's per-molecule caches must cover one round's working set, which is
+    # the candidate pool PLUS the surrogate's training subset (--train-cap,
+    # 30,000). Below that they thrash between fit() and predict() every round.
+    # A 4-GPU box plans a 90,000 pool, so the 100,000 default was already too
+    # small. _mol is left alone: it is 17.6 KiB per entry against ~2 KiB for the
+    # others, and re-parsing a SMILES costs ~100 us.
+    if [ -n "${pool:-}" ]; then
+      local cache=$(( pool + 50000 ))
+      envs+=(HUNTER_FP_CACHE="$cache" HUNTER_BV_CACHE="$cache" HUNTER_DESC_CACHE="$cache")
+    fi
     echo "starting $name via multi.run | ${workers} worker(s) auto-planned | budget ${budget} batch ${batch} pool ${pool:-$base_pool} | GPUs: ${GPU_IDS:-all detected}"
   else
     envs=(CUDA_VISIBLE_DEVICES="$gpu")
