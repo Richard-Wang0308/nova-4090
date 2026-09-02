@@ -109,9 +109,9 @@ except Exception:
     SynthonLibrary = None
 
 try:
-    from utils.molecules import compute_maccs_entropy
+    from utils.molecules import compute_fingerprint_entropy
 except Exception:
-    compute_maccs_entropy = None
+    compute_fingerprint_entropy = None
 
 try:
     from boltz_wrapper import BoltzWrapper
@@ -1075,10 +1075,15 @@ def select_batch(ranked: pd.DataFrame, budget: int,
     The first version of this used 25%, and a held-out measurement showed that
     was the same mistake in smaller form: going 0.25 -> 0.00 recovered 13 hits
     above 0.11 on rxn5 and 5 on rxn2. It is not zero because the validator
-    requires MACCS entropy >= 0.1 across the submitted 20, and a pure-exploit
-    portfolio can fail that. Note a single-round offline test can see this
-    slice's cost but not its across-round benefit, so 0.10 is a deliberate
-    compromise rather than the measured optimum.
+    requires atom-pair fingerprint entropy >= 0.25 across the submitted 20,
+    and a pure-exploit portfolio can fail that. Note a single-round offline test
+    can see this slice's cost but not its across-round benefit, so 0.10 is a
+    deliberate compromise rather than the measured optimum.
+
+    That constraint tightened at epoch 24876 and this figure predates it: the
+    same twenty molecules score about 0.06 lower over 2048 atom-pair bits than
+    over 167 MACCS keys, while the floor went from 0.1 to 0.25. 0.10 was chosen
+    against the old, slacker constraint and is worth re-measuring.
     """
     if ranked.empty:
         return ranked
@@ -1491,9 +1496,10 @@ def parse_args():
                    help="fraction of the Boltz budget spent away from the top of "
                         "the ranking. Measured cost of 0.25 on a held-out pool: "
                         "13 hits >0.11 on rxn5, 5 on rxn2. Kept non-zero only "
-                        "because the validator requires MACCS entropy >= 0.1 "
-                        "across the submitted 20, so an all-exploit portfolio "
-                        "risks failing that check")
+                        "because the validator requires atom-pair entropy "
+                        ">= 0.25 across the submitted 20, so an all-exploit "
+                        "portfolio risks failing that check. Measured at 0.1 "
+                        "on MACCS keys; the floor tightened at epoch 24876")
     p.add_argument("--strict-pool-mult", type=int, default=6)
     p.add_argument("--max-rounds", type=int, default=10 ** 9)
     p.add_argument("--seed", type=int, default=68)

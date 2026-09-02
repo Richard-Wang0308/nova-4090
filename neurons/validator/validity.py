@@ -5,7 +5,7 @@ from rdkit.Chem import Descriptors
 from utils import (
     get_smiles, 
     get_heavy_atom_count, 
-    compute_maccs_entropy,
+    compute_fingerprint_entropy,
     molecule_unique_for_protein_hf,
     find_chemically_identical,
     is_reaction_allowed
@@ -19,7 +19,7 @@ def validate_molecules_and_calculate_entropy(
     allowed_reaction: str = None
 ) -> dict[int, dict[str, list[str]]]:
     """
-    Validates molecules for all UIDs and calculates their MACCS entropy.
+    Validates molecules for all UIDs and calculates their fingerprint entropy.
     Updates the score_dict with entropy values.
     
     Args:
@@ -129,7 +129,7 @@ def validate_molecules_and_calculate_entropy(
         # Calculate entropy if we have valid molecules
         if valid_smiles:
             try:
-                entropy = compute_maccs_entropy(valid_smiles)
+                entropy = compute_fingerprint_entropy(valid_smiles)
                 score_dict[uid]["entropy"] = entropy
                 valid_molecules_by_uid[uid] = {"smiles": valid_smiles, "names": valid_names}
                 score_dict[uid]["block_submitted"] = data["block_submitted"]               

@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import time
 from rdkit import Chem
-from rdkit.Chem import MACCSkeys, AllChem, FilterCatalog
+from rdkit.Chem import AllChem, FilterCatalog
+from rdkit.Chem import rdFingerprintGenerator as rfg
 from huggingface_hub import hf_hub_download, hf_hub_url, get_hf_file_metadata
 from huggingface_hub.errors import EntryNotFoundError
 import bittensor as bt
@@ -71,9 +72,30 @@ def get_heavy_atom_count(smiles: str) -> int:
     return mol.GetNumHeavyAtoms()
 
 
-def compute_maccs_entropy(smiles_list: list[str]) -> float:
+# Atom-pair fingerprint width used for the submission entropy check. Must stay
+# identical to the validator's (utils/molecules.py on nova's atom-pair-entropy
+# branch): the threshold is calibrated against this width, and folding to a
+# different size silently changes every entropy value.
+ENTROPY_FP_SIZE = 2048
+
+# Stateless with respect to its output, so one generator for the process gives
+# byte-identical fingerprints to the validator building one per molecule.
+_ATOM_PAIR_GEN = rfg.GetAtomPairGenerator(fpSize=ENTROPY_FP_SIZE)
+
+
+def compute_fingerprint_entropy(smiles_list: list[str]) -> float:
     """
-    Computes fingerprint entropy from MACCS keys for a list of SMILES.
+    Computes atom-pair fingerprint entropy for a list of SMILES.
+
+    Mirrors the validator's check exactly. The validator applies this to the
+    whole submitted set at once and rejects the entire submission when the
+    result is below min_entropy, so this is only ever meaningful on a complete
+    submission -- a single molecule has no entropy.
+
+    Replaces the previous MACCS-keys implementation. The two are not
+    comparable: over 2048 atom-pair bits the same set scores roughly 0.06-0.07
+    lower than over 167 MACCS keys, which is why the threshold moved with the
+    fingerprint.
 
     Parameters:
         smiles_list (list of str): Molecules in SMILES format.
@@ -81,14 +103,14 @@ def compute_maccs_entropy(smiles_list: list[str]) -> float:
     Returns:
         avg_entropy (float): Average entropy per bit.
     """
-    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
+    n_bits = ENTROPY_FP_SIZE
     bit_counts = np.zeros(n_bits)
     valid_mols = 0
 
     for smi in smiles_list:
-        mol = Chem.MolFromSmiles(smi)
+        mol = Chem.MolFromSmiles(smi) if smi else None
         if mol:
-            fp = MACCSkeys.GenMACCSKeys(mol)
+            fp = _ATOM_PAIR_GEN.GetFingerprint(mol)
             arr = np.array(fp)
             bit_counts += arr
             valid_mols += 1

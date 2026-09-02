@@ -99,8 +99,9 @@ _bv_cache: Dict[str, Any] = {}
 # Defaults tuned for late-stage / saturated archives
 # Validator threshold, NOT a local preference: a molecule is only submittable
 # when max Tanimoto to the archive is < config['max_similarity_to_historical'].
-# This was hardcoded to 0.9 while the validator enforces 0.7, so everything
-# mined in the 0.7-0.9 band was unsubmittable. # Bind at import time so a caller that imports this module as a library gets
+# This was hardcoded to 0.9 while the validator enforced 0.7, so everything
+# mined in the 0.7-0.9 band was unsubmittable. The validator's threshold is
+# 0.6 as of epoch 24876; it is read from config, never from a literal here. # Bind at import time so a caller that imports this module as a library gets
 # the same value as one that runs main(). Never edit the literal by hand — it
 # is a fallback for an unreadable config, nothing else.
 try:
@@ -109,7 +110,7 @@ try:
         _load_cfg()["max_similarity_to_historical"]
     )
 except Exception as _e:
-    MAX_SIMILARITY_TO_HISTORICAL = 0.7
+    MAX_SIMILARITY_TO_HISTORICAL = 0.6
     print(f"[novelty] could not read max_similarity_to_historical from config "
           f"({_e}); using {MAX_SIMILARITY_TO_HISTORICAL}")
 

@@ -10,8 +10,8 @@ Workflow:
     build a diverse set of num_molecules (default 20) per wallet from the top
     candidate pool — each set must pass HF uniqueness, BRENK structural alerts,
     historical diversity,
-    no InChIKey duplicates within the set, and MACCS entropy >= min_entropy
-    (same checks the validator applies).
+    no InChIKey duplicates within the set, and atom-pair fingerprint entropy
+    >= min_entropy over the completed set (same checks the validator applies).
     PREPARE all payloads (comma-separated molecule names, timelock-encrypted),
     fire ALL chain commits concurrently over ONE persistent AsyncSubtensor
     connection, then BATCH-UPLOAD all successfully-committed files to GitHub
@@ -74,7 +74,23 @@ AVAILABILITY_CANDIDATE_POOL = 1000
 # below (load_config is not importable this early in the file). Never edit this
 # by hand: hardcoding 0.9 here while config said 0.7 is what let molecules the
 # validator rejects reach the submission set.
-MAX_SIMILARITY_TO_HISTORICAL = 0.7
+MAX_SIMILARITY_TO_HISTORICAL = 0.6
+
+# Atom-pair fingerprint width for the entropy check. Must equal the validator's
+# (utils.molecules.ENTROPY_FP_SIZE) -- folding to any other width silently
+# changes every entropy value the threshold was calibrated against.
+ENTROPY_FP_SIZE = 2048
+
+# How many extra qualified candidates to gather when the score-ordered set
+# misses the entropy floor and has to be repaired. Only paid for when a repair
+# is actually needed: measured on rxn2, 1 score-ordered top-20 window in 50
+# falls below 0.25, and those are fixed by a single swap costing 0.000017 of
+# average score.
+ENTROPY_REPAIR_RESERVE = 80
+
+# A set that cannot be brought over the floor in this many swaps is not going
+# to be, and an unbounded search here would run into the epoch boundary.
+ENTROPY_REPAIR_MAX_SWAPS = 8
 
 # Retries for the GitHub batch-commit flow (re-fetches branch head + retries
 # the whole blob->tree->commit->ref-update sequence on conflict).
@@ -82,6 +98,7 @@ GITHUB_BATCH_MAX_RETRIES = 3
 
 # ============================================================================
 
+import numpy as np
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator
 
@@ -100,7 +117,7 @@ from utils import (
 )
 from combinatorial_db.reactions import get_smiles_from_reaction
 from utils.molecules import (
-    compute_maccs_entropy,
+    compute_fingerprint_entropy,
     molecule_unique_for_protein_hf,
     get_brenk_matches,
 )
@@ -271,7 +288,7 @@ def setup_logging(config: argparse.Namespace) -> None:
         f"batched into ONE commit after chain commit | "
         f"{_cfg_val(config, 'num_molecules', 20)} molecules/wallet | "
         f"HF unique + BRENK + similarity<{MAX_SIMILARITY_TO_HISTORICAL} + "
-        f"MACCS entropy≥{_cfg_val(config, 'min_entropy', 0.1)} on top "
+        f"set entropy≥{_cfg_val(config, 'min_entropy', 0.25)} on top "
         f"{AVAILABILITY_CANDIDATE_POOL} candidates"
     )
     bt.logging.info("="*70 + "\n")
@@ -696,14 +713,116 @@ def _smiles_inchikey(smiles: str) -> Optional[str]:
     return Chem.MolToInchiKey(mol)
 
 
-def _set_meets_entropy(smiles_list: List[str], min_entropy: float) -> bool:
-    if len(smiles_list) < 2:
-        return True
-    try:
-        return compute_maccs_entropy(smiles_list) >= min_entropy
-    except Exception:
-        return False
+_ENTROPY_FP_GEN = rdFingerprintGenerator.GetAtomPairGenerator(fpSize=ENTROPY_FP_SIZE)
+_ENTROPY_FP_CACHE: Dict[str, Any] = {}
 
+
+def _entropy_fp(smiles: str):
+    """Atom-pair fingerprint as a float vector, memoised per SMILES.
+
+    The repair loop below evaluates tens of thousands of candidate sets. Calling
+    compute_fingerprint_entropy() on SMILES for each one re-parses and
+    re-fingerprints all twenty molecules every time: 11.6 ms a call against
+    0.02 ms here, which is 5.7 minutes for a single swap inside a submission
+    path that is racing the epoch boundary.
+    """
+    fp = _ENTROPY_FP_CACHE.get(smiles)
+    if fp is None:
+        mol = Chem.MolFromSmiles(smiles) if smiles else None
+        if mol is None:
+            return None
+        fp = np.array(_ENTROPY_FP_GEN.GetFingerprint(mol), dtype=float)
+        _ENTROPY_FP_CACHE[smiles] = fp
+    return fp
+
+
+def _entropy_from_counts(bit_counts, n_mols: int) -> float:
+    """Mean per-bit binary entropy from summed fingerprint bits.
+
+    Same arithmetic as compute_fingerprint_entropy(), expressed over a running
+    bit-count vector so that swapping one molecule for another costs a single
+    subtract and add instead of re-fingerprinting the set.
+    """
+    p = bit_counts / n_mols
+    per_bit = np.where(
+        (p > 0) & (p < 1),
+        -p * np.log2(np.clip(p, 1e-12, 1.0))
+        - (1 - p) * np.log2(np.clip(1 - p, 1e-12, 1.0)),
+        0.0,
+    )
+    return float(per_bit.mean())
+
+
+def _set_entropy(entries: List[Tuple[str, float, str]]) -> Optional[float]:
+    """Fast entropy of a candidate set of (name, score, smiles) triples.
+
+    Divides by the number of parseable molecules, matching the validator's
+    valid_mols count. Returns None when nothing in the set parses.
+    """
+    fps = [fp for fp in (_entropy_fp(e[2]) for e in entries) if fp is not None]
+    if not fps:
+        return None
+    return _entropy_from_counts(np.sum(fps, axis=0), len(fps))
+
+
+def _repair_entropy(
+    selected: List[Tuple[str, float, str]],
+    reserve: List[Tuple[str, float, str]],
+    min_entropy: float,
+) -> Tuple[List[Tuple[str, float, str]], Optional[float], int]:
+    """Swap the cheapest molecules out of a set that misses the entropy floor.
+
+    Entropy is pass/fail at the validator, never scored, so the goal is the
+    highest-scoring set that clears the floor rather than the most diverse one.
+    Each round therefore takes the swap that crosses the threshold for the
+    smallest loss of score, and only falls back to the largest entropy gain
+    while nothing crosses it yet.
+
+    Returns (selected, entropy, swaps). `selected` keeps its score ordering
+    loosely; the caller re-sorts nothing because the validator does not care.
+    """
+    fps_sel = [_entropy_fp(e[2]) for e in selected]
+    if any(fp is None for fp in fps_sel):
+        return selected, _set_entropy(selected), 0
+
+    selected = list(selected)
+    reserve = [r for r in reserve if _entropy_fp(r[2]) is not None]
+    n = len(selected)
+    counts = np.sum(fps_sel, axis=0)
+    swaps = 0
+
+    while swaps < ENTROPY_REPAIR_MAX_SWAPS and reserve:
+        current = _entropy_from_counts(counts, n)
+        if current >= min_entropy:
+            break
+
+        best_cross = None   # (score_loss, i, j) — clears the floor
+        best_gain = None    # (entropy, i, j)    — best progress toward it
+        for i in range(n):
+            base = counts - fps_sel[i]
+            for j, cand in enumerate(reserve):
+                e = _entropy_from_counts(base + _entropy_fp(cand[2]), n)
+                if e >= min_entropy:
+                    loss = selected[i][1] - cand[1]
+                    if best_cross is None or loss < best_cross[0]:
+                        best_cross = (loss, i, j)
+                if best_gain is None or e > best_gain[0]:
+                    best_gain = (e, i, j)
+
+        if best_cross is not None:
+            _loss, i, j = best_cross
+        elif best_gain is not None and best_gain[0] > current + 1e-12:
+            _e, i, j = best_gain
+        else:
+            break
+
+        new_fp = _entropy_fp(reserve[j][2])
+        counts = counts - fps_sel[i] + new_fp
+        selected[i], reserve[j] = reserve[j], selected[i]
+        fps_sel[i] = new_fp
+        swaps += 1
+
+    return selected, _entropy_from_counts(counts, n), swaps
 
 
 def select_diverse_molecule_set(
@@ -714,36 +833,54 @@ def select_diverse_molecule_set(
     historical_df,
     morgan_gen,
     max_similarity: float,
-) -> Tuple[List[Tuple[str, float]], Dict[str, int], List[Tuple[str, str]]]:
+) -> Tuple[List[Tuple[str, float, str]], Dict[str, Any], List[Tuple[str, str]]]:
     """
     Greedily build a set of num_molecules from score-sorted candidates.
 
-    Each pick must pass HF uniqueness + BRENK + historical diversity, must not be
-    chemically identical to an already-selected molecule, and the growing
-    SMILES set must keep MACCS entropy >= min_entropy once it has 2+ members
-    (mirrors validator-side checks).
+    Each pick must pass HF uniqueness + BRENK + historical diversity and must
+    not be chemically identical to an already-picked molecule. Those are
+    per-molecule tests, so they are applied as the set is built.
+
+    Entropy is not, because it is not a per-molecule property. The validator
+    computes it once over the complete submission and discards the whole
+    submission when it falls below min_entropy (molecule_validity.py). Applying
+    it to every growing prefix, as this function used to, asks a pair of
+    molecules to clear a bar calibrated for twenty. Under MACCS keys that was
+    slack enough not to matter; under atom-pair fingerprints no PAIR in the
+    pool reaches 0.25 (best measured on rxn2: 0.2178), so the prefix rule would
+    reject every candidate after the first and the miner would submit nothing.
+
+    The set is therefore assembled on score, checked once when complete, and
+    repaired by swapping when it misses the floor.
 
     Returns:
-        (selected, stats, failed_availability) where failed_availability is
-        a list of (molecule_name, reason) for HF/historical/smiles failures
-        that should be marked unavailable in the DB.
+        (selected, stats, failed_availability) where selected is a list of
+        (molecule_name, score, smiles) and failed_availability is a list of
+        (molecule_name, reason) for HF/historical/smiles failures that should
+        be marked unavailable in the DB.
     """
-    selected: List[Tuple[str, float]] = []
-    selected_smiles: List[str] = []
-    selected_inchikeys: set = set()
+    selected: List[Tuple[str, float, str]] = []
+    reserve: List[Tuple[str, float, str]] = []
+    qualified_inchikeys: set = set()
     failed_availability: List[Tuple[str, str]] = []
-    stats = {
+    stats: Dict[str, Any] = {
         "checked": 0,
         "rejected_hf": 0,
         "rejected_brenk": 0,
         "rejected_similar": 0,
         "rejected_dup": 0,
-        "rejected_entropy": 0,
         "rejected_bad_smiles": 0,
+        "reserve": 0,
+        "entropy_swaps": 0,
+        "entropy": None,
     }
 
+    # Stays 0 unless the completed set fails entropy, so the common case scans
+    # no further than it did before and pays for no reserve at all.
+    reserve_target = 0
+
     for molecule_name, score, smiles in candidates:
-        if len(selected) >= num_molecules:
+        if len(selected) >= num_molecules and len(reserve) >= reserve_target:
             break
 
         stats["checked"] += 1
@@ -752,7 +889,7 @@ def select_diverse_molecule_set(
         if inchikey is None:
             stats["rejected_bad_smiles"] += 1
             continue
-        if inchikey in selected_inchikeys:
+        if inchikey in qualified_inchikeys:
             stats["rejected_dup"] += 1
             continue
 
@@ -781,14 +918,30 @@ def select_diverse_molecule_set(
                 stats["rejected_bad_smiles"] += 1
             continue
 
-        trial_smiles = selected_smiles + [smiles]
-        if len(trial_smiles) >= 2 and not _set_meets_entropy(trial_smiles, min_entropy):
-            stats["rejected_entropy"] += 1
-            continue
+        qualified_inchikeys.add(inchikey)
+        entry = (molecule_name, score, smiles)
 
-        selected.append((molecule_name, score))
-        selected_smiles.append(smiles)
-        selected_inchikeys.add(inchikey)
+        if len(selected) < num_molecules:
+            selected.append(entry)
+            if len(selected) == num_molecules:
+                # First moment the set is complete. Only a set that misses the
+                # floor is worth gathering a reserve for.
+                ent = _set_entropy(selected)
+                if ent is not None and ent < min_entropy:
+                    reserve_target = ENTROPY_REPAIR_RESERVE
+        else:
+            reserve.append(entry)
+
+    stats["reserve"] = len(reserve)
+
+    if len(selected) == num_molecules:
+        entropy = _set_entropy(selected)
+        if entropy is not None and entropy < min_entropy:
+            selected, entropy, swaps = _repair_entropy(
+                selected, reserve, min_entropy
+            )
+            stats["entropy_swaps"] = swaps
+        stats["entropy"] = entropy
 
     return selected, stats, failed_availability
 
@@ -807,8 +960,8 @@ async def get_verified_molecule_sets(
 
     1. Load top `candidate_pool` available molecules by score.
     2. For each wallet, greedily select `molecules_per_wallet` molecules that
-       pass HF/historical checks, have no InChIKey duplicates within the set,
-       and maintain MACCS entropy >= min_entropy.
+       pass HF/historical checks and have no InChIKey duplicates within the
+       set, then verify the completed set clears min_entropy.
     3. Molecules assigned to an earlier wallet are excluded from later wallets.
     4. Persist updated available flags for every candidate checked.
     """
@@ -850,8 +1003,8 @@ async def get_verified_molecule_sets(
     bt.logging.info(
         f"   🔍 Building {n_wallets} set(s) of {molecules_per_wallet} molecules "
         f"from top {len(rows)} candidates "
-        f"(HF unique + historical similarity≤{max_similarity}, "
-        f"MACCS entropy≥{min_entropy})"
+        f"(HF unique + historical similarity<{max_similarity}, "
+        f"set entropy≥{min_entropy})"
     )
 
     historical_df = await asyncio.to_thread(
@@ -919,29 +1072,62 @@ async def get_verified_molecule_sets(
                 f"BRENK={stats['rejected_brenk']}, "
                 f"historical={stats['rejected_similar']}, "
                 f"dup InChIKey={stats['rejected_dup']}, "
-                f"entropy={stats['rejected_entropy']})"
+                f"bad SMILES={stats['rejected_bad_smiles']})"
             )
             break
 
-        final_smiles = [
-            get_smiles_from_reaction(name) for name, _score in selected
-        ]
-        entropy = compute_maccs_entropy(final_smiles)
-        molecule_names = [name for name, _score in selected]
+        # The SMILES the selector actually used. Re-deriving them here would
+        # repeat work and would hand compute_fingerprint_entropy() a None for
+        # any name that stopped resolving in between.
+        final_smiles = [smiles for _name, _score, smiles in selected]
+
+        # Authoritative gate: the same function, over the same SMILES, that the
+        # validator will run. The cached-fingerprint path drives the search;
+        # this is what decides whether we submit at all.
+        #
+        # Submitting a set that fails is strictly worse than submitting
+        # nothing. The validator discards it whole, and mark_molecules_unavailable()
+        # still burns all twenty on chain-commit success, so a known-bad
+        # submission costs the molecules as well as the epoch.
+        try:
+            entropy = compute_fingerprint_entropy(final_smiles)
+        except Exception as e:
+            bt.logging.error(
+                f"   ❌ Wallet set {wallet_idx + 1}/{n_wallets}: entropy check "
+                f"failed ({e}). Not submitting this set."
+            )
+            break
+
+        if entropy < min_entropy:
+            bt.logging.warning(
+                f"   ⚠️  Wallet set {wallet_idx + 1}/{n_wallets}: entropy "
+                f"{entropy:.4f} < {min_entropy} after "
+                f"{stats['entropy_swaps']} repair swap(s) over a reserve of "
+                f"{stats['reserve']}. The validator would discard this "
+                f"submission and the molecules would be spent, so skipping."
+            )
+            break
+
+        molecule_names = [name for name, _score, _smiles in selected]
         used_names.update(molecule_names)
 
-        for name, score in selected:
+        for name, score, _smiles in selected:
             _set_molecule_available(db_path, name, True)
             bt.logging.info(
                 f"      ✅ wallet {wallet_idx + 1} | {name:<30} "
                 f"| Score: {score:.6f}"
             )
 
+        repaired = (
+            f", repaired with {stats['entropy_swaps']} swap(s) from a reserve "
+            f"of {stats['reserve']}" if stats["entropy_swaps"] else ""
+        )
         bt.logging.info(
             f"   📦 Wallet set {wallet_idx + 1}/{n_wallets}: "
-            f"{len(selected)} molecules, MACCS entropy={entropy:.4f}"
+            f"{len(selected)} molecules, entropy={entropy:.4f} "
+            f"(min {min_entropy}){repaired}"
         )
-        wallet_sets.append(selected)
+        wallet_sets.append([(name, score) for name, score, _smiles in selected])
 
     if not wallet_sets:
         bt.logging.warning(
@@ -1335,18 +1521,18 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         return
 
     num_molecules = _cfg_val(cfg, "num_molecules", 1)
-    min_entropy = _cfg_val(cfg, "min_entropy", 0.1)
+    min_entropy = _cfg_val(cfg, "min_entropy", 0.25)
     max_similarity = _cfg_val(
         cfg, "max_similarity_to_historical", MAX_SIMILARITY_TO_HISTORICAL
     )
 
     # ==========================================================
-    # STEP 2: Build diverse molecule sets (HF + historical + MACCS entropy)
+    # STEP 2: Build diverse molecule sets (HF + historical + set entropy)
     # ==========================================================
     bt.logging.info(
         "🔹 STEP 2/3: Molecule Selection "
         f"({num_molecules} per wallet, HF unique, BRENK-clean, "
-        f"historical similarity<{max_similarity}, MACCS entropy≥{min_entropy})"
+        f"historical similarity<{max_similarity}, set entropy≥{min_entropy})"
     )
     bt.logging.info(f"   🗄️  Using score DB: {reaction_db_path}")
     bt.logging.info(

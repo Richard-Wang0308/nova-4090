@@ -105,9 +105,9 @@ except Exception:
     molecule_unique_for_protein_hf = None
 
 try:
-    from utils.molecules import compute_maccs_entropy
+    from utils.molecules import compute_fingerprint_entropy
 except Exception:
-    compute_maccs_entropy = None
+    compute_fingerprint_entropy = None
 
 from utils.molecules import get_brenk_matches
 
@@ -1508,10 +1508,10 @@ def final_top20(
     if len(top) < n:
         return top
 
-    if compute_maccs_entropy is not None:
+    if compute_fingerprint_entropy is not None:
         try:
-            ent = float(compute_maccs_entropy(top["smiles"].tolist()))
-            min_ent = float(config.get("min_entropy", 0.1))
+            ent = float(compute_fingerprint_entropy(top["smiles"].tolist()))
+            min_ent = float(config.get("min_entropy", 0.25))
             if ent < min_ent:
                 log.warning("Top20 entropy %.4f < %.4f; running diversity repair", ent, min_ent)
                 chosen = [candidates.iloc[0]]
@@ -1541,8 +1541,24 @@ def final_top20(
                     remaining = remaining.drop(index=best_idx)
 
                 repaired = pd.DataFrame(chosen).reset_index(drop=True)
+                # The loop above maximises a Morgan-Tanimoto diversity proxy,
+                # not the atom-pair bit entropy the validator actually gates
+                # on, so "repaired" is a hypothesis. Keep the repair only when
+                # it genuinely clears the floor -- accepting it unchecked, as
+                # this used to, can swap a failing set for another failing set
+                # and lose score for nothing.
                 if len(repaired) == n:
-                    top = repaired
+                    ent_after = float(
+                        compute_fingerprint_entropy(repaired["smiles"].tolist())
+                    )
+                    if ent_after >= min_ent:
+                        log.info("diversity repair: entropy %.4f -> %.4f",
+                                 ent, ent_after)
+                        top = repaired
+                    else:
+                        log.warning(
+                            "diversity repair reached only %.4f (< %.4f); "
+                            "keeping the score-ordered set", ent_after, min_ent)
         except Exception as e:
             log.debug("Entropy check unavailable/failed: %s", e)
 

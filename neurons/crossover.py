@@ -75,7 +75,7 @@ try:
         _load_cfg()["max_similarity_to_historical"]
     )
 except Exception as _e:
-    MAX_SIMILARITY_TO_HISTORICAL = 0.7
+    MAX_SIMILARITY_TO_HISTORICAL = 0.6
     print(f"[novelty] could not read max_similarity_to_historical from config "
           f"({_e}); using {MAX_SIMILARITY_TO_HISTORICAL}")
 

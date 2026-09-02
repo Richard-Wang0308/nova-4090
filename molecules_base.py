@@ -74,13 +74,37 @@ def _inchikey_from_name_cached(name: str) -> str:
     except Exception:
         return ""
 
-def compute_maccs_entropy(smiles_list: list[str]) -> float:
-    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
+# Must match utils.molecules.ENTROPY_FP_SIZE and the validator's width.
+ENTROPY_FP_SIZE = 2048
+_ATOM_PAIR_GEN = rdFingerprintGenerator.GetAtomPairGenerator(fpSize=ENTROPY_FP_SIZE)
+
+
+@lru_cache(maxsize=1000_000)
+def _atom_pair_fp_from_smiles_cached(smiles: str):
+    """Cache atom-pair fingerprints, the ones the validator's entropy check uses."""
+    if not smiles:
+        return None
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return None
+        return _ATOM_PAIR_GEN.GetFingerprint(mol)
+    except Exception:
+        return None
+
+
+def compute_fingerprint_entropy(smiles_list: list[str]) -> float:
+    """Cached-fingerprint twin of utils.molecules.compute_fingerprint_entropy.
+
+    Same value, same width -- only the fingerprint lookup is memoised. See that
+    function for why this is an atom-pair fingerprint and not MACCS keys.
+    """
+    n_bits = ENTROPY_FP_SIZE
     bit_counts = np.zeros(n_bits)
     valid_mols = 0
 
     for smi in smiles_list:
-        fp = _maccs_fp_from_smiles_cached(smi)
+        fp = _atom_pair_fp_from_smiles_cached(smi)
         if fp is not None:
             arr = np.array(fp)
             bit_counts += arr

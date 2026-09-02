@@ -27,7 +27,7 @@ try:
     MAX_SIMILARITY_TO_HISTORICAL = float(_cfg["max_similarity_to_historical"])
 except Exception as _e:  # keep the tool usable if config is unreadable
     TARGET_PROTEIN = "P40261"
-    MAX_SIMILARITY_TO_HISTORICAL = 0.7
+    MAX_SIMILARITY_TO_HISTORICAL = 0.6
     print(f"[check] could not read config ({_e}); "
           f"falling back to {TARGET_PROTEIN} / {MAX_SIMILARITY_TO_HISTORICAL}")
 

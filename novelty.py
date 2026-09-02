@@ -6,7 +6,7 @@ THE PROBLEM THIS SOLVES
 -----------------------
 A molecule is only worth submitting if it is far enough from every molecule in
 the HuggingFace Submission-Archive: the validator requires
-`max_tanimoto_to_historical < config['max_similarity_to_historical']` (0.7 here).
+`max_tanimoto_to_historical < config['max_similarity_to_historical']` (0.6 here).
 
 Two things were quietly breaking that:
 
@@ -78,7 +78,7 @@ def config_threshold(config: Dict[str, Any]) -> float:
     The validator's threshold, straight from config. Never hardcode this —
     that is exactly how the 0.9-vs-0.7 drift happened.
     """
-    return float(config.get("max_similarity_to_historical", 0.7))
+    return float(config.get("max_similarity_to_historical", 0.6))
 
 
 _INCHIKEY_CACHE: Dict[str, set] = {}
