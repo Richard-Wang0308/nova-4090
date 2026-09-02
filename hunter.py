@@ -157,6 +157,33 @@ os.makedirs(REACTANT_FP_DIR, exist_ok=True)
 # `--confirm-threshold auto` (the default) tracks the reaction's own submittable
 # #20 minus a margin for single-draw noise; a literal float overrides it. This
 # value is only the fallback when no frontier exists yet.
+#
+# Re-measured at max_similarity_to_historical = 0.6 (epoch 24876), which moves
+# the frontier down by up to 0.0044 and, far more importantly, changes how deep
+# the search must scan to find twenty submittable molecules:
+#
+#     rxn1  #20 = 0.0962   scan 34    80% of its top 500 still passes 0.6
+#     rxn2  #20 = 0.1019   scan 21   100%
+#     rxn3  #20 = 0.0951   scan 21   100%
+#     rxn4  #20 = 0.0995   scan 54    31%
+#     rxn5  #20 = 0.1022   scan 418    5%
+#
+# CONFIRMATION IS NOT OPTIONAL AT THESE MARGINS
+# ---------------------------------------------
+# The whole submittable band is narrower than the noise on one draw. Measured
+# per reaction, #1 minus #20 against the p90 redraw range of that reaction's
+# own replicates:
+#
+#     rxn1  band 0.0097   p90 redraw range 0.0154
+#     rxn2  band 0.0056                    0.0093
+#     rxn3  band 0.0085                    0.0130
+#     rxn4  band 0.0139                    0.0216
+#     rxn5  band 0.0104                    0.0282
+#
+# In every one of them the noise exceeds the entire band, so a single draw
+# cannot order the twenty molecules that actually get submitted -- it can only
+# tell you roughly which molecules are in the running. That is the argument for
+# a wider --confirm-margin, not GPU thrift.
 CONFIRM_FALLBACK_THRESHOLD = 0.1
 # Extra draws per confirmed molecule, for the ROUND-LEADER confirmation. Two,
 # so that every molecule clearing the round's threshold ends up measured three
@@ -1509,22 +1536,35 @@ def parse_args():
                         "and its score replaced by the mean. 'auto' (default) "
                         "uses this reaction's own submittable #20 minus "
                         "--confirm-margin, so it adapts both per reaction and as "
-                        "the search progresses. Measured #20 today: rxn1 0.091, "
-                        "rxn2 0.106, rxn4 0.102, rxn5 0.111 — a fixed 0.1 "
-                        "confirms nothing on rxn1 and wastes GPU on rxn2/4/5")
-    p.add_argument("--confirm-margin", type=float, default=0.005,
+                        "the search progresses. Measured #20 at similarity "
+                        "0.6: rxn1 0.0962, rxn2 0.1019, rxn3 0.0951, rxn4 "
+                        "0.0995, rxn5 0.1022 — a fixed 0.1 confirms nothing on "
+                        "rxn1/rxn3 and wastes GPU on rxn2/5")
+    p.add_argument("--confirm-margin", type=float, default=0.010,
                    help="how far below the frontier still earns confirmation. "
-                        "Boltz spread at a fixed seed is ~0.0025 typical and "
-                        "0.0102 worst, so the default is about two typical "
-                        "noise widths (default 0.005)")
+                        "Raised from 0.005 after measuring the redraw spread "
+                        "on all 2,537 molecules that carry >=2 replicate draws "
+                        "in the five score DBs, rather than the handful the "
+                        "old 0.0025/0.0102 figures came from: median sd "
+                        "0.0029, but p90 RANGE 0.0163 and max 0.1417. A 0.005 "
+                        "margin caught under half of real redraw variation. "
+                        "0.010 catches 78% and is the largest value that "
+                        "still leaves every reaction under --confirm-max-frac "
+                        "(worst is rxn5 at 7.5%% of a round). See the "
+                        "confirmation note above for why this matters more "
+                        "than it looks (default 0.010)")
     p.add_argument("--confirm-floor", type=float, default=0.08,
                    help="threshold never drops below this, so an early or weak "
                         "round does not confirm everything it scored")
-    p.add_argument("--confirm-max-frac", type=float, default=0.08,
+    p.add_argument("--confirm-max-frac", type=float, default=0.10,
                    help="hard cap on the fraction of a round that gets "
                         "confirmed; above it the threshold is raised to the "
                         "matching quantile. Each confirmation costs 2 extra "
-                        "Boltz calls (default 0.08)")
+                        "Boltz calls. Raised from 0.08 to leave the wider "
+                        "--confirm-margin room: at 0.010 the busiest reaction "
+                        "confirms 7.5%% of a round, close enough to 0.08 that "
+                        "a good round would have been silently clipped back "
+                        "to the 92nd percentile (default 0.10)")
     p.add_argument("--confirm-extra-rounds", type=int, default=CONFIRM_EXTRA_ROUNDS,
                    help="extra draws per ROUND-LEADER molecule, on top of the "
                         "round's own draw: 2 gives three draws in total and a "
