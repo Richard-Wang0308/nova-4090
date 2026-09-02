@@ -87,6 +87,14 @@ class MultiGPUBoltz:
         self.pool = pool or BoltzPool(workers_per_gpu=workers_per_gpu,
                                       plan=plan, logger=self.log)
 
+        # Optional, outside the BoltzWrapper contract: set to
+        # `f(scores, components)` and it fires as each worker's chunk lands
+        # instead of only when the whole call returns. A batch here is not one
+        # unit of work -- it is N chunks that finish minutes apart -- so a
+        # caller that persists results needs the chunk boundary, not the call
+        # boundary. Callers that never set it see the interface unchanged.
+        self.on_chunk_scores = None
+
     # -- BoltzWrapper surface ---------------------------------------------
 
     def score_molecules(self, valid_molecules_by_uid: dict, score_dict: dict,
@@ -98,7 +106,9 @@ class MultiGPUBoltz:
             return
 
         molecules = [(ids[0][1], smi) for smi, ids in self.unique_molecules.items()]
-        scores = self.pool.score(molecules, subnet_config)
+        cb = self.on_chunk_scores
+        scores = self.pool.score(molecules, subnet_config,
+                                 on_chunk=cb if callable(cb) else None)
         components = self.pool.last_components
         self._distribute(scores, components)
         self._postprocess(score_dict)

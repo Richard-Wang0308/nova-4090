@@ -158,10 +158,13 @@ os.makedirs(REACTANT_FP_DIR, exist_ok=True)
 # #20 minus a margin for single-draw noise; a literal float overrides it. This
 # value is only the fallback when no frontier exists yet.
 CONFIRM_FALLBACK_THRESHOLD = 0.1
-# Extra draws per confirmed molecule, for the ROUND-LEADER confirmation. Now 0
-# — see --confirm-extra-rounds. The remaining confirmation happens once, on the
-# submittable top-20 only, where it is bounded at 20 predictions per round.
-CONFIRM_EXTRA_ROUNDS = 0
+# Extra draws per confirmed molecule, for the ROUND-LEADER confirmation. Two,
+# so that every molecule clearing the round's threshold ends up measured three
+# times and its stored score is the mean of those three draws — rescore.py's
+# TOTAL_DRAWS. It was 0 for a while on the argument recorded under
+# --confirm-extra-rounds; that argument is about how much the averaging buys,
+# not about whether it works, and three draws is now the policy.
+CONFIRM_EXTRA_ROUNDS = 2
 
 # The score is (affinity_probability_binary - affinity_pred_value) / heavy_atoms.
 # Heavy atoms are the denominator, so size is a direct penalty, not a neutral
@@ -1201,10 +1204,17 @@ async def boltz_score(boltz, config: Dict[str, Any],
     """
     Score `molecules` in batches.
 
-    `on_batch(records)` is called with each batch's results as soon as they are
-    read, before the next batch starts. hunter uses it to persist every batch
-    immediately: a round is ~43 minutes of GPU at budget 150, and writing only
-    at the end means a crash at molecule 149 throws away all 149 scores.
+    `on_batch(records)` is called with results as soon as they are read, so a
+    crash never costs more than the work still in flight: writing once at the
+    end of a round means a kill at molecule 149 of 150 throws away all 149.
+
+    A batch is not one unit of work under multi.run. MultiGPUBoltz fans it out
+    across every worker as ~30-molecule chunks that land minutes apart, so when
+    the wrapper exposes the chunk hook, `on_batch` is driven per chunk instead
+    of per batch. At batch_size=480 on 8 workers that cuts the window in which
+    a kill discards finished scores from ~19 minutes to ~7, and each chunk's
+    molecules reach the log as it lands rather than 16 chunks' worth at once.
+    Against a plain BoltzWrapper there is no hook and the batch stays the unit.
     """
     if not molecules:
         return []
@@ -1220,23 +1230,91 @@ async def boltz_score(boltz, config: Dict[str, Any],
         "combination_strategy": config.get(
             "combination_strategy", "heavy_atom_normalization"),
     }
+
+    # Chunks come back in completion order, not input order, so the [i/N] index
+    # has to be looked up rather than counted.
+    pos: Dict[str, int] = {}
+    for i, m in enumerate(molecules, start=1):
+        pos.setdefault(m["smiles"], i)
+
+    def log_molecules(records):
+        """Every molecule, in the order Boltz was handed it.
+
+        Without this the log only shows aggregates, so a single strong hit is
+        invisible until the round ends.
+        """
+        for r in sorted(records, key=lambda x: pos.get(x.get("smiles", ""), 0)):
+            sc, smi = r["boltz_score"], r.get("smiles", "")
+            log.info("    [%4d/%d] %.6f  ha=%2d  %s%s",
+                     pos.get(smi, 0), len(molecules), sc,
+                     heavy_atoms(smi) if smi else 0, r["name"],
+                     " <<<" if sc >= mark_at else "")
+
     out: List[Dict[str, Any]] = []
     for start in range(0, len(molecules), batch_size):
         batch = molecules[start:start + batch_size]
+        # One smiles can carry several records; the pool scores it once and the
+        # score belongs to every one of them.
+        by_smiles: Dict[str, List[Dict[str, Any]]] = {}
+        for x in batch:
+            by_smiles.setdefault(x["smiles"], []).append(x)
         vm = {0: {"smiles": [x["smiles"] for x in batch],
                   "names": [x["name"] for x in batch]}}
         sd = {0: {"target_scores": [[]], "antitarget_scores": [[]],
                   "entropy": None, "entropy_boltz": None,
                   "block_submitted": None, "push_time": ""}}
         t0 = time.time()
-        await asyncio.get_running_loop().run_in_executor(
-            None, lambda: boltz.score_molecules(vm, sd, subnet))
+        done: Dict[str, float] = {}   # smiles already logged and persisted
+
+        def on_chunk(chunk_scores, _components, _by=by_smiles, _done=done):
+            """Persist and print one worker's chunk the moment it lands."""
+            recs = []
+            for smi, per_target in (chunk_scores or {}).items():
+                if smi in _done or smi not in _by:
+                    continue
+                try:
+                    sc = float(per_target.get(targets[0]))
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(sc):
+                    continue
+                for rec in _by[smi]:
+                    r = dict(rec)
+                    r["boltz_score"] = sc
+                    recs.append(r)
+            if not recs:
+                return
+            vals = [r["boltz_score"] for r in recs]
+            log.info("  boltz chunk: %d/%d scored | best %.6f mean %.6f | +%.0fs",
+                     len(recs), len(chunk_scores or {}), max(vals),
+                     float(np.mean(vals)), time.time() - t0)
+            log_molecules(recs)
+            if on_batch is not None:
+                try:
+                    on_batch(recs)
+                except Exception as e:
+                    # Leave these out of `done` so the end-of-batch write retries.
+                    log.error("could not persist chunk: %s", e, exc_info=True)
+                    return
+            _done.update({r["smiles"]: r["boltz_score"] for r in recs})
+
+        hook = hasattr(boltz, "on_chunk_scores")
+        if hook:
+            boltz.on_chunk_scores = on_chunk
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: boltz.score_molecules(vm, sd, subnet))
+        finally:
+            # The pool is shared with rescore's own wrapper; never leave a
+            # callback bound to this batch armed for someone else's call.
+            if hook:
+                boltz.on_chunk_scores = None
         got = sd.get(0, {}).get("molecule_scores", [])
         scores = got[0] if got else []
         if len(scores) != len(batch):
             fmap = getattr(boltz, "final_boltz_scores", {}).get(0, {}).get(targets[0], {})
             scores = [fmap.get(x["smiles"], -math.inf) for x in batch]
-        vals, named, batch_scored_records = [], [], []
+        vals, fresh = [], []
         for rec, sc in zip(batch, scores):
             try:
                 sc = float(sc)
@@ -1247,9 +1325,9 @@ async def boltz_score(boltz, config: Dict[str, Any],
             r = dict(rec)
             r["boltz_score"] = sc
             out.append(r)
-            batch_scored_records.append(r)
             vals.append(sc)
-            named.append((rec["name"], sc, rec.get("smiles", "")))
+            if rec["smiles"] not in done:
+                fresh.append(r)
         if vals:
             log.info(
                 "  boltz %d-%d: %d/%d | best %.6f mean %.6f | %.0fs",
@@ -1257,18 +1335,13 @@ async def boltz_score(boltz, config: Dict[str, Any],
                 len(vals), len(batch), max(vals), float(np.mean(vals)),
                 time.time() - t0,
             )
-            # Every molecule, in the order Boltz saw it. Without this the log
-            # only shows batch aggregates, so a single strong hit is invisible
-            # until the round ends.
-            for i, (nm, sc, smi) in enumerate(named, start=start + 1):
-                mark = " <<<" if sc >= mark_at else ""
-                log.info("    [%4d/%d] %.6f  ha=%2d  %s%s",
-                         i, len(molecules), sc, heavy_atoms(smi) if smi else 0,
-                         nm, mark)
+            # Anything the chunk hook already printed is not repeated here.
+            if fresh:
+                log_molecules(fresh)
 
-        if on_batch is not None and batch_scored_records:
+        if on_batch is not None and fresh:
             try:
-                on_batch(batch_scored_records)
+                on_batch(fresh)
             except Exception as e:
                 log.error("could not persist batch: %s", e, exc_info=True)
 
@@ -1445,10 +1518,13 @@ def parse_args():
                    help="hard cap on the fraction of a round that gets "
                         "confirmed; above it the threshold is raised to the "
                         "matching quantile. Each confirmation costs 2 extra "
-                        "Boltz calls (default 0.30)")
+                        "Boltz calls (default 0.08)")
     p.add_argument("--confirm-extra-rounds", type=int, default=CONFIRM_EXTRA_ROUNDS,
-                   help="extra draws per ROUND-LEADER molecule. Default is now "
-                        "0 (was 2). Measured: our own same-seed replicate "
+                   help="extra draws per ROUND-LEADER molecule, on top of the "
+                        "round's own draw: 2 gives three draws in total and a "
+                        "stored score that is their mean. Known trade-off, "
+                        "kept here because it is the reason this was once 0: "
+                        "our own same-seed replicate "
                         "spread is sd=0.0034 (rxn1 .0033 rxn2 .0026 rxn3 .0033 "
                         "rxn4 .0046), but the sd of (validator score - our "
                         "score) is 0.0095 on n=519 molecules other miners "
@@ -1460,15 +1536,19 @@ def parse_args():
                         "834 extra predictions against 7,310 fresh ones). It is "
                         "also one-sided: only molecules above the threshold are "
                         "re-drawn, so it can demote a lucky molecule but never "
-                        "promote an unlucky one, which fixes the reported "
-                        "number without repairing the ranking. See "
-                        "--top20-confirm-draws for the confirmation that is "
-                        "actually worth paying for")
+                        "promote an unlucky one — it corrects the reported "
+                        "number without repairing the ranking underneath. Set "
+                        "0 to disable and leave confirmation to "
+                        "--top20-confirm-draws alone")
     p.add_argument("--no-confirm", action="store_true",
                    help="skip the confirmation of this round's leaders")
-    p.add_argument("--top20-confirm-draws", type=int, default=1,
+    p.add_argument("--top20-confirm-draws", type=int, default=2,
                    help="extra draws given to any molecule that has entered the "
                         "SUBMITTABLE TOP 20 and has not been confirmed before. "
+                        "Matches --confirm-extra-rounds so both gates settle a "
+                        "molecule at the same three draws; a lower value here "
+                        "would flag it `rescored` after two and lock it out of "
+                        "the third for good. "
                         "This is the only set that is ever submitted, so it is "
                         "the only set whose noise costs anything: our top-20 "
                         "regressed by -0.0028 per molecule against the "
