@@ -2,17 +2,24 @@
 """
 prune_score_db.py — delete dead weight from a score DB, in place.
 
-Two things go:
+Two thresholds, because "unavailable" and "worthless" are not the same thing:
 
-    score < THRESHOLD     molecules too weak to ever reach a submission
-    available = FALSE     molecules the DB has already marked unavailable
+    score < LOW                        too weak to ever reach a submission,
+                                       whatever its availability
+    available = FALSE AND score < HIGH already spent or archived, AND not good
+                                       enough to be worth the row
 
-    python3 prune_score_db.py score_results_1.sqlite 0.05            # report only
-    python3 prune_score_db.py score_results_1.sqlite 0.05 --apply    # delete
+A high-scoring molecule marked unavailable is NOT deleted. It is the single
+most informative kind of row in the file: it is what a good molecule looks
+like, it is what the surrogate learns the top of the distribution from, and it
+is what keeps `seen` from proposing and re-scoring the same chemistry. Only its
+submittability was spent, not its information.
 
-`score < THRESHOLD` is strict: a molecule sitting exactly on the threshold is
-kept, so the same threshold used elsewhere in the pipeline means the same set
-here.
+    python3 prune_score_db.py score_results_1.sqlite 0.02 0.09           # report
+    python3 prune_score_db.py score_results_1.sqlite 0.02 0.09 --apply   # delete
+
+Both comparisons are strict: a molecule sitting exactly on a threshold is kept,
+so the same number used elsewhere in the pipeline means the same set here.
 
 NOTHING IS DELETED WITHOUT --apply
 ----------------------------------
@@ -82,12 +89,21 @@ BUSY_TIMEOUT_MS = 30_000
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Delete molecules below a score threshold, and every "
-                    "molecule marked unavailable, from a score DB. Reports "
-                    "only unless --apply is given.")
+        description="Delete molecules below a low score threshold, plus "
+                    "unavailable molecules below a high one. High-scoring "
+                    "unavailable molecules are kept. Reports only unless "
+                    "--apply is given.")
     p.add_argument("db", help="path to the score DB (e.g. score_results_1.sqlite)")
-    p.add_argument("threshold", type=float,
-                   help="delete molecules with score strictly below this")
+    p.add_argument("low", type=float,
+                   help="delete ANY molecule scoring strictly below this")
+    p.add_argument("high", type=float,
+                   help="delete UNAVAILABLE molecules scoring strictly below "
+                        "this. Unavailable molecules at or above it are kept "
+                        "for what they teach the surrogate. Required, and "
+                        "deliberately not defaulted: the old single-threshold "
+                        "form deleted every unavailable row regardless of "
+                        "score, and silently falling back to that is exactly "
+                        "the behaviour this argument exists to prevent")
     p.add_argument("--apply", action="store_true",
                    help="actually delete. Without this the script only reports")
     p.add_argument("--no-backup", action="store_true",
@@ -187,13 +203,18 @@ def holders(path: str) -> List[Tuple[int, str]]:
     return found
 
 
-def where_clause(threshold: float, keep_unavailable: bool) -> Tuple[str, list]:
-    """`available` is stored as 0/1. NULL is left alone deliberately: the column
+def where_clause(low: float, high: float,
+                 keep_unavailable: bool) -> Tuple[str, list]:
+    """Rows to delete.
+
+    `available` is stored as 0/1. NULL is left alone deliberately: the column
     defaults to TRUE, so a NULL is an unset field rather than a decision, and
-    this script does not delete on a value nobody wrote."""
+    this script does not delete on a value nobody wrote -- which also means a
+    NULL row is only ever judged against `low`.
+    """
     if keep_unavailable:
-        return "score < ?", [threshold]
-    return "score < ? OR available = 0", [threshold]
+        return "score < ?", [low]
+    return "score < ? OR (available = 0 AND score < ?)", [low, high]
 
 
 def main(args: argparse.Namespace,
@@ -201,6 +222,14 @@ def main(args: argparse.Namespace,
     db = args.db
     if not os.path.exists(db):
         print(f"no such DB: {db}", file=sys.stderr)
+        return 2
+
+    # low > high is almost certainly the arguments the wrong way round, and it
+    # silently makes the second clause dead: everything below `high` is already
+    # caught by `low`. Refuse rather than delete more than was meant.
+    if not args.keep_unavailable and args.low > args.high:
+        print(f"low ({args.low:g}) is above high ({args.high:g}) — arguments "
+              f"look reversed. Expected: DB LOW HIGH.", file=sys.stderr)
         return 2
 
     # Before connect(), not at the point of use: opening a WAL database creates
@@ -216,13 +245,17 @@ def main(args: argparse.Namespace,
               f"Refusing to delete from a damaged file.", file=sys.stderr)
         return 1
 
-    where, params = where_clause(args.threshold, args.keep_unavailable)
+    where, params = where_clause(args.low, args.high, args.keep_unavailable)
     one = lambda sql, p=(): conn.execute(sql, p).fetchone()[0]
 
     total = one(f"SELECT COUNT(*) FROM {TABLE}")
     doomed = one(f"SELECT COUNT(*) FROM {TABLE} WHERE {where}", params)
-    below = one(f"SELECT COUNT(*) FROM {TABLE} WHERE score < ?", [args.threshold])
+    below = one(f"SELECT COUNT(*) FROM {TABLE} WHERE score < ?", [args.low])
     unavail = one(f"SELECT COUNT(*) FROM {TABLE} WHERE available = 0")
+    unavail_cut = one(f"SELECT COUNT(*) FROM {TABLE} WHERE available = 0 "
+                      f"AND score >= ? AND score < ?", [args.low, args.high])
+    unavail_kept = one(f"SELECT COUNT(*) FROM {TABLE} WHERE available = 0 "
+                       f"AND score >= ?", [args.high])
     null_avail = one(f"SELECT COUNT(*) FROM {TABLE} WHERE available IS NULL")
     has_reps = has_table(conn, REPLICATES)
     reps = one(f"SELECT COUNT(*) FROM {REPLICATES} WHERE molecule_name IN "
@@ -230,16 +263,21 @@ def main(args: argparse.Namespace,
                params) if has_reps else 0
 
     print(f"{db}")
-    print(f"  rows                        {total:>9,}")
-    print(f"  score < {args.threshold:<19g} {below:>9,}")
+    print(f"  rows                            {total:>9,}")
+    print(f"  score < {args.low:<23g} {below:>9,}")
     if not args.keep_unavailable:
-        print(f"  available = FALSE           {unavail:>9,}")
-    print(f"  to delete (union)           {doomed:>9,}")
+        print(f"  unavailable                     {unavail:>9,}")
+        cut_label = f"{args.low:g} <= score < {args.high:g}"
+        keep_label = f"score >= {args.high:g}"
+        print(f"    of which {cut_label:<21} {unavail_cut:>9,}   also deleted")
+        print(f"    of which {keep_label:<21} {unavail_kept:>9,}   KEPT")
+    print(f"  to delete (union)               {doomed:>9,}")
     if has_reps:
-        print(f"  replicate draws with them   {reps:>9,}")
-    print(f"  surviving                   {total - doomed:>9,}")
+        print(f"  replicate draws with them       {reps:>9,}")
+    print(f"  surviving                       {total - doomed:>9,}")
     if null_avail:
-        print(f"  note: {null_avail:,} rows have available IS NULL — kept")
+        print(f"  note: {null_avail:,} rows have available IS NULL — judged "
+              f"against {args.low:g} only")
 
     if not doomed:
         print("\nnothing to delete.")
@@ -252,6 +290,14 @@ def main(args: argparse.Namespace,
         print("\nhighest-scoring rows that would go:")
         for name, score, avail in top:
             print(f"    {name:<28} {score:.6f}  available={avail}")
+        if unavail_kept and not args.keep_unavailable:
+            best = conn.execute(
+                f"SELECT molecule_name, score FROM {TABLE} WHERE available = 0 "
+                f"AND score >= ? ORDER BY score DESC LIMIT 3",
+                [args.high]).fetchall()
+            print(f"\nunavailable but kept (score >= {args.high:g}), best first:")
+            for name, score in best:
+                print(f"    {name:<28} {score:.6f}")
         print(f"\nreport only — nothing changed. Re-run with --apply to delete "
               f"{doomed:,} molecules.")
         return 0

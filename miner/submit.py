@@ -83,14 +83,30 @@ ENTROPY_FP_SIZE = 2048
 
 # How many extra qualified candidates to gather when the score-ordered set
 # misses the entropy floor and has to be repaired. Only paid for when a repair
-# is actually needed: measured on rxn2, 1 score-ordered top-20 window in 50
-# falls below 0.25, and those are fixed by a single swap costing 0.000017 of
-# average score.
-ENTROPY_REPAIR_RESERVE = 80
+# is actually needed.
+#
+# Raised from 80. A bigger reserve is not just insurance -- it reaches the floor
+# in FEWER swaps, because each swap can choose from more chemistry. Reproduced
+# on real rxn5 molecules with a 481-candidate pool: from a reserve of 200 the
+# repair needed 9 swaps, from the full 461 it needed 8. The gathering cost is
+# one availability check per candidate (~15 ms), paid only on a repair.
+ENTROPY_REPAIR_RESERVE = 400
 
-# A set that cannot be brought over the floor in this many swaps is not going
-# to be, and an unbounded search here would run into the epoch boundary.
-ENTROPY_REPAIR_MAX_SWAPS = 8
+# Cap on repair swaps.
+#
+# WAS 8, AND 8 WAS TOO FEW -- this is what made rxn5 skip epoch 24891. The
+# score-ordered top 20 of a small confirmed pool can start FAR below the floor
+# (0.1679 measured on real rxn5 chemistry against a 0.25 requirement), and the
+# repair climbs at a steady ~0.0107 per swap with no plateau:
+#
+#   0.1679 0.1854 0.1992 0.2112 0.2224 0.2317 0.2404 0.2478 | 0.2537
+#                                                       8th ^   ^ 9th
+#
+# It ran out of swaps one short of clearing the bar and threw the epoch away.
+# The loop exits the moment entropy reaches the floor, so a high cap costs
+# nothing in the normal case -- it is only ever reached when the alternative is
+# submitting nothing at all. At ~0.08 s per swap even 60 is under five seconds.
+ENTROPY_REPAIR_MAX_SWAPS = 60
 
 # Minimum independent Boltz draws a molecule needs before it may be submitted.
 #
