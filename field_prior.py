@@ -78,9 +78,54 @@ UPSIDE_WEIGHT = 0.15
 # The reactant summaries contain entries like avg_score = -17.79 from these.
 MIN_VALID_SCORE = -1.0
 
+# Fallback `hit_threshold` for a reaction with no field CSV. With a CSV the
+# threshold is DERIVED per reaction instead (see _derive_hit_threshold): 0.11 is
+# a single global number and it is wrong for every reaction, because the score
+# distribution of what gets submitted differs by reaction. Derived values, and
+# where each sits in its own reaction's field distribution:
+#
+#     rxn1 0.1035 (p69)   rxn2 0.1140 (p73)   rxn3 0.1025 (p66)
+#     rxn4 0.1114 (p80)   rxn5 0.1191 (p77)
+#
+# At a flat 0.11 the hit rate meant "top 12%" on rxn3 and "top 49%" on rxn5, so
+# the same feature carried a different meaning in every reaction's prior. The
+# derived bar lands consistently around p70-p80, which is what makes it
+# comparable across reactions -- that consistency is the property being bought
+# here, NOT any claim to be a winning threshold.
+DEFAULT_HIT_THRESHOLD = 0.11
+
+# The `field_hi` signal takes components appearing in the field's best molecules.
+# It was a hardcoded 0.125, which is a quantile of wildly different depth per
+# reaction -- 1,087 molecules on rxn5 but FOUR on rxn3, so rxn3's strongest
+# component signal was built on four data points and was pure noise. A quantile
+# of that reaction's own field scores keeps the slice the same size everywhere
+# (~500 molecules per reaction at 0.95).
+HI_QUANTILE = 0.95
+
 
 def field_csv_path(rxn_id: int, data_dir: str = DATA_DIR) -> str:
     return os.path.join(data_dir, f"rxn{rxn_id}.csv")
+
+
+def _derive_hit_threshold(df: pd.DataFrame, fallback: float) -> float:
+    """A per-reaction bar separating good field molecules from ordinary ones.
+
+    For each epoch, the 20th best molecule ANY miner submitted; then the median
+    across epochs. Note what this is not: the field CSV pools every miner (~5.5
+    per epoch, no uid column), so this is a composite, not one miner's #20 and
+    not a winning threshold. Its value is that it lands at a consistent p70-p80
+    of each reaction's own distribution, so a component's hit rate means the
+    same thing in every reaction -- which a flat 0.11 did not.
+    """
+    if "epoch" not in df.columns:
+        return fallback
+    twentieths = [
+        g.nlargest(20, "final_score")["final_score"].iloc[-1]
+        for _, g in df.groupby("epoch") if len(g) >= 20
+    ]
+    if not twentieths:
+        return fallback
+    return float(np.median(twentieths))
 
 
 def parse_components(name: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
@@ -158,12 +203,17 @@ class FieldPrior:
         *,
         data_dir: str = DATA_DIR,
         db_path: Optional[str] = None,
-        hit_threshold: float = 0.11,
+        hit_threshold: Optional[float] = None,
         field_weight: float = 0.65,
         logger=None,
     ):
         self.rxn_id = rxn_id
-        self.hit_threshold = hit_threshold
+        # None means "derive it from this reaction's own field CSV". _load_field
+        # fills it in before anything reads it; the fallback stands only when
+        # there is no CSV to derive from.
+        self.hit_threshold = (DEFAULT_HIT_THRESHOLD if hit_threshold is None
+                              else float(hit_threshold))
+        self._hit_threshold_given = hit_threshold is not None
         self.field_weight = float(np.clip(field_weight, 0.0, 1.0))
         self.log = logger
         self.three_component = False
@@ -214,6 +264,10 @@ class FieldPrior:
         if not self.n_field:
             return
 
+        # Derive the bar before tabulating: _tabulate's hit rate depends on it.
+        if not self._hit_threshold_given:
+            self.hit_threshold = _derive_hit_threshold(df, self.hit_threshold)
+
         roles = ["A", "B"] + (["C"] if self.three_component else [])
         for role in roles:
             self.field[role] = _tabulate(df, role, "final_score", self.hit_threshold)
@@ -229,7 +283,9 @@ class FieldPrior:
 
         # Components that appear in genuinely high-scoring molecules. This is
         # the signal that transferred best in testing (spearman +0.36 for B).
-        hi = df[df["final_score"] > 0.125]
+        # Cut by quantile, not by a fixed score: see HI_QUANTILE.
+        hi_cut = float(df["final_score"].quantile(HI_QUANTILE))
+        hi = df[df["final_score"] > hi_cut]
         for role in roles:
             self.field_hi[role] = hi.groupby(role)["final_score"].max().to_dict()
 
@@ -238,7 +294,8 @@ class FieldPrior:
             + " ".join(
                 f"{r}={len(self.field[r].n)}" for r in roles
             )
-            + f" | pairs={len(self.pairs)} | >0.125: {len(hi)}"
+            + f" | pairs={len(self.pairs)} | hit_bar={self.hit_threshold:.4f}"
+            + f" | >{hi_cut:.4f}: {len(hi)}"
         )
 
     def _load_local(self, db_path: str) -> None:

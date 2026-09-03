@@ -78,6 +78,7 @@ import logging
 import math
 import os
 import random
+import sqlite3
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -158,15 +159,23 @@ os.makedirs(REACTANT_FP_DIR, exist_ok=True)
 # #20 minus a margin for single-draw noise; a literal float overrides it. This
 # value is only the fallback when no frontier exists yet.
 #
-# Re-measured at max_similarity_to_historical = 0.6 (epoch 24876), which moves
-# the frontier down by up to 0.0044 and, far more importantly, changes how deep
-# the search must scan to find twenty submittable molecules:
+# Re-measured against all five score DBs and the field's own submissions. The
+# archive saturation that dominated the previous derivation no longer reaches
+# the submittable pool: every molecule failing 0.6 has been marked unavailable
+# and each frontier is now reached at scan depth 21. Generation is still 70%
+# filtered by the novelty gate (see hunter_opts.sh) -- what changed is where the
+# loss lands, not that it went away.
 #
-#     rxn1  #20 = 0.0962   scan 34    80% of its top 500 still passes 0.6
-#     rxn2  #20 = 0.1019   scan 21   100%
-#     rxn3  #20 = 0.0951   scan 21   100%
-#     rxn4  #20 = 0.0995   scan 54    31%
-#     rxn5  #20 = 0.1022   scan 418    5%
+#     rxn  our #20   our top20 sum   field ceiling   gap   recent median
+#      1    0.1068          2.1949          2.1561  -0.0388        0.0586
+#      2    0.1031          2.1121          2.3543  +0.2422        0.0505
+#      3    0.0925          1.8580          2.1056  +0.2476        0.0608
+#      4    0.0994          2.0363          2.3392  +0.3029        0.0374
+#      5    0.1002          2.0969          2.4624  +0.3655        0.0442
+#
+# "Ceiling" is the best 20 molecules any miner submitted in an epoch, pooled
+# across ~5.5 miners. It is not a winning submission and every gap is overstated;
+# it ranks the reactions fairly because the pooling is equal across them.
 #
 # CONFIRMATION IS NOT OPTIONAL AT THESE MARGINS
 # ---------------------------------------------
@@ -174,16 +183,17 @@ os.makedirs(REACTANT_FP_DIR, exist_ok=True)
 # per reaction, #1 minus #20 against the p90 redraw range of that reaction's
 # own replicates:
 #
-#     rxn1  band 0.0097   p90 redraw range 0.0154
-#     rxn2  band 0.0056                    0.0093
-#     rxn3  band 0.0085                    0.0130
-#     rxn4  band 0.0139                    0.0216
-#     rxn5  band 0.0104                    0.0282
+#     rxn1  band 0.0133   p90 redraw range 0.0152
+#     rxn2  band 0.0095                    0.0094
+#     rxn3  band 0.0009                    0.0134
+#     rxn4  band 0.0093                    0.0218
+#     rxn5  band 0.0264                    0.0565
 #
-# In every one of them the noise exceeds the entire band, so a single draw
-# cannot order the twenty molecules that actually get submitted -- it can only
-# tell you roughly which molecules are in the running. That is the argument for
-# a wider --confirm-margin, not GPU thrift.
+# On four of five the noise exceeds the entire band, so a single draw cannot
+# order the twenty molecules that actually get submitted. rxn3 is the extreme
+# case: its top 20 spans 0.0009, a flat plateau fifteen times narrower than one
+# redraw, so its ordering is noise and nothing else. That is the argument for a
+# wider --confirm-margin, not GPU thrift.
 CONFIRM_FALLBACK_THRESHOLD = 0.1
 # Extra draws per confirmed molecule, for the ROUND-LEADER confirmation. Two,
 # so that every molecule clearing the round's threshold ends up measured three
@@ -1394,6 +1404,165 @@ async def boltz_score(boltz, config: Dict[str, Any],
 # Submittable top-20
 # =============================================================================
 
+async def topup_unconfirmed(boltz, config: Dict[str, Any], db_path: str,
+                            rxn_id: int, threshold: float, args,
+                            round_no: int, target_key: str,
+                            target_label: str) -> Dict[str, float]:
+    """Give every above-threshold molecule in the DB the draws it is missing.
+
+    The round-end confirmation only ever looks at molecules THIS round scored.
+    Anything that cleared the bar in an earlier round and did not get its three
+    draws stays unconfirmed for good: the threshold moves as the frontier
+    climbs, --confirm-max-frac clips busy rounds, and a failed pass leaves a
+    molecule stranded at two draws. Those stragglers are exactly the ones that
+    reach the submittable top 20 still carrying a lucky single draw, and they
+    are what regresses when the validator re-scores them.
+
+    So sweep the whole DB, not just the round: everything above `threshold`
+    that has fewer than the full complement of draws gets topped up, best score
+    first. The sweep is UNCAPPED by default, because a cap is what leaves a
+    backlog, and a backlog is exactly the pool submit.py has to pick from -- a
+    partial sweep just defers the bad submission rather than preventing it. The
+    goal is that nothing above the bar is left unconfirmed when the round ends.
+
+    The first sweep on a DB with history is expensive: 315 molecules above the
+    bar on rxn2, ~627 extra predictions, roughly +82 min on a 43 min round.
+    That is a one-off. Once the backlog is gone the sweep only sees what the
+    round's own gates missed -- a clipped --confirm-max-frac, a failed pass --
+    which is a handful. --topup-max caps it if a first run needs rationing;
+    --no-topup turns it off.
+    """
+    log_ = log
+    total_draws = 1 + args.confirm_extra_rounds
+    if boltz is None or args.no_topup or args.confirm_extra_rounds < 1:
+        return {}
+
+    # `rescored` is set by whichever gate last topped a molecule up, and it is
+    # set on anything that reached that gate's OWN total -- so a molecule can
+    # carry "done" while holding two draws. confirm_high_scorers skips every
+    # flagged molecule, which turns a wrong flag into a permanent lock-out.
+    #
+    # Repair the flag across the whole reaction, not just the rows this sweep
+    # is about to touch: a short row below the threshold is not swept today,
+    # but it will be the moment the frontier moves, and it should not be
+    # locked out when that happens. Pure bookkeeping -- no Boltz cost.
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE scored_molecules
+                SET    rescored = FALSE
+                WHERE  rescored = 1
+                  AND  molecule_name LIKE ?
+                  AND  molecule_name NOT IN (
+                           SELECT molecule_name
+                           FROM   molecule_replicates
+                           GROUP  BY molecule_name
+                           HAVING COUNT(*) >= ?)
+                """,
+                (f"rxn:{rxn_id}:%", total_draws),
+            )
+            repaired = cur.rowcount
+            conn.commit()
+        if repaired:
+            log_.info("[round %d] cleared a stale `rescored` flag on %d "
+                      "molecule(s) holding fewer than %d draws",
+                      round_no, repaired, total_draws)
+    except sqlite3.Error as e:
+        log_.warning("[round %d] could not repair rescored flags: %s",
+                     round_no, e)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT s.molecule_name, s.smiles, s.score,
+                       COALESCE(d.n, 0) AS draws
+                FROM   scored_molecules s
+                LEFT JOIN (SELECT molecule_name, COUNT(*) n
+                           FROM   molecule_replicates
+                           GROUP  BY molecule_name) d
+                  ON   d.molecule_name = s.molecule_name
+                WHERE  s.available = 1
+                  AND  s.smiles IS NOT NULL AND s.smiles != ''
+                  AND  s.molecule_name LIKE ?
+                  AND  s.score > ?
+                  AND  COALESCE(d.n, 0) < ?
+                ORDER  BY s.score DESC
+                """ + ("LIMIT ?" if args.topup_max > 0 else ""),
+                (f"rxn:{rxn_id}:%", float(threshold), total_draws)
+                + ((int(args.topup_max),) if args.topup_max > 0 else ()),
+            ).fetchall()
+    except sqlite3.Error as e:
+        log_.warning("[round %d] top-up scan failed: %s", round_no, e)
+        return {}
+
+    if not rows:
+        return {}
+
+    names = [r[0] for r in rows]
+    prior = score_store.replicate_scores(db_path, names)
+
+    # The score stored for a partly-confirmed molecule is the MEAN of its draws,
+    # not a draw. Handing that mean to confirm_high_scorers would make it look
+    # like a fresh measurement and be appended as one, letting the molecule
+    # reach three "draws" of which one is an average of the other two. Pass an
+    # actual prior draw instead, so it matches something already on record and
+    # is recognised as old.
+    records = []
+    for nm, smi, sc, _d in rows:
+        seen = prior.get(nm) or []
+        records.append({"name": nm, "smiles": smi, "source": "hunter",
+                        "boltz_score": float(seen[0]) if seen else float(sc)})
+
+    short = sum(1 for r in rows if r[3] > 0)
+    log_.info("[round %d] top-up sweep: %d molecule(s) above %.5f without "
+              "%d draws (%d stranded part-way) -> up to %d extra predictions",
+              round_no, len(rows), threshold, total_draws, short,
+              sum(total_draws - r[3] - (0 if r[3] else 1) for r in rows))
+
+    averaged = await rescore.confirm_high_scorers(
+        boltz=boltz, config=config, scored=records,
+        threshold=-math.inf,           # the SQL above already selected them
+        extra_rounds=args.confirm_extra_rounds,
+        batch_size=args.batch_size, db_path=db_path, rxn_id=rxn_id,
+        round_no=round_no, target_key=target_key,
+        target_label=target_label, source="hunter", logger=log_)
+    # State the outcome the sweep exists to guarantee, rather than assuming it.
+    # A molecule can still be left behind -- a Boltz pass can fail -- and that
+    # is worth seeing in the log rather than discovering in a submission.
+    try:
+        with sqlite3.connect(db_path) as conn:
+            left = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM   scored_molecules s
+                LEFT JOIN (SELECT molecule_name, COUNT(*) n
+                           FROM   molecule_replicates
+                           GROUP  BY molecule_name) d
+                  ON   d.molecule_name = s.molecule_name
+                WHERE  s.available = 1
+                  AND  s.smiles IS NOT NULL AND s.smiles != ''
+                  AND  s.molecule_name LIKE ?
+                  AND  s.score > ?
+                  AND  COALESCE(d.n, 0) < ?
+                """,
+                (f"rxn:{rxn_id}:%", float(threshold), total_draws),
+            ).fetchone()[0]
+    except sqlite3.Error:
+        left = -1
+
+    log_.info("[round %d] top-up sweep: confirmed %d | still unconfirmed "
+              "above %.5f: %s",
+              round_no, len(averaged or {}), threshold,
+              "unknown" if left < 0 else ("none" if left == 0 else str(left)))
+    if left > 0:
+        log_.warning("[round %d] %d molecule(s) above the bar still lack %d "
+                     "draws — a confirmation pass failed, or --topup-max "
+                     "capped the sweep", round_no, left, total_draws)
+    return averaged or {}
+
+
 def submittable_top20(db_path: str, rxn_id: int, guard: novelty.NoveltyGuard,
                       target: str, config: Dict[str, Any],
                       scan: int = 4000) -> pd.DataFrame:
@@ -1540,7 +1709,7 @@ def parse_args():
                         "0.6: rxn1 0.0962, rxn2 0.1019, rxn3 0.0951, rxn4 "
                         "0.0995, rxn5 0.1022 — a fixed 0.1 confirms nothing on "
                         "rxn1/rxn3 and wastes GPU on rxn2/5")
-    p.add_argument("--confirm-margin", type=float, default=0.010,
+    p.add_argument("--confirm-margin", type=float, default=0.015,
                    help="how far below the frontier still earns confirmation. "
                         "Raised from 0.005 after measuring the redraw spread "
                         "on all 2,537 molecules that carry >=2 replicate draws "
@@ -1548,11 +1717,12 @@ def parse_args():
                         "old 0.0025/0.0102 figures came from: median sd "
                         "0.0029, but p90 RANGE 0.0163 and max 0.1417. A 0.005 "
                         "margin caught under half of real redraw variation. "
-                        "0.010 catches 78% and is the largest value that "
-                        "still leaves every reaction under --confirm-max-frac "
-                        "(worst is rxn5 at 7.5%% of a round). See the "
+                        "Re-measured across all five DBs: 0.015 is now the "
+                        "largest value keeping every reaction under "
+                        "--confirm-max-frac (worst is rxn5 at 8.0%% of a "
+                        "round; 0.020 puts rxn3 at 17.7%%). See the "
                         "confirmation note above for why this matters more "
-                        "than it looks (default 0.010)")
+                        "than it looks (default 0.015)")
     p.add_argument("--confirm-floor", type=float, default=0.08,
                    help="threshold never drops below this, so an early or weak "
                         "round does not confirm everything it scored")
@@ -1588,6 +1758,28 @@ def parse_args():
                         "--top20-confirm-draws alone")
     p.add_argument("--no-confirm", action="store_true",
                    help="skip the confirmation of this round's leaders")
+    p.add_argument("--no-topup", action="store_true",
+                   help="skip the end-of-round sweep that confirms every "
+                        "above-threshold molecule the round's own gates left "
+                        "unconfirmed")
+    p.add_argument("--topup-max", type=int, default=0,
+                   help="cap on molecules the end-of-round top-up sweep may "
+                        "confirm. The sweep looks at the WHOLE DB, not just "
+                        "this round, so it catches molecules that cleared the "
+                        "bar in an earlier round and never got their three "
+                        "draws -- the ones that reach the submittable top 20 "
+                        "still carrying a lucky single draw. Measured on rxn2: "
+                        "315 available molecules sit above the confirm "
+                        "threshold with fewer than three draws, and 57 are "
+                        "stranded at two by a `rescored` flag that locks them "
+                        "out. Best score first. 0 (the default) means NO cap: "
+                        "the sweep runs until nothing above the bar is left "
+                        "unconfirmed, because a leftover is precisely what "
+                        "submit.py would otherwise pick up. Budget for the "
+                        "first run on an old DB -- 627 extra predictions on "
+                        "rxn2, about +82 min on a 43 min round -- then it "
+                        "settles to whatever the round's gates missed. Use "
+                        "--no-topup to disable")
     p.add_argument("--top20-confirm-draws", type=int, default=2,
                    help="extra draws given to any molecule that has entered the "
                         "SUBMITTABLE TOP 20 and has not been confirmed before. "
@@ -1900,6 +2092,18 @@ async def main() -> None:
                          float(moved.sum()) if len(moved) else 0.0,
                          int((moved < 0).sum()) if len(moved) else 0)
                 # Confirmed values can reorder the frontier, so re-read it.
+                after = submittable_top20(db_path, rxn_id, guard, target, config)
+
+        # Sweep the DB for anything above the bar that is still short of its
+        # draws. Runs after both gates so it only ever picks up what they left
+        # behind, and uses the frontier as it stands AFTER this round's work.
+        if not args.dry_run and not args.no_confirm and boltz is not None:
+            sweep_thr, _why = resolve_confirm_threshold(args, after)
+            topped = await topup_unconfirmed(
+                boltz=boltz, config=config, db_path=db_path, rxn_id=rxn_id,
+                threshold=sweep_thr, args=args, round_no=round_no,
+                target_key=target_key, target_label=target_label)
+            if topped:
                 after = submittable_top20(db_path, rxn_id, guard, target, config)
 
         export_top20(after, rxn_id, target)

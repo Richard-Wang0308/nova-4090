@@ -38,18 +38,27 @@
 # reaction well. If this box has more cards than nvidia-smi showed when this was
 # written, set GPU_FOR below.
 #
-# WHICH REACTION TO RUN, if you only have one card. Measured deficit between our
-# available top-20 sum and the median winning sum (see the P0 analysis):
+# WHICH REACTION TO RUN, if you only have one card. Gap between our submittable
+# top-20 sum (at novelty 0.6) and the field's CEILING -- the best 20 molecules
+# any miner submitted in an epoch, pooled from ~5.5 miners because the field CSV
+# carries no uid. That ceiling is not a winning submission and every gap below
+# is therefore overstated; the RANKING is fair because all five reactions pool a
+# near-identical number of miners. Re-measured 2026-09-03 against all five DBs
+# and ~10k validator-scored molecules per reaction:
 #
-#     rxn4   0.008   at parity   <- run this
-#     rxn3   0.009   at parity   <- then this
-#     rxn2   0.036   close
-#     rxn1   0.116   needs ~44x more hits above the winning threshold
-#     rxn5   0.156   needs ~190x
+#     rxn1  -0.0388   AHEAD even of the inflated ceiling   <- run this
+#     rxn2  +0.2422
+#     rxn3  +0.2476   flat: its whole top 20 spans 0.0009
+#     rxn4  +0.3029   weakest generator (recent median 0.0374)
+#     rxn5  +0.3655   hardest bar in the field (#20 = 0.1191)
 #
-# rxn3 and rxn4 are together ~40% of epochs and are the only two where the gap
-# is smaller than what these changes plausibly deliver. One card spent on rxn4
-# is worth more than one card split five ways.
+# THIS HAS COMPLETELY REVERSED. The previous ordering put rxn4 and rxn3 "at
+# parity" and said rxn1 "needs ~44x more hits"; rxn1 is now the only reaction
+# whose top 20 would beat the median submission, and rxn4 has become the weakest
+# of the five. The old numbers were taken before the archive cull that removed
+# every near-archive molecule from these DBs.
+#
+# One card spent on rxn1 is worth more than one card split five ways.
 # =============================================================================
 
 set -uo pipefail

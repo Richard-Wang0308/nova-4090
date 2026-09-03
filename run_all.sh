@@ -12,14 +12,20 @@
 # PER-REACTION SETTINGS
 # ---------------------------------------------------------------------------
 # The five reactions are not the same search problem and no longer share a
-# parameter set. What differs, measured:
+# parameter set. Component pools are fixed by the combinatorial DB; coverage is
+# what WE have tried, re-counted 2026-09-03 from the score DBs:
 #
-#   rxn  type  A pool   B pool   C pool   coverage A/B/C   block enrich (k=2)
-#    1    2c    25,728   35,774     --      39.7% / 25.0%        21.1x
-#    2    2c    83,307   24,165     --      20.0% / 37.1%         4.8x
-#    3    3c       817    2,731  18,330  99.3% / 98.1% / 61.6%    5.2x
-#    4    2c    49,108    6,959     --      25.9% / 80.5%         4.1x
-#    5    3c     2,054    2,874   2,874  95.2% / 94.3% / 96.1%    2.8x
+#   rxn  type  A pool   B pool   C pool   coverage A/B/C
+#    1    2c    25,728   35,774     --      30.4% / 18.0%
+#    2    2c    83,307   24,165     --      21.1% /  7.8%
+#    3    3c       817    2,731  18,330  73.1% / 49.2% / 22.7%
+#    4    2c    49,108    6,959     --       8.4% / 62.0%
+#    5    3c     2,054    2,874   2,874  48.7% / 67.7% / 67.0%
+#
+# The coverage figures the previous header recorded (rxn3 "99.3%/98.1%",
+# rxn5 "95.2%/94.3%/96.1%") are not reproducible from these DBs and should not
+# be trusted; rxn2's B position at 7.8% and rxn4's A at 8.4% are the two least
+# explored, and drive the flat priors those reactions now carry.
 #
 # BLOCK-K is chosen as the SMALLEST k whose fresh-cell supply still fills the
 # quota, because block enrichment falls monotonically with k (rxn1: 21.1x at
@@ -49,12 +55,12 @@
 # Molecules above 0.125 in data/rxn{N}.csv: rxn1 252, rxn2 476, rxn3 4,
 # rxn4 320, rxn5 1,071. rxn3's field prior is built on four data points.
 #
-# STRICT-POOL-MULT is raised where block candidates fail the 0.7 novelty gate
-# most often (block novel-pass: rxn1 56%, rxn3 50%, rxn5 78%, rxn2 79%,
-# rxn4 79%) -- the shortlist has to be wider to still fill the Boltz budget.
-#
-# CANDIDATE-POOL is raised on rxn1 and rxn3, which lose the most to BRENK and
-# validity (rxn1: 7,537 proposed -> 3,156 usable, 58% lost).
+# STRICT-POOL-MULT tracks the novelty pass rate at 0.6, re-measured on a random
+# sample of each DB: rxn1 50.6%, rxn2 28.1%, rxn3 31.5%, rxn4 63.9%, rxn5 33.6%
+# -- so 1.6x to 3.6x is the true requirement, against values of 10-20x that were
+# set for a 0.7 gate on archive-saturated pools. BRENK now rejects NOTHING (100%
+# pass on all five), so the old "rxn1 loses 58% to BRENK and validity" no longer
+# holds and CANDIDATE-POOL is no longer inflated to compensate for it.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail

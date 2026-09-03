@@ -46,87 +46,122 @@ HUNTER_BUDGET_PER_WORKER=300
 HUNTER_BATCH=60
 
 # ---------------------------------------------------------------------------
-# PER-REACTION SETTINGS, RE-DERIVED AT max_similarity_to_historical = 0.6
+# PER-REACTION SETTINGS — RE-DERIVED 2026-09-03 against all five score DBs and
+# the field's own submissions (data/rxn{N}.csv, ~10k validator-scored molecules
+# each, 69-95 epochs).
 #
-# The five reactions are NOT in the same situation, and the 0.7 -> 0.6 novelty
-# change (epoch 24876) pulled them further apart. Measured over the top 500
-# available molecules of each score DB against the 48,382-fingerprint P40261
-# archive, together with the last 2,000 molecules each searcher actually
-# scored:
+# THE PREVIOUS DERIVATION IS VOID. It was built on rxn5 being 95% unsubmittable
+# at similarity 0.6 and having to scan 418 molecules deep to field twenty. The
+# AVAILABLE pool is now clean on all five -- every molecule that failed 0.6 has
+# been marked unavailable, and each frontier is reached at scan depth 21.
 #
-#   rxn  passes 0.6   lost vs 0.7   median score   > frontier   scan depth to 20
-#     1       80.0%         19.8%         0.0436        0.25%                 34
-#     2      100.0%          0.0%         0.0697        0.90%                 21
-#     3      100.0%          0.0%         0.0665        0.20%                 21
-#     4       30.8%         69.2%         0.0500        0.85%                 54
-#     5        5.0%         95.0%         0.0642        1.50%                418
+# But do not read that as "novelty is solved". Both easy measurements of it are
+# tautological: the top of the available pool is clean because the dirty rows
+# were culled, and everything in the DB passed the novelty screen before it was
+# ever scored. The only honest number is hunter's own screening log, and it says
+# 70% of RANKED candidates still fail the 0.6 gate (rxn2, 168 rounds: median
+# pass 29.9%, worst 22.8%, and trending DOWN -- 29.3, 25.0, 24.8, 22.8, 24.6%
+# over the most recent rounds). Novelty is still the binding filter on
+# generation; what changed is that it no longer poisons the submittable pool.
 #
-# Two different failure modes, needing opposite corrections:
+# WHERE EACH REACTION STANDS, against the field's best-20-of-all-miners ceiling:
 #
-#   ARCHIVE-SATURATED (rxn4, rxn5). Their chemistry sits inside the 0.6-0.7
-#   similarity band that just became unsubmittable -- median similarity to the
-#   archive is 0.634 and 0.677 against 0.579 for rxn2. rxn5 must now scan 418
-#   molecules deep to field twenty. Yet both carried the most EXPLOITATIVE
-#   settings in this file (rxn5: temperature 8.0, floor 0.05, elite 0.92), which
-#   is exactly backwards: a sharp prior keeps re-mining the components that
-#   produced the molecules everyone else has already submitted. They need to be
-#   pushed off the region they have been working.
+#   rxn  our top20  field ceiling  gap      recent median  recent p99
+#    1      2.1949         2.1561  -0.0388          0.0586      0.1027
+#    2      2.1121         2.3543  +0.2422          0.0505      0.0923
+#    3      1.8580         2.1056  +0.2476          0.0608      0.0869
+#    4      2.0363         2.3392  +0.3029          0.0374      0.0866
+#    5      2.0969         2.4624  +0.3655          0.0442      0.1044
 #
-#   UNPRODUCTIVE BUT NOVEL (rxn1, rxn3). Novelty is not their constraint -- they
-#   lose little or nothing to 0.6 -- but they generate weak candidates (rxn1's
-#   median is the lowest of the five) and almost nothing reaches the frontier.
-#   rxn1 already had the most exploratory settings and it is not paying, so the
-#   correction is the other direction: concentrate on what its prior says is
-#   good instead of sampling broadly and scoring junk.
+# The "ceiling" is the best 20 molecules ANY miner submitted in an epoch, taken
+# from ~107-117 pooled molecules per epoch. The CSV carries no uid, so single
+# submissions cannot be reconstructed and this is NOT a winning submission --
+# it is a composite no individual miner achieved, and every gap above is
+# therefore overstated. It is still a fair RANKING between reactions, because
+# all five pool a near-identical 5.3-5.8 miners per epoch.
 #
-#   rxn2 is the healthy one on every axis and is left alone, as the control.
+# Even against that inflated bar rxn1 comes out ahead, which is the finding that
+# matters: the old run.sh guidance said rxn1 "needs ~44x more hits" and rxn4 was
+# "at parity". Both have reversed.
 #
-# --strict-pool-mult deserves its own note: it sets how many ranked candidates
-# get novelty-screened per round (budget x mult) to end up with `budget` novel
-# ones. At a 5% pass rate rxn5 needs roughly 20x to avoid starving the round;
-# it was at 8. Screening is CPU work against the cached archive, not Boltz, so
-# raising it costs wall clock on the host rather than GPU budget.
+# COMPONENT COVERAGE is what the prior settings key off, and it is nothing like
+# the numbers the old header recorded (rxn3 "99.3%/98.1%", rxn5 "95.2%/94.3%"):
 #
-# These are reasoned from the DBs, not A/B tested. Give them a few rounds and
-# re-read the two columns that matter: "> frontier" should rise on rxn1/rxn3,
-# and "scan depth to 20" should fall on rxn4/rxn5.
+#   rxn  A pool   A cov   B pool   B cov   C pool   C cov
+#    1   25,728   30.4%   35,774   18.0%       --      --
+#    2   83,307   21.1%   24,165    7.8%       --      --
+#    3      817   73.1%    2,731   49.2%   18,330   22.7%
+#    4   49,108    8.4%    6,959   62.0%       --      --
+#    5    2,054   48.7%    2,874   67.7%    2,874   67.0%
+#
+# A reaction with most of its building blocks never tried has more to gain from
+# a flat prior than from a sharp one, because a sharp prior can only re-rank
+# what it has already seen. rxn2 (7.8% of B) and rxn4 (8.4% of A) are the two
+# with the most unexplored ground, and they get the flattest priors. rxn5 is the
+# best covered on every position and gets the sharpest.
+#
+# STRICT-POOL-MULT sets how many ranked candidates get novelty-screened
+# (budget x mult) to yield `budget` novel ones. It CANNOT be derived from the
+# score DBs: everything in them already passed the screen, so any sample drawn
+# from them reports a pass rate near 100% and would justify a mult of 1 that
+# starves every round. The measurement has to come from hunter's screening log.
+#
+# rxn2, 168 rounds: median pass 29.9%, worst 22.8% -> 3.3x needed typically,
+# 4.4x in the worst round observed, and the rate is falling as the searcher
+# works through the novel chemistry near its favoured region. 8x leaves headroom
+# for a round worse than any yet seen.
+#
+# The other four reactions have no usable log history (rxn4 has one round at
+# 44%), so there is no evidence on which to differentiate them, and they get the
+# same 8x rather than a number invented per reaction. The previous 10/6/10/10/20
+# spread was not measured either; rxn5 at 20x was screening twenty times its
+# budget with nothing to justify it.
+#
+# FIELD-WEIGHT: the field CSV is worth far more than the 41x the module header
+# claims. P(above that reaction's own winning bar) in the field CSV against our
+# DB: rxn1 261x, rxn3 1,613x, rxn4 2,780x, rxn5 4,262x, and rxn2 is unbounded --
+# we have ZERO molecules above rxn2's bar of 0.1140. rxn3 was held at 0.3 only
+# because its `field_hi` slice was four molecules; field_prior.py now cuts that
+# slice by quantile and rxn3 gets 387, so the reason for holding it back is gone.
 # ---------------------------------------------------------------------------
 opts_for() {
   case "$1" in
-    # Novel enough (80% passes 0.6) but the weakest generator of the five:
-    # median 0.0436, and only 0.25% of what it scores reaches the frontier.
-    # It was already the most exploratory config here, so tighten instead:
-    # elite 0.88 -> 0.92, temperature 4.0 -> 6.0, floor 0.15 -> 0.10.
-    1) echo "--candidate-pool 40000 --block-frac 0.16 --block-k 4 --block-seed-reuse 2 \
-             --prior-temperature 6.0 --prior-floor 0.10 --elite-quantile 0.92 \
-             --field-weight 0.5 --strict-pool-mult 10" ;;
-    # The control. Healthiest on every axis: nothing lost to 0.6, best median,
-    # frontier reached at scan depth 21. Unchanged deliberately.
-    2) echo "--candidate-pool 30000 --block-frac 0.15 --block-k 4 --block-seed-reuse 2 \
-             --prior-temperature 4.0 --prior-floor 0.15 --elite-quantile 0.90 \
-             --field-weight 0.5 --strict-pool-mult 6" ;;
-    # Loses nothing to 0.6, but the worst frontier yield of all five (0.20%)
-    # while running the sharpest prior in the file. Exploitation is not the
-    # problem it looked like: loosen to 5.0/0.12/0.88 and widen each block
-    # (k 3 -> 4, so 25 cells instead of 16).
-    3) echo "--candidate-pool 40000 --block-frac 0.14 --block-k 4 --block-seed-reuse 2 \
-             --prior-temperature 5.0 --prior-floor 0.12 --elite-quantile 0.88 \
-             --field-weight 0.3 --strict-pool-mult 10" ;;
-    # 69% of its top 500 became unsubmittable at 0.6 and scan depth tripled to
-    # 54. Diversify: temperature 5.0 -> 4.0, floor 0.12 -> 0.15, elite 0.90 ->
-    # 0.86, more of the pool from the 2-D block scan, and a wider pool to
-    # screen from. Pass rate 31% means mult 6 was only just adequate.
-    4) echo "--candidate-pool 40000 --block-frac 0.20 --block-k 4 --block-seed-reuse 2 \
-             --prior-temperature 4.0 --prior-floor 0.15 --elite-quantile 0.86 \
-             --field-weight 0.5 --strict-pool-mult 10" ;;
-    # The urgent one: 95% of its top 500 is now unsubmittable and it scans 418
-    # deep to field twenty, while running the most exploitative settings in the
-    # file. Every lever goes the other way -- temperature 8.0 -> 4.0, floor
-    # 0.05 -> 0.18, elite 0.92 -> 0.85, block-frac 0.14 -> 0.22, block-k 2 -> 4
-    # -- and mult 8 -> 20 so a 5% pass rate still fills the round.
-    5) echo "--candidate-pool 45000 --block-frac 0.22 --block-k 4 --block-seed-reuse 2 \
+    # Ahead of the median winner and the best generator of the five. Do not
+    # disturb what is working: moderate prior, tight elite. Coverage is low
+    # (30%/18%) so the floor stays generous enough to keep finding new blocks.
+    1) echo "--candidate-pool 35000 --block-frac 0.16 --block-k 4 --block-seed-reuse 2 \
+             --prior-temperature 5.0 --prior-floor 0.15 --elite-quantile 0.90 \
+             --field-weight 0.55 --strict-pool-mult 8" ;;
+    # 7.8% of its B pool tried -- the least-explored position in any reaction --
+    # and not one molecule above its 0.1140 bar. A sharp prior cannot fix that;
+    # only trying more of the 24,165 B blocks can. Flattest prior, biggest pool.
+    2) echo "--candidate-pool 45000 --block-frac 0.18 --block-k 4 --block-seed-reuse 2 \
+             --prior-temperature 4.0 --prior-floor 0.18 --elite-quantile 0.88 \
+             --field-weight 0.60 --strict-pool-mult 8" ;;
+    # The flat one: its top 20 spans 0.0009, so it has no upside, only a
+    # plateau. Its C position is 22.7% covered of 18,330 -- that is where the
+    # unexplored ground is. Broad elite so the plateau is not mistaken for a
+    # ranking, and field-weight up now that its hi-slice is 387 not 4.
+    3) echo "--candidate-pool 40000 --block-frac 0.16 --block-k 4 --block-seed-reuse 2 \
+             --prior-temperature 5.0 --prior-floor 0.15 --elite-quantile 0.86 \
+             --field-weight 0.55 --strict-pool-mult 8" ;;
+    # The weakest generator: recent median 0.0374 against rxn1's 0.0586, and
+    # p99 barely above its own frontier. 8.4% of a 49,108 A pool tried. Same
+    # prescription as rxn2 and for the same reason -- explore A.
+    4) echo "--candidate-pool 45000 --block-frac 0.20 --block-k 4 --block-seed-reuse 2 \
              --prior-temperature 4.0 --prior-floor 0.18 --elite-quantile 0.85 \
-             --field-weight 0.5 --strict-pool-mult 20" ;;
+             --field-weight 0.60 --strict-pool-mult 8" ;;
+    # The hardest reaction to win: the field's bar is the highest of the five
+    # (ceiling #20 = 0.1191) and our gap is the largest. It is also the best
+    # covered (49/68/67%), so there is least left to discover at the component
+    # level, and its p99 of 0.1044 says the upside is real when it lands -- both
+    # arguments for a sharper prior. Sharper than the others, then, but not the
+    # extreme: with 70% of ranked candidates still failing the novelty gate,
+    # concentrating hard on known-good components is how a searcher walks back
+    # into the chemistry the archive already covers.
+    5) echo "--candidate-pool 30000 --block-frac 0.14 --block-k 4 --block-seed-reuse 2 \
+             --prior-temperature 6.0 --prior-floor 0.12 --elite-quantile 0.90 \
+             --field-weight 0.60 --strict-pool-mult 8" ;;
     *) return 1 ;;
   esac
 }

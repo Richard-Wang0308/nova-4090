@@ -92,6 +92,24 @@ ENTROPY_REPAIR_RESERVE = 80
 # to be, and an unbounded search here would run into the epoch boundary.
 ENTROPY_REPAIR_MAX_SWAPS = 8
 
+# Minimum independent Boltz draws a molecule needs before it may be submitted.
+#
+# A Boltz score is a draw, not a property: the same molecule re-scored moves by
+# a median 0.0053 and a p90 of 0.0163 across the replicate tables, which is
+# WIDER than the whole #1-to-#20 span of the submittable band. Picking the top
+# 20 on single draws therefore selects the luckiest draws, and they regress the
+# moment the validator re-scores them -- the classic winner's curse.
+#
+# Measured on this DB: of the 20 molecules the score-ordered query returned,
+# 18 had 3 draws and the 2 that did not landed at positions 16 and 20 with
+# scores that were single-draw outliers. Requiring 3 draws removes exactly that
+# failure.
+#
+# hunter's confirmation pass (--confirm-extra-rounds) is what produces the
+# draws; a molecule that never cleared the confirm threshold never earns them
+# and is not submittable under this rule.
+MIN_CONFIRMED_DRAWS = 3
+
 # Retries for the GitHub batch-commit flow (re-fetches branch head + retries
 # the whole blob->tree->commit->ref-update sequence on conflict).
 GITHUB_BATCH_MAX_RETRIES = 3
@@ -978,16 +996,56 @@ async def get_verified_molecule_sets(
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+
+        # molecule_replicates only exists once rescore/backfill has run. On a
+        # search-only DB there is nothing to confirm against, and filtering on
+        # a missing table would mean never submitting at all, so fall back to
+        # the unfiltered query and say so loudly.
         cursor.execute(
-            """
-            SELECT molecule_name, score
-            FROM   scored_molecules
-            WHERE  available = TRUE
-            ORDER  BY score DESC
-            LIMIT  ?
-            """,
-            (candidate_pool,),
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='molecule_replicates' LIMIT 1"
         )
+        have_replicates = cursor.fetchone() is not None
+
+        if have_replicates and MIN_CONFIRMED_DRAWS > 1:
+            # Count real draws rather than trusting scored_molecules.rescored:
+            # that flag is also set on molecules that stopped at 2 draws, and
+            # n_reps/mu are only populated by rescore.py's consensus commit,
+            # which hunter's own confirmation pass does not call. The replicate
+            # rows are the one place the draw count is always true.
+            cursor.execute(
+                """
+                SELECT s.molecule_name, s.score
+                FROM   scored_molecules s
+                JOIN  (SELECT molecule_name
+                       FROM   molecule_replicates
+                       GROUP  BY molecule_name
+                       HAVING COUNT(*) >= ?) r
+                  ON   r.molecule_name = s.molecule_name
+                WHERE  s.available = TRUE
+                ORDER  BY s.score DESC
+                LIMIT  ?
+                """,
+                (MIN_CONFIRMED_DRAWS, candidate_pool),
+            )
+        else:
+            if not have_replicates:
+                bt.logging.warning(
+                    f"   ⚠️  {db_path} has no molecule_replicates table — "
+                    f"cannot tell confirmed molecules from single draws. "
+                    f"Submitting on unconfirmed scores; run rescore/backfill "
+                    f"to populate it."
+                )
+            cursor.execute(
+                """
+                SELECT molecule_name, score
+                FROM   scored_molecules
+                WHERE  available = TRUE
+                ORDER  BY score DESC
+                LIMIT  ?
+                """,
+                (candidate_pool,),
+            )
         rows = cursor.fetchall()
         conn.close()
     except sqlite3.Error as e:
@@ -1003,9 +1061,18 @@ async def get_verified_molecule_sets(
     bt.logging.info(
         f"   🔍 Building {n_wallets} set(s) of {molecules_per_wallet} molecules "
         f"from top {len(rows)} candidates "
-        f"(HF unique + historical similarity<{max_similarity}, "
-        f"set entropy≥{min_entropy})"
+        f"(>={MIN_CONFIRMED_DRAWS} Boltz draws + HF unique + historical "
+        f"similarity<{max_similarity}, set entropy≥{min_entropy})"
     )
+    needed = n_wallets * molecules_per_wallet
+    if len(rows) < needed:
+        bt.logging.warning(
+            f"   ⚠️  only {len(rows)} molecule(s) have {MIN_CONFIRMED_DRAWS}+ "
+            f"draws and are still available; {needed} are needed before the "
+            f"HF/BRENK/novelty filters even run. hunter confirms molecules that "
+            f"clear its --confirm-threshold, so a thin pool here means the "
+            f"search is not reaching the frontier often enough."
+        )
 
     historical_df = await asyncio.to_thread(
         load_historical_fingerprints, target_protein
@@ -1392,6 +1459,67 @@ async def prepare_submission(
         return None
 
 
+# Substrate rejects a re-used nonce with InvalidTransaction::Stale, surfaced as
+# error 1010 with this text. Matched on the message because the SDK flattens the
+# chain error into a string by the time it reaches us.
+_STALE_NONCE_MARKERS = (
+    "transaction is outdated",
+    "priority is too low",
+    "stale",
+)
+
+
+def _extrinsic_ok(response: Any) -> Tuple[bool, Optional[str]]:
+    """Did the extrinsic actually succeed?
+
+    bittensor>=10 returns an ExtrinsicResponse dataclass, and it defines no
+    __bool__ -- so a FAILED response is still truthy and `if response:` reports
+    every rejected commit as a success. That is not cosmetic here: commit
+    success is what mark_molecules_unavailable() keys on, so a rejected
+    transaction used to burn all twenty molecules while nothing reached the
+    chain. Read .success explicitly, and keep the bool path for older SDKs that
+    really did return one.
+    """
+    if isinstance(response, bool):
+        return response, None
+    success = getattr(response, "success", None)
+    message = getattr(response, "message", None)
+    if success is None:
+        # Unknown shape: fall back to truthiness rather than silently failing.
+        return bool(response), message
+    return bool(success), message
+
+
+def _is_stale_nonce(message: Optional[str]) -> bool:
+    if not message:
+        return False
+    text = str(message).lower()
+    return any(marker in text for marker in _STALE_NONCE_MARKERS)
+
+
+def _clear_nonce_cache(subtensor_conn: Any, wallet: Any) -> bool:
+    """Drop the SDK's cached nonce for this hotkey.
+
+    async-substrate-interface caches the account nonce per connection and then
+    only ever does `self._nonces[addr] += 1`; it never re-reads the chain. This
+    miner deliberately holds ONE AsyncSubtensor for its whole life to avoid RPC
+    handshake throttling, so that counter has to stay correct across every
+    epoch. Once it drifts below the chain's value -- one commit that never
+    landed is enough -- every later epoch is rejected as outdated, which is
+    exactly the failure this recovers from.
+    """
+    try:
+        substrate = getattr(subtensor_conn, "substrate", None)
+        clear = getattr(substrate, "clear_nonce_cache_for_account", None)
+        if clear is None:
+            return False
+        clear(wallet.hotkey.ss58_address)
+        return True
+    except Exception as e:
+        bt.logging.warning(f"      ⚠️  could not clear nonce cache: {e}")
+        return False
+
+
 async def commit_only(
     payload: Dict[str, Any],
     subtensor_conn: Any,
@@ -1407,35 +1535,61 @@ async def commit_only(
 
     bt.logging.info(f"      ⛓️  Committing on-chain for {label} (UID {miner_uid})...")
 
-    try:
-        commitment_status = await subtensor_conn.set_commitment(
-            wallet=payload["wallet"],
-            netuid=state['config'].netuid,
-            data=payload["commit_content"],
-            wait_for_inclusion=True,      # need confirmed ordering
-            wait_for_finalization=False,  # don't wait extra blocks
-        )
-
-        if commitment_status:
-            bt.logging.info(f"      ✅ Commit OK for {label} (UID {miner_uid})")
-        else:
-            bt.logging.error(
-                f"      ❌ Commit returned False for {label} (UID {miner_uid})"
+    for attempt in (1, 2):
+        try:
+            response = await subtensor_conn.set_commitment(
+                wallet=payload["wallet"],
+                netuid=state['config'].netuid,
+                data=payload["commit_content"],
+                wait_for_inclusion=True,      # need confirmed ordering
+                wait_for_finalization=False,  # don't wait extra blocks
             )
-        return bool(commitment_status)
 
-    except MetadataError as e:
-        bt.logging.warning(
-            f"      ⏳ MetadataError (rate limited) for {label} "
-            f"(UID {miner_uid}): {e}"
-        )
-        return False
-    except Exception as e:
-        bt.logging.error(
-            f"      ❌ Commit error for {label} (UID {miner_uid}): {e}"
-        )
-        bt.logging.error(traceback.format_exc())
-        return False
+            ok, message = _extrinsic_ok(response)
+            if ok:
+                bt.logging.info(
+                    f"      ✅ Commit OK for {label} (UID {miner_uid})"
+                    + (f" [attempt {attempt}]" if attempt > 1 else "")
+                )
+                return True
+
+            bt.logging.error(
+                f"      ❌ Commit REJECTED for {label} (UID {miner_uid}): "
+                f"{message or 'no message'}"
+            )
+            # A stale nonce means the extrinsic never entered a block, so
+            # re-signing it is safe -- and is the only way to recover without
+            # dropping the epoch. Anything else is not retried blind.
+            if attempt == 1 and _is_stale_nonce(message):
+                if _clear_nonce_cache(subtensor_conn, payload["wallet"]):
+                    bt.logging.warning(
+                        f"      🔄 stale nonce for {label}; cache cleared, "
+                        f"re-signing once"
+                    )
+                    continue
+            return False
+
+        except MetadataError as e:
+            bt.logging.warning(
+                f"      ⏳ MetadataError (rate limited) for {label} "
+                f"(UID {miner_uid}): {e}"
+            )
+            return False
+        except Exception as e:
+            if attempt == 1 and _is_stale_nonce(str(e)):
+                if _clear_nonce_cache(subtensor_conn, payload["wallet"]):
+                    bt.logging.warning(
+                        f"      🔄 stale nonce for {label} ({e}); cache "
+                        f"cleared, re-signing once"
+                    )
+                    continue
+            bt.logging.error(
+                f"      ❌ Commit error for {label} (UID {miner_uid}): {e}"
+            )
+            bt.logging.error(traceback.format_exc())
+            return False
+
+    return False
 
 
 # ============================================================================
@@ -1615,6 +1769,14 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         f"   ⚡ Firing {len(payloads)} chain commit(s) CONCURRENTLY "
         f"over one persistent WebSocket..."
     )
+
+    # Re-read every hotkey's nonce from the chain for this epoch. The cache is
+    # per-account, so clearing here cannot make two concurrent wallets collide
+    # -- and it must happen BEFORE the gather, never inside it, because the
+    # cache's increment is what keeps concurrent commits on one account in
+    # order. One extra account_nextIndex RPC per wallet per epoch.
+    for payload in payloads:
+        _clear_nonce_cache(state['wallet_subtensors'][0], payload["wallet"])
 
     commit_tasks = [
         commit_only(payload, state['wallet_subtensors'][idx], state)
