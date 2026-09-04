@@ -30,6 +30,7 @@ import base64
 import hashlib
 import sqlite3
 import signal
+import time
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -82,15 +83,25 @@ MAX_SIMILARITY_TO_HISTORICAL = 0.6
 ENTROPY_FP_SIZE = 2048
 
 # How many extra qualified candidates to gather when the score-ordered set
-# misses the entropy floor and has to be repaired. Only paid for when a repair
-# is actually needed.
+# misses the entropy floor and has to be repaired. 0 means the entire remaining
+# candidate pool. Only paid for when a repair is actually needed.
 #
-# Raised from 80. A bigger reserve is not just insurance -- it reaches the floor
-# in FEWER swaps, because each swap can choose from more chemistry. Reproduced
-# on real rxn5 molecules with a 481-candidate pool: from a reserve of 200 the
-# repair needed 9 swaps, from the full 461 it needed 8. The gathering cost is
-# one availability check per candidate (~15 ms), paid only on a repair.
-ENTROPY_REPAIR_RESERVE = 400
+# WAS 400, AND A CAPPED RESERVE IS WHAT MADE rxn5 SKIP EPOCH 24907. A reserve
+# truncated by score is chemically narrow -- the next 400 molecules by score are
+# near-neighbours of the twenty already picked -- so the swap search runs out of
+# distinct chemistry and stalls at a local maximum BELOW the floor while the
+# swap cap is nowhere near reached. Measured on that epoch's pool (999 qualified
+# candidates, floor 0.25):
+#
+#   reserve=400  ->  entropy 0.2479 after 21 swaps, STALLED, epoch thrown away
+#   reserve=999  ->  entropy 0.2502 after  7 swaps, and a HIGHER mean score
+#
+# A bigger reserve is not just insurance: it reaches the floor in fewer swaps
+# and gives up less score doing it, because each swap chooses from more
+# chemistry. The gathering cost is one availability check per candidate
+# (~7-15 ms against the cached HF table), paid only on a repair, against an
+# epoch that is over an hour long.
+ENTROPY_REPAIR_RESERVE = 0
 
 # Cap on repair swaps.
 #
@@ -107,6 +118,109 @@ ENTROPY_REPAIR_RESERVE = 400
 # nothing in the normal case -- it is only ever reached when the alternative is
 # submitting nothing at all. At ~0.08 s per swap even 60 is under five seconds.
 ENTROPY_REPAIR_MAX_SWAPS = 60
+
+# Cap on the score-recovery swaps of the diversity-first fallback
+# (_entropy_rebuild). Each round buys back the most score it can without
+# dropping the set below the floor and stops on its own once no swap helps;
+# 16 rounds were used on epoch 24907, so this is a runaway guard, not a budget.
+ENTROPY_RECOVERY_MAX_SWAPS = 200
+
+# --- Score-maximising search at the entropy floor -------------------------
+#
+# Clearing the floor is necessary but NOT the goal. The validator scores what
+# is submitted, so among all sets that clear the floor the one to submit is the
+# highest-scoring one -- the entropy repair is a constrained optimisation
+# (maximise total score subject to entropy >= floor), not a feasibility search.
+#
+# Both constructive heuristics above are single-swap hill climbs, and both stop
+# at the first feasible local optimum they reach. Measured on the epoch-24907
+# pool (999 candidates, floor 0.25, unconstrained top-20 total 2.64543):
+#
+#   repair + rebuild, best of the two   total 2.42422   (gives up 0.22120)
+#   annealed search, 8/8 restarts beat it  up to 2.46966   (gives up 0.17577)
+#
+# Every independent restart beat the hill climbs, from every starting point:
+# they were leaving 0.045 of total score -- a fifth of everything they gave up
+# -- on the table. The hill climbs pay for the floor by dropping to very deep,
+# very exotic molecules (pool ranks 477-778); the annealed set instead spreads
+# the cost over more mid-ranked ones (ranks up to 186) and reaches the same
+# entropy for less score.
+#
+# So the constructive results are treated as SEEDS, and this search then
+# maximises score along the floor. A swap costs one entropy evaluation (17.7 us
+# measured; an incremental bit-delta version benchmarked SLOWER at 34.1 us
+# because of the index union, so the straightforward vector form is used).
+# Restart count and iteration budget from a sweep on the epoch-24907 pool,
+# against a 468 s / 14-restart reference run that converged on 2.47067:
+#
+#   restarts  iters   total     time    headroom recovered over the seeds
+#      2      250k   2.46827   10.5 s        94.8 %
+#      4      250k   2.46827   21.1 s        94.8 %
+#      4      400k   2.46645   33.7 s        90.9 %   <- longer runs are WORSE
+#      6      250k   2.46900   32.1 s        96.4 %   <- chosen
+#      8      250k   2.46900   42.9 s        96.4 %   <- no further gain
+#
+# More restarts beat longer restarts: the search converges well before 250k
+# iterations and what it converges to depends on where it started, so spending
+# the budget on more starting points is what finds the better sets.
+ENTROPY_OPT_RESTARTS = 6
+ENTROPY_OPT_ITERS = 250_000
+ENTROPY_OPT_PAIR_TRIES = 60_000
+
+# Wall-clock ceiling for the whole search, checked between restarts, so a slow
+# box degrades to fewer restarts instead of overrunning the epoch. Only ever
+# spent when the score-ordered set missed the floor, against an epoch of
+# EPOCH_LENGTH * 12 s (~72 min) that has already spent ~10 s qualifying the
+# candidate pool. NOTE: paid once PER WALLET.
+ENTROPY_OPT_TIME_BUDGET = 60.0
+
+# Fixed so a given pool always yields the same submission; the search is
+# stochastic but the run is not.
+ENTROPY_OPT_SEED = 0
+
+# --- Last-resort donor tier: unconfirmed molecules for diversity only -------
+#
+# Every submitted set takes the pool's most distinctive chemistry with it, so a
+# pool that is not being replenished goes CHEMICALLY flat long before it goes
+# empty. Simulated on the epoch-24907 pool with hunter stalled (no new
+# confirmations, 20 spent per epoch):
+#
+#   epoch 14: last submittable set
+#   epoch 15: 719 molecules still available, but the best 20-subset of them
+#             reaches only 0.2437 -- BELOW the 0.25 floor. Genuinely
+#             infeasible: no algorithm submits from that pool.
+#
+# The molecules that break the deadlock are needed for their chemistry, not
+# their score, and MIN_CONFIRMED_DRAWS exists to protect the SCORE. So when the
+# confirmed pool cannot reach the floor, unconfirmed (single-draw) molecules are
+# admitted as diversity donors only, under a hard cap. Measured on that dead
+# epoch-15 pool:
+#
+#   0 donors -> ceiling 0.2434 (infeasible)    6 donors -> 0.2943
+#   2 donors -> ceiling 0.2646 (FEASIBLE)     12 donors -> 0.3222
+#
+# Two donors are already enough to clear the floor, so the cap stays small: the
+# submission keeps a confirmed, re-score-stable core and rents just enough
+# chemistry to be valid at all. The alternative is submitting nothing.
+ENTROPY_DONOR_ENABLED = True
+ENTROPY_DONOR_POOL = 4000
+MAX_UNCONFIRMED_PER_SET = 6
+
+# Single-draw scores are optimistic: a molecule picked on one draw is picked
+# partly for a lucky draw. Measured over the 1967 molecules in this DB that
+# have >=3 draws, comparing first draw against the consensus of all draws:
+#
+#   all molecules            median +0.00167   mean +0.00585   p90 +0.01695
+#   top 10% by first draw    median +0.00204   mean +0.01082   p90 +0.04879
+#   top 2%  by first draw    median +0.00216   mean +0.01163   p90 +0.04992
+#
+# The submit band is the top 2%, so a donor's score is discounted by that
+# band's mean optimism before the optimiser compares it with a confirmed
+# molecule. Without this, unconfirmed molecules simply outbid the confirmed
+# pool on raw score (their max was 0.1436 against 0.1404) and take over the
+# submission -- measured 18 of 20 slots -- which is precisely the winner's
+# curse MIN_CONFIRMED_DRAWS exists to prevent.
+UNCONFIRMED_SCORE_HAIRCUT = 0.0116
 
 # Minimum independent Boltz draws a molecule needs before it may be submitted.
 #
@@ -859,6 +973,388 @@ def _repair_entropy(
     return selected, _entropy_from_counts(counts, n), swaps
 
 
+def _entropy_rebuild(
+    pool: List[Tuple[str, float, str]],
+    num_molecules: int,
+    min_entropy: float,
+) -> Tuple[Optional[List[Tuple[str, float, str]]], Optional[float]]:
+    """Diversity-first fallback for when the swap repair stalls below the floor.
+
+    _repair_entropy() is a steepest-ascent hill climb starting from the
+    score-ordered top twenty, and a hill climb can stop at a local maximum: on
+    epoch 24907 it ran out of improving single swaps at 0.2479 against a 0.25
+    floor, with 39 of its 60 swaps unused. No swap budget rescues that, because
+    the problem is the starting point, not the number of steps.
+
+    So build from the other end. Greedily add whichever candidate maximises the
+    entropy of the growing set -- ignoring score entirely -- which lands far
+    ABOVE the floor (0.3124 on that epoch's pool), then trade diversity back for
+    score: repeatedly swap in the highest-scoring candidate that keeps the set
+    at or above the floor. Approaching the floor from above means every
+    intermediate set is already valid, so this returns a submittable set
+    whenever one exists in the pool.
+
+    On epoch 24907 it finished at entropy 0.2502 with mean score 0.1211 --
+    higher than the 0.1193 the uncapped swap repair reached -- in ~3 s.
+
+    Returns (selected, entropy), or (None, None) when the pool cannot reach the
+    floor at all.
+    """
+    pool = [c for c in pool if _entropy_fp(c[2]) is not None]
+    if len(pool) < num_molecules:
+        return None, None
+
+    # Seed: greedy maximum entropy, started from the highest scorer so the
+    # cheapest tie-breaks favour score.
+    selected = [pool[0]]
+    counts = _entropy_fp(pool[0][2]).copy()
+    rest = pool[1:]
+    while len(selected) < num_molecules:
+        n_next = len(selected) + 1
+        best = None
+        for k, cand in enumerate(rest):
+            e = _entropy_from_counts(counts + _entropy_fp(cand[2]), n_next)
+            if best is None or e > best[0]:
+                best = (e, k)
+        counts = counts + _entropy_fp(rest[best[1]][2])
+        selected.append(rest.pop(best[1]))
+
+    n = num_molecules
+    entropy = _entropy_from_counts(counts, n)
+    if entropy < min_entropy:
+        # The most diverse set the pool can build still misses the floor;
+        # nothing else in here will do better.
+        return None, None
+
+    # Recovery: buy score back, one swap at a time, never dropping below the
+    # floor. Candidates stay score-sorted so the inner scan can stop as soon as
+    # it reaches molecules no better than the one it would replace.
+    names = {e[0] for e in selected}
+    cands = sorted(
+        (c for c in pool if c[0] not in names), key=lambda c: -c[1]
+    )
+    for _round in range(ENTROPY_RECOVERY_MAX_SWAPS):
+        best = None    # (score_gain, i, j)
+        for i in range(n):
+            base = counts - _entropy_fp(selected[i][2])
+            for j, cand in enumerate(cands):
+                gain = cand[1] - selected[i][1]
+                if gain <= 0:
+                    break
+                if best is not None and gain <= best[0]:
+                    break
+                if _entropy_from_counts(base + _entropy_fp(cand[2]), n) >= min_entropy:
+                    best = (gain, i, j)
+                    break
+        if best is None:
+            break
+        _gain, i, j = best
+        counts = counts - _entropy_fp(selected[i][2]) + _entropy_fp(cands[j][2])
+        selected[i], cands[j] = cands[j], selected[i]
+        cands.sort(key=lambda c: -c[1])
+
+    return selected, _entropy_from_counts(counts, n)
+
+
+def _polish_single(idx, fps, scores, n, floor, donors=None, max_donors=None):
+    """Best-improvement single swaps that never leave the feasible region.
+
+    `fps`/`scores` are ordered by score descending, so the inner scan can stop
+    as soon as it reaches a candidate no better than the member it would
+    replace, or no better than the best swap already found.
+
+    `donors`, when given, is a 0/1 array marking unconfirmed candidates; no swap
+    may push their count in the set above `max_donors`.
+    """
+    cur = list(idx)
+    counts = fps[cur].sum(axis=0)
+    total = float(scores[cur].sum())
+    m = len(scores)
+    n_don = int(donors[cur].sum()) if donors is not None else 0
+
+    while True:
+        best = None    # (score_gain, i, j)
+        inset = set(cur)
+        for i in range(n):
+            base = counts - fps[cur[i]]
+            held = scores[cur[i]]
+            for j in range(m):
+                gain = scores[j] - held
+                if gain <= 1e-12:
+                    break
+                if best is not None and gain <= best[0]:
+                    break
+                if j in inset:
+                    continue
+                if donors is not None and (
+                    n_don - donors[cur[i]] + donors[j] > max_donors
+                ):
+                    continue
+                if _entropy_from_counts(base + fps[j], n) >= floor:
+                    best = (gain, i, j)
+                    break
+        if best is None:
+            return cur, total
+        gain, i, j = best
+        counts = counts - fps[cur[i]] + fps[j]
+        total += gain
+        if donors is not None:
+            n_don += int(donors[j]) - int(donors[cur[i]])
+        cur[i] = j
+
+
+def _polish_pair(idx, fps, scores, n, floor, rng, tries, donors=None, max_donors=None):
+    """Randomised two-at-a-time swaps.
+
+    Some improvements are unreachable one swap at a time: trading two mid-range
+    molecules for one high scorer plus one diversity donor can raise the total
+    while a set sitting exactly on the floor blocks either half on its own.
+    """
+    cur = list(idx)
+    counts = fps[cur].sum(axis=0)
+    total = float(scores[cur].sum())
+    inset = set(cur)
+    m = len(scores)
+    n_don = int(donors[cur].sum()) if donors is not None else 0
+
+    i_draw = rng.integers(0, n, size=(tries, 2))
+    j_draw = rng.integers(0, m, size=(tries, 2))
+    for t in range(tries):
+        i1, i2 = int(i_draw[t, 0]), int(i_draw[t, 1])
+        j1, j2 = int(j_draw[t, 0]), int(j_draw[t, 1])
+        if i1 == i2 or j1 == j2 or j1 in inset or j2 in inset:
+            continue
+        gain = scores[j1] + scores[j2] - scores[cur[i1]] - scores[cur[i2]]
+        if gain <= 1e-12:
+            continue
+        if donors is not None:
+            new_don = (
+                n_don - donors[cur[i1]] - donors[cur[i2]]
+                + donors[j1] + donors[j2]
+            )
+            if new_don > max_donors:
+                continue
+        new_counts = (
+            counts - fps[cur[i1]] - fps[cur[i2]] + fps[j1] + fps[j2]
+        )
+        if _entropy_from_counts(new_counts, n) < floor:
+            continue
+        inset.discard(cur[i1]); inset.discard(cur[i2])
+        inset.add(j1); inset.add(j2)
+        counts = new_counts
+        total += float(gain)
+        if donors is not None:
+            n_don = int(new_don)
+        cur[i1], cur[i2] = j1, j2
+    return cur, total
+
+
+def _anneal_at_floor(start, fps, scores, n, floor, iters, rng,
+                     donors=None, max_donors=None):
+    """Simulated annealing on score, with the floor as a ramped penalty.
+
+    Feasible-only local search cannot cross the ridge: from a set sitting on the
+    floor, every single swap that gains score drops entropy below it, so the
+    climb stops. Letting the walk go briefly infeasible -- under a penalty that
+    ramps up until only feasible sets survive -- is what reaches the sets the
+    hill climbs cannot see. Only feasible states are ever recorded as best, so
+    an infeasible walk can never be returned.
+
+    The donor cap, unlike the floor, is a HARD constraint here: a move that
+    would exceed it is refused outright rather than penalised. `start` must
+    already satisfy it -- from a state that already exceeds the cap, every
+    single swap still exceeds it and the walk would be frozen.
+    """
+    m = len(scores)
+    cur = list(start)
+    counts = fps[cur].sum(axis=0)
+    total = float(scores[cur].sum())
+    entropy = _entropy_from_counts(counts, n)
+    inset = np.zeros(m, dtype=bool)
+    inset[cur] = True
+    n_don = int(donors[cur].sum()) if donors is not None else 0
+
+    best_idx, best_total = (list(cur), total) if entropy >= floor else (None, -1e18)
+
+    t_hi, t_lo = 0.02, 1e-5
+    ratio = t_lo / t_hi
+    chunk = 8192
+    pos = chunk
+    for it in range(iters):
+        if pos >= chunk:
+            r_u = rng.random(chunk)         # candidate draw
+            r_k = rng.random(chunk)         # uniform vs score-biased
+            r_i = rng.integers(0, n, chunk) # member to evict
+            r_a = rng.random(chunk)         # acceptance
+            pos = 0
+
+        frac = it / iters
+        temp = t_hi * ratio ** frac
+        # Penalty ramps: early on the walk may dip below the floor to cross a
+        # ridge, by the end nothing infeasible can survive.
+        pen = 2.0 + 200.0 * frac
+
+        u = r_u[pos]
+        # fps/scores are score-sorted, so u*u concentrates draws on high
+        # scorers while the uniform half keeps the exotic tail reachable.
+        j = int(m * (u * u if r_k[pos] < 0.5 else u))
+        i = int(r_i[pos])
+        acc = r_a[pos]
+        pos += 1
+
+        if j >= m or inset[j]:
+            continue
+
+        out = cur[i]
+        if donors is not None:
+            new_don = n_don - int(donors[out]) + int(donors[j])
+            if new_don > max_donors:
+                continue
+        new_counts = counts - fps[out] + fps[j]
+        new_entropy = _entropy_from_counts(new_counts, n)
+        new_total = total - scores[out] + scores[j]
+
+        delta = (
+            (new_total - pen * max(0.0, floor - new_entropy))
+            - (total - pen * max(0.0, floor - entropy))
+        )
+        if delta <= 0 and acc >= np.exp(delta / temp):
+            continue
+
+        inset[out] = False
+        inset[j] = True
+        cur[i] = j
+        counts, total, entropy = new_counts, float(new_total), new_entropy
+        if donors is not None:
+            n_don = new_don
+
+        if entropy >= floor and total > best_total:
+            best_idx, best_total = list(cur), total
+
+    return best_idx, best_total
+
+
+def _optimize_score_at_floor(
+    pool: List[Tuple[str, float, str]],
+    num_molecules: int,
+    min_entropy: float,
+    starts: List[List[Tuple[str, float, str]]],
+    donor_names: Optional[set] = None,
+    max_donors: Optional[int] = None,
+) -> Tuple[Optional[List[Tuple[str, float, str]]], Optional[float], Dict[str, Any]]:
+    """Highest-scoring set in `pool` that clears `min_entropy`.
+
+    `starts` are the sets the constructive heuristics produced. They seed the
+    search and, when one of them is already feasible, they also floor the
+    result: the best feasible start is returned if nothing beats it, so this
+    can only improve on _repair_entropy/_entropy_rebuild, never regress.
+
+    An INFEASIBLE start is still useful. The annealer treats the floor as a
+    penalty rather than a wall, so it can walk out of a region the hill climbs
+    cannot escape and reach a feasible set from a start that misses the floor.
+    That is the difference between skipping an epoch and submitting one, so
+    starts are never rejected for being infeasible -- only the returned set has
+    to clear the floor.
+
+    `donor_names`/`max_donors` cap how many unconfirmed molecules the set may
+    contain; every start must already satisfy that cap.
+
+    Returns (selected, entropy, stats); (None, None, stats) if nothing feasible
+    was found.
+    """
+    pool = [c for c in pool if _entropy_fp(c[2]) is not None]
+    pool = sorted(pool, key=lambda c: -c[1])
+    index_of = {c[0]: k for k, c in enumerate(pool)}
+
+    fps = np.asarray([_entropy_fp(c[2]) for c in pool])
+    scores = np.asarray([c[1] for c in pool], dtype=float)
+    n = num_molecules
+    m = len(pool)
+    stats: Dict[str, Any] = {
+        "opt_restarts": 0, "opt_gain": 0.0, "donors_used": 0,
+        "opt_from_scratch": False,
+    }
+
+    donors = None
+    if donor_names and max_donors is not None:
+        donors = np.asarray(
+            [1 if c[0] in donor_names else 0 for c in pool], dtype=int
+        )
+        plain = np.flatnonzero(donors == 0)
+    else:
+        plain = np.arange(m)
+
+    start_idx: List[List[int]] = []
+    for st in starts:
+        try:
+            idx = [index_of[c[0]] for c in st]
+        except KeyError:
+            continue
+        if len(set(idx)) != n:
+            continue
+        if donors is not None and int(donors[idx].sum()) > max_donors:
+            continue
+        start_idx.append(idx)
+    if not start_idx or m < n:
+        return None, None, stats
+
+    def feasible_total(idx):
+        if _entropy_from_counts(fps[idx].sum(axis=0), n) < min_entropy:
+            return None
+        return float(scores[idx].sum())
+
+    best, best_total = None, -1e18
+    for idx in start_idx:
+        t = feasible_total(idx)
+        if t is not None and t > best_total:
+            best, best_total = idx, t
+    seed_best = best_total if best is not None else None
+
+    rng = np.random.default_rng(ENTROPY_OPT_SEED)
+    deadline = time.monotonic() + ENTROPY_OPT_TIME_BUDGET
+
+    for r in range(ENTROPY_OPT_RESTARTS):
+        if time.monotonic() >= deadline:
+            break
+        if r < len(start_idx) * 2:
+            start = start_idx[r % len(start_idx)]
+        else:
+            # Random restarts draw from the confirmed candidates only, so the
+            # start always satisfies the donor cap.
+            source = plain if len(plain) >= n else np.arange(m)
+            start = list(rng.choice(source, n, replace=False))
+        idx, _t = _anneal_at_floor(
+            start, fps, scores, n, min_entropy, ENTROPY_OPT_ITERS, rng,
+            donors, max_donors,
+        )
+        if idx is None:
+            continue
+        idx, total = _polish_single(
+            idx, fps, scores, n, min_entropy, donors, max_donors)
+        idx, total = _polish_pair(
+            idx, fps, scores, n, min_entropy, rng, ENTROPY_OPT_PAIR_TRIES,
+            donors, max_donors)
+        idx, total = _polish_single(
+            idx, fps, scores, n, min_entropy, donors, max_donors)
+        stats["opt_restarts"] = r + 1
+        if total > best_total:
+            best, best_total = idx, total
+
+    if best is None:
+        return None, None, stats
+
+    entropy = _entropy_from_counts(fps[best].sum(axis=0), n)
+    if entropy < min_entropy:
+        # Cannot happen -- only feasible states are ever recorded -- but never
+        # hand back a set the validator would discard.
+        return None, None, stats
+    if donors is not None:
+        stats["donors_used"] = int(donors[best].sum())
+    stats["opt_from_scratch"] = seed_best is None
+    stats["opt_gain"] = 0.0 if seed_best is None else best_total - seed_best
+    return [pool[k] for k in best], entropy, stats
+
+
 def select_diverse_molecule_set(
     candidates: List[Tuple[str, float, str]],
     num_molecules: int,
@@ -867,6 +1363,8 @@ def select_diverse_molecule_set(
     historical_df,
     morgan_gen,
     max_similarity: float,
+    donor_names: Optional[set] = None,
+    max_donors: Optional[int] = None,
 ) -> Tuple[List[Tuple[str, float, str]], Dict[str, Any], List[Tuple[str, str]]]:
     """
     Greedily build a set of num_molecules from score-sorted candidates.
@@ -907,11 +1405,21 @@ def select_diverse_molecule_set(
         "reserve": 0,
         "entropy_swaps": 0,
         "entropy": None,
+        "rebuilt": False,
+        "opt_restarts": 0,
+        "opt_gain": 0.0,
+        "donors_used": 0,
+        "donor_cap_relaxed": False,
+        "opt_from_scratch": False,
     }
 
     # Stays 0 unless the completed set fails entropy, so the common case scans
-    # no further than it did before and pays for no reserve at all.
+    # no further than it did before and pays for no reserve at all. Once a
+    # repair IS needed, the reserve is the whole remaining pool by default
+    # (ENTROPY_REPAIR_RESERVE = 0); a reserve truncated by score is what stalled
+    # the repair below the floor on epoch 24907.
     reserve_target = 0
+    full_reserve = ENTROPY_REPAIR_RESERVE or len(candidates)
 
     for molecule_name, score, smiles in candidates:
         if len(selected) >= num_molecules and len(reserve) >= reserve_target:
@@ -962,7 +1470,7 @@ def select_diverse_molecule_set(
                 # floor is worth gathering a reserve for.
                 ent = _set_entropy(selected)
                 if ent is not None and ent < min_entropy:
-                    reserve_target = ENTROPY_REPAIR_RESERVE
+                    reserve_target = full_reserve
         else:
             reserve.append(entry)
 
@@ -970,14 +1478,129 @@ def select_diverse_molecule_set(
 
     if len(selected) == num_molecules:
         entropy = _set_entropy(selected)
-        if entropy is not None and entropy < min_entropy:
-            selected, entropy, swaps = _repair_entropy(
-                selected, reserve, min_entropy
+        # In the donor tier the score-ordered top set can be all donors -- their
+        # raw scores outbid the confirmed pool -- so it has to go through the
+        # capped search even when its entropy already clears the floor.
+        over_cap = (
+            donor_names is not None and max_donors is not None
+            and sum(1 for c in selected if c[0] in donor_names) > max_donors
+        )
+        if entropy is not None and (entropy < min_entropy or over_cap):
+            # The score-ordered top set misses the floor, so some score has to
+            # be given up. How much is the whole game: everything below exists
+            # to give up as little as possible.
+            pool = selected + reserve
+
+            # The constructive seeds must respect the donor cap, so they are
+            # built from the confirmed candidates alone; the search below is
+            # what spends the donor allowance, and only as far as it must.
+            if donor_names:
+                seed_pool = [c for c in pool if c[0] not in donor_names]
+            else:
+                seed_pool = pool
+            seeds: List[List[Tuple[str, float, str]]] = []
+
+            if len(seed_pool) >= num_molecules:
+                # Seed 1 -- cheapest swaps out of the score-ordered set. Can stop
+                # at a local maximum below the floor (epoch 24907 did, at
+                # 0.2479); it is kept as a starting point either way.
+                repaired, _rep_entropy, swaps = _repair_entropy(
+                    seed_pool[:num_molecules], seed_pool[num_molecules:],
+                    min_entropy,
+                )
+                stats["entropy_swaps"] = swaps
+                if repaired:
+                    seeds.append(repaired)
+
+                # Seed 2 -- built from maximum diversity and walked back down to
+                # the floor. Returns None when even maximum diversity misses the
+                # floor, which is exactly when the donor tier is needed.
+                rebuilt, _reb_entropy = _entropy_rebuild(
+                    seed_pool, num_molecules, min_entropy
+                )
+                if rebuilt is not None:
+                    seeds.append(rebuilt)
+                    stats["rebuilt"] = True
+
+            # Search from every seed, feasible or not. Both seeds are single-swap
+            # hill climbs that stop at the first local optimum they reach; this
+            # searches along the floor for the highest-scoring feasible set, and
+            # returns the best feasible seed if it finds nothing better -- so it
+            # never regresses.
+            best, best_entropy, opt_stats = _optimize_score_at_floor(
+                pool, num_molecules, min_entropy, seeds,
+                donor_names, max_donors,
             )
-            stats["entropy_swaps"] = swaps
+            stats.update(opt_stats)
+
+            if (
+                best is None and seeds and donor_names
+                and max_donors is not None and max_donors < num_molecules
+            ):
+                # Last resort before losing the epoch: the donor cap protects
+                # score quality, not validity, and a submission built on
+                # single-draw scores still beats no submission at all. Only
+                # reached when nothing under the cap clears the floor.
+                best, best_entropy, opt_stats = _optimize_score_at_floor(
+                    pool, num_molecules, min_entropy, seeds,
+                    donor_names, num_molecules,
+                )
+                stats.update(opt_stats)
+                if best is not None:
+                    stats["donor_cap_relaxed"] = True
+
+            if best is not None:
+                selected, entropy = best, best_entropy
+            elif seeds:
+                # Nothing feasible exists here. Hand back the best effort; the
+                # caller's authoritative gate refuses to submit it and, if a
+                # donor tier is still available, retries with it.
+                selected = max(seeds, key=lambda st: sum(e[1] for e in st))
+                entropy = _set_entropy(selected)
         stats["entropy"] = entropy
 
     return selected, stats, failed_availability
+
+
+def _load_donor_candidates(
+    db_path: str, exclude: set, limit: int = ENTROPY_DONOR_POOL
+) -> List[Tuple[str, float, str]]:
+    """Unconfirmed (single-draw) molecules, score-discounted, for diversity only.
+
+    Loaded lazily -- only when the confirmed pool cannot reach the entropy floor
+    on its own -- because these molecules are exactly what MIN_CONFIRMED_DRAWS
+    keeps out of a submission. Their scores are haircut by the measured
+    single-draw optimism so that the optimiser only ever takes one when it buys
+    entropy, never because it outbids a confirmed molecule on score.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            """
+            SELECT molecule_name, score
+            FROM   scored_molecules
+            WHERE  available = TRUE
+            ORDER  BY score DESC
+            LIMIT  ?
+            """,
+            (limit + len(exclude),),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        bt.logging.error(f"   ❌ Could not load donor candidates: {e}")
+        return []
+
+    donors: List[Tuple[str, float, str]] = []
+    for name, score in rows:
+        if name in exclude:
+            continue
+        smiles = get_smiles_from_reaction(name)
+        if smiles is None:
+            continue
+        donors.append((name, score - UNCONFIRMED_SCORE_HAIRCUT, smiles))
+        if len(donors) >= limit:
+            break
+    return donors
 
 
 async def get_verified_molecule_sets(
@@ -1114,6 +1737,8 @@ async def get_verified_molecule_sets(
 
     wallet_sets: List[List[Tuple[str, float]]] = []
     used_names: set = set()
+    donor_triples: Optional[List[Tuple[str, float, str]]] = None
+    confirmed_names = {name for name, _s, _sm in candidate_triples}
 
     for wallet_idx in range(n_wallets):
         remaining = [
@@ -1132,6 +1757,55 @@ async def get_verified_molecule_sets(
             morgan_gen,
             max_similarity,
         )
+
+        # Tier 2 -- the confirmed pool cannot reach the floor on its own. Every
+        # submitted set strips the pool of its most distinctive chemistry, so a
+        # pool that is not being replenished goes flat while it is still large:
+        # measured infeasible at epoch 15 with 719 molecules left. Rather than
+        # skip the epoch, rent a capped number of unconfirmed molecules as
+        # diversity donors. Only reached when the alternative is submitting
+        # nothing at all.
+        needs_donors = (
+            len(selected) < molecules_per_wallet
+            or stats.get("entropy") is None
+            or stats["entropy"] < min_entropy
+        )
+        if needs_donors and ENTROPY_DONOR_ENABLED:
+            if donor_triples is None:
+                bt.logging.warning(
+                    f"   ⚠️  Confirmed pool cannot reach entropy "
+                    f"{min_entropy} — loading up to {ENTROPY_DONOR_POOL} "
+                    f"unconfirmed molecules as diversity donors "
+                    f"(max {MAX_UNCONFIRMED_PER_SET} per set, scores "
+                    f"discounted by {UNCONFIRMED_SCORE_HAIRCUT})"
+                )
+                donor_triples = await asyncio.to_thread(
+                    _load_donor_candidates, db_path, confirmed_names
+                )
+                bt.logging.info(
+                    f"   🧬 Donor candidates available: {len(donor_triples)}"
+                )
+            donor_names = {
+                name for name, _s, _sm in donor_triples
+                if name not in used_names
+            }
+            if donor_names:
+                combined = remaining + [
+                    t for t in donor_triples if t[0] in donor_names
+                ]
+                combined.sort(key=lambda t: -t[1])
+                selected, stats, failed_availability = await asyncio.to_thread(
+                    select_diverse_molecule_set,
+                    combined,
+                    molecules_per_wallet,
+                    min_entropy,
+                    target_protein,
+                    historical_df,
+                    morgan_gen,
+                    max_similarity,
+                    donor_names,
+                    MAX_UNCONFIRMED_PER_SET,
+                )
 
         for name, reason in failed_availability:
             _set_molecule_available(db_path, name, False)
@@ -1157,7 +1831,7 @@ async def get_verified_molecule_sets(
                 f"dup InChIKey={stats['rejected_dup']}, "
                 f"bad SMILES={stats['rejected_bad_smiles']})"
             )
-            break
+            continue
 
         # The SMILES the selector actually used. Re-deriving them here would
         # repeat work and would hand compute_fingerprint_entropy() a None for
@@ -1179,17 +1853,19 @@ async def get_verified_molecule_sets(
                 f"   ❌ Wallet set {wallet_idx + 1}/{n_wallets}: entropy check "
                 f"failed ({e}). Not submitting this set."
             )
-            break
+            continue
 
         if entropy < min_entropy:
             bt.logging.warning(
                 f"   ⚠️  Wallet set {wallet_idx + 1}/{n_wallets}: entropy "
-                f"{entropy:.4f} < {min_entropy} after "
-                f"{stats['entropy_swaps']} repair swap(s) over a reserve of "
-                f"{stats['reserve']}. The validator would discard this "
-                f"submission and the molecules would be spent, so skipping."
+                f"{entropy:.4f} < {min_entropy}. No 20-molecule subset of this "
+                f"pool clears the floor — not a search failure but a depleted "
+                f"pool: the chemistry left is too alike, even after the donor "
+                f"tier. The validator would discard this submission and the "
+                f"molecules would be spent, so skipping. hunter must confirm "
+                f"new molecules ({MIN_CONFIRMED_DRAWS}+ draws) to restore it."
             )
-            break
+            continue
 
         molecule_names = [name for name, _score, _smiles in selected]
         used_names.update(molecule_names)
@@ -1201,10 +1877,41 @@ async def get_verified_molecule_sets(
                 f"| Score: {score:.6f}"
             )
 
-        repaired = (
-            f", repaired with {stats['entropy_swaps']} swap(s) from a reserve "
-            f"of {stats['reserve']}" if stats["entropy_swaps"] else ""
-        )
+        if stats["entropy_swaps"] or stats.get("rebuilt"):
+            total_score = sum(score for _n, score, _s in selected)
+            donors_used = stats.get("donors_used", 0)
+            if donors_used and stats.get("donor_cap_relaxed"):
+                donor_note = (
+                    f", ⚠️ DONOR CAP RELAXED: {donors_used} unconfirmed "
+                    f"molecule(s) — nothing under the cap of "
+                    f"{MAX_UNCONFIRMED_PER_SET} cleared the floor, so this set "
+                    f"rests on single-draw scores"
+                )
+            elif donors_used:
+                donor_note = (
+                    f", {donors_used} unconfirmed donor(s) of "
+                    f"{MAX_UNCONFIRMED_PER_SET} allowed"
+                )
+            else:
+                donor_note = ""
+            if stats.get("opt_from_scratch"):
+                origin = (
+                    f"no constructive seed reached the floor; found by "
+                    f"{stats.get('opt_restarts', 0)} search restart(s)"
+                )
+            else:
+                origin = (
+                    f"+{stats.get('opt_gain', 0.0):.5f} from "
+                    f"{stats.get('opt_restarts', 0)} search restart(s) over the "
+                    f"best constructive seed"
+                )
+            repaired = (
+                f", floor-constrained over a pool of "
+                f"{stats['reserve'] + len(selected)} "
+                f"(total score {total_score:.5f}, {origin}{donor_note})"
+            )
+        else:
+            repaired = ""
         bt.logging.info(
             f"   📦 Wallet set {wallet_idx + 1}/{n_wallets}: "
             f"{len(selected)} molecules, entropy={entropy:.4f} "
@@ -1720,13 +2427,24 @@ async def do_epoch_submission(state: Dict[str, Any], current_epoch: int) -> None
         max_similarity=max_similarity,
     )
 
-    if len(molecule_sets) < num_pairs:
+    if not molecule_sets:
         bt.logging.warning(
-            f"   ⚠️  Only built {len(molecule_sets)}/{num_pairs} complete "
-            f"molecule set(s) for {allowed_reaction}. "
+            f"   ⚠️  Built no complete molecule set for {allowed_reaction}. "
             "Skipping submission for this epoch.\n"
         )
         return
+
+    if len(molecule_sets) < num_pairs:
+        # Submit what was built rather than throwing the epoch away. Sets are
+        # interchangeable across wallets -- they are paired positionally below
+        # and every set is disjoint -- so a wallet that could not be filled
+        # costs only its own submission, not everyone else's.
+        bt.logging.warning(
+            f"   ⚠️  Only built {len(molecule_sets)}/{num_pairs} complete "
+            f"molecule set(s) for {allowed_reaction}. Submitting the "
+            f"{len(molecule_sets)} that were built; "
+            f"{num_pairs - len(molecule_sets)} wallet(s) sit this epoch out.\n"
+        )
 
     bt.logging.info("")
 
